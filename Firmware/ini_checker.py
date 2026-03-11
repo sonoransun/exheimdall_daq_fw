@@ -373,6 +373,229 @@ def check_ini(parameters, en_hw_check=True):
     if not (data_iface_params['out_data_iface_type'] == "eth" or data_iface_params['out_data_iface_type'] == "shmem"):
         error_list.append("Output data interface type should be 'eth' or 'shmem'. Currently one of it is: '{0}' ".format(data_iface_params['out_data_iface_type']))
 
+    """
+    ----------------------------------------
+        | SCHEDULE | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'schedule' in parameters:
+        sched_params = parameters['schedule']
+
+        if not chk_int(sched_params.get('en_schedule', '0')):
+            error_list.append("Schedule enable must be 0 or 1. Currently it is: '{0}' ".format(sched_params.get('en_schedule')))
+        else:
+            if not int(sched_params.get('en_schedule', '0')) in [0,1]:
+                error_list.append("Schedule enable must be 0 or 1. Currently it is: '{0}' ".format(sched_params.get('en_schedule')))
+
+        sched_mode = sched_params.get('schedule_mode', 'none')
+        if sched_mode not in ['none', 'file', 'inline']:
+            error_list.append("Schedule mode must be one of: none, file, inline. Currently it is: '{0}' ".format(sched_mode))
+
+        if sched_mode == 'inline':
+            freq_str = sched_params.get('frequencies', '')
+            dwell_str = sched_params.get('dwell_frames', '')
+            if freq_str.strip():
+                freq_parts = freq_str.split(',')
+                for fp in freq_parts:
+                    if not chk_int(fp.strip()):
+                        error_list.append("Schedule frequencies must be comma-separated positive integers. Invalid: '{0}' ".format(fp.strip()))
+                    elif int(fp.strip()) <= 0:
+                        error_list.append("Schedule frequencies must be positive integers. Invalid: '{0}' ".format(fp.strip()))
+
+                if dwell_str.strip():
+                    dwell_parts = dwell_str.split(',')
+                    for dp in dwell_parts:
+                        if not chk_int(dp.strip()):
+                            error_list.append("Schedule dwell_frames must be comma-separated positive integers. Invalid: '{0}' ".format(dp.strip()))
+                        elif int(dp.strip()) <= 0:
+                            error_list.append("Schedule dwell_frames must be positive integers. Invalid: '{0}' ".format(dp.strip()))
+                    if len(dwell_parts) != len(freq_parts):
+                        error_list.append("Schedule frequencies and dwell_frames must have the same number of entries. Frequencies: {0}, Dwell: {1}".format(len(freq_parts), len(dwell_parts)))
+
+                gains_str = sched_params.get('gains', '')
+                if gains_str.strip():
+                    gain_entries = gains_str.split(';')
+                    for ge in gain_entries:
+                        ge = ge.strip()
+                        if ge:
+                            for gv in ge.split(','):
+                                gv = gv.strip()
+                                if gv and not chk_int(gv):
+                                    error_list.append("Schedule gain values must be integers. Invalid: '{0}' ".format(gv))
+                                elif gv and int(gv) not in valid_gains:
+                                    error_list.append("Schedule gain value should be one of: {0}. Currently: '{1}' ".format(valid_gains, gv))
+
+        repeat_mode = sched_params.get('repeat_mode', 'loop')
+        if repeat_mode not in ['loop', 'once', 'pingpong']:
+            error_list.append("Schedule repeat_mode must be one of: loop, once, pingpong. Currently it is: '{0}' ".format(repeat_mode))
+
+        if not chk_int(sched_params.get('require_cal_on_hop', '1')):
+            error_list.append("Schedule require_cal_on_hop must be 0 or 1. Currently it is: '{0}' ".format(sched_params.get('require_cal_on_hop')))
+
+        max_cal_wait = sched_params.get('max_cal_wait_frames', '500')
+        if not chk_int(max_cal_wait):
+            error_list.append("Schedule max_cal_wait_frames must be a positive integer. Currently it is: '{0}' ".format(max_cal_wait))
+        elif int(max_cal_wait) <= 0:
+            error_list.append("Schedule max_cal_wait_frames must be a positive integer. Currently it is: '{0}' ".format(max_cal_wait))
+
+    """
+    ----------------------------------------
+        | DATABASE | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'database' in parameters:
+        db_params = parameters['database']
+
+        if not chk_int(db_params.get('en_db', '0')):
+            error_list.append("Database enable must be 0 or 1. Currently it is: '{0}' ".format(db_params.get('en_db')))
+        else:
+            if not int(db_params.get('en_db', '0')) in [0,1]:
+                error_list.append("Database enable must be 0 or 1. Currently it is: '{0}' ".format(db_params.get('en_db')))
+
+        db_dir = db_params.get('db_dir', '')
+        if not db_dir.strip():
+            error_list.append("Database db_dir must be a non-empty string")
+
+        max_size = db_params.get('max_db_size_mb', '500')
+        if not chk_int(max_size):
+            error_list.append("Database max_db_size_mb must be a positive integer. Currently it is: '{0}' ".format(max_size))
+        elif int(max_size) <= 0:
+            error_list.append("Database max_db_size_mb must be a positive integer. Currently it is: '{0}' ".format(max_size))
+
+        rot_age = db_params.get('rotation_max_age_hours', '168')
+        if not chk_int(rot_age):
+            error_list.append("Database rotation_max_age_hours must be a positive integer. Currently it is: '{0}' ".format(rot_age))
+        elif int(rot_age) <= 0:
+            error_list.append("Database rotation_max_age_hours must be a positive integer. Currently it is: '{0}' ".format(rot_age))
+
+        batch_size = db_params.get('write_batch_size', '50')
+        if not chk_int(batch_size):
+            error_list.append("Database write_batch_size must be a positive integer. Currently it is: '{0}' ".format(batch_size))
+        elif int(batch_size) <= 0:
+            error_list.append("Database write_batch_size must be a positive integer. Currently it is: '{0}' ".format(batch_size))
+
+        flush_interval = db_params.get('write_flush_interval_sec', '1.0')
+        if not chk_float(flush_interval):
+            error_list.append("Database write_flush_interval_sec must be a positive float. Currently it is: '{0}' ".format(flush_interval))
+        elif float(flush_interval) <= 0:
+            error_list.append("Database write_flush_interval_sec must be a positive float. Currently it is: '{0}' ".format(flush_interval))
+
+        hw_interval = db_params.get('hw_snapshot_interval', '100')
+        if not chk_int(hw_interval):
+            error_list.append("Database hw_snapshot_interval must be a positive integer. Currently it is: '{0}' ".format(hw_interval))
+        elif int(hw_interval) <= 0:
+            error_list.append("Database hw_snapshot_interval must be a positive integer. Currently it is: '{0}' ".format(hw_interval))
+
+    """
+    ----------------------------------------
+        | MONITORING | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'monitoring' in parameters:
+        mon_params = parameters['monitoring']
+
+        if not chk_int(mon_params.get('en_monitoring', '0')):
+            error_list.append("Monitoring enable must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_monitoring')))
+        else:
+            if not int(mon_params.get('en_monitoring', '0')) in [0,1]:
+                error_list.append("Monitoring enable must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_monitoring')))
+
+        if not chk_int(mon_params.get('en_syslog', '0')):
+            error_list.append("Monitoring en_syslog must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_syslog')))
+        else:
+            if not int(mon_params.get('en_syslog', '0')) in [0,1]:
+                error_list.append("Monitoring en_syslog must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_syslog')))
+
+        syslog_addr = mon_params.get('syslog_address', '/dev/log')
+        if not syslog_addr.strip():
+            error_list.append("Monitoring syslog_address must be a non-empty string")
+
+        syslog_fac = mon_params.get('syslog_facility', 'daemon')
+        valid_facilities = ['daemon', 'local0', 'local1', 'local2', 'local3', 'local4', 'local5', 'local6', 'local7']
+        if syslog_fac not in valid_facilities:
+            error_list.append("Monitoring syslog_facility must be one of: {0}. Currently it is: '{1}' ".format(valid_facilities, syslog_fac))
+
+        syslog_sev = mon_params.get('syslog_min_severity', 'warning')
+        valid_severities = ['info', 'warning', 'error', 'critical']
+        if syslog_sev not in valid_severities:
+            error_list.append("Monitoring syslog_min_severity must be one of: {0}. Currently it is: '{1}' ".format(valid_severities, syslog_sev))
+
+        if not chk_int(mon_params.get('en_metrics', '0')):
+            error_list.append("Monitoring en_metrics must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_metrics')))
+        else:
+            if not int(mon_params.get('en_metrics', '0')) in [0,1]:
+                error_list.append("Monitoring en_metrics must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_metrics')))
+
+        win_size = mon_params.get('metrics_window_size', '1000')
+        if not chk_int(win_size):
+            error_list.append("Monitoring metrics_window_size must be a positive integer. Currently it is: '{0}' ".format(win_size))
+        elif int(win_size) <= 0:
+            error_list.append("Monitoring metrics_window_size must be a positive integer. Currently it is: '{0}' ".format(win_size))
+
+        hb_interval = mon_params.get('heartbeat_interval', '100')
+        if not chk_int(hb_interval):
+            error_list.append("Monitoring heartbeat_interval must be a non-negative integer. Currently it is: '{0}' ".format(hb_interval))
+        elif int(hb_interval) < 0:
+            error_list.append("Monitoring heartbeat_interval must be a non-negative integer. Currently it is: '{0}' ".format(hb_interval))
+
+        if not chk_int(mon_params.get('en_status_server', '0')):
+            error_list.append("Monitoring en_status_server must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_status_server')))
+        else:
+            if not int(mon_params.get('en_status_server', '0')) in [0,1]:
+                error_list.append("Monitoring en_status_server must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_status_server')))
+
+        status_port = mon_params.get('status_server_port', '5002')
+        if not chk_int(status_port):
+            error_list.append("Monitoring status_server_port must be a valid port number. Currently it is: '{0}' ".format(status_port))
+        elif int(status_port) < 1 or int(status_port) > 65535:
+            error_list.append("Monitoring status_server_port must be a valid port number (1-65535). Currently it is: '{0}' ".format(status_port))
+
+        if not chk_int(mon_params.get('en_zmq_pub', '0')):
+            error_list.append("Monitoring en_zmq_pub must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_zmq_pub')))
+        else:
+            if not int(mon_params.get('en_zmq_pub', '0')) in [0,1]:
+                error_list.append("Monitoring en_zmq_pub must be 0 or 1. Currently it is: '{0}' ".format(mon_params.get('en_zmq_pub')))
+
+        zmq_port = mon_params.get('zmq_pub_port', '5003')
+        if not chk_int(zmq_port):
+            error_list.append("Monitoring zmq_pub_port must be a valid port number. Currently it is: '{0}' ".format(zmq_port))
+        elif int(zmq_port) < 1 or int(zmq_port) > 65535:
+            error_list.append("Monitoring zmq_pub_port must be a valid port number (1-65535). Currently it is: '{0}' ".format(zmq_port))
+
+        ring_size = mon_params.get('event_ring_size', '500')
+        if not chk_int(ring_size):
+            error_list.append("Monitoring event_ring_size must be a positive integer. Currently it is: '{0}' ".format(ring_size))
+        elif int(ring_size) <= 0:
+            error_list.append("Monitoring event_ring_size must be a positive integer. Currently it is: '{0}' ".format(ring_size))
+
+    # ---> Federation section check <---
+    if 'federation' in daq_cfg:
+        fed_params = daq_cfg['federation']
+
+        instance_id = fed_params.get('instance_id', '0')
+        if not chk_int(instance_id):
+            error_list.append("Federation instance_id must be a non-negative integer. Currently it is: '{0}' ".format(instance_id))
+        elif int(instance_id) < 0:
+            error_list.append("Federation instance_id must be a non-negative integer. Currently it is: '{0}' ".format(instance_id))
+
+        port_stride = fed_params.get('port_stride', '100')
+        if not chk_int(port_stride):
+            error_list.append("Federation port_stride must be a positive integer. Currently it is: '{0}' ".format(port_stride))
+        elif int(port_stride) <= 0:
+            error_list.append("Federation port_stride must be a positive integer. Currently it is: '{0}' ".format(port_stride))
+
+        if not chk_int(fed_params.get('en_federation', '0')):
+            error_list.append("Federation en_federation must be 0 or 1. Currently it is: '{0}' ".format(fed_params.get('en_federation')))
+        else:
+            if not int(fed_params.get('en_federation', '0')) in [0,1]:
+                error_list.append("Federation en_federation must be 0 or 1. Currently it is: '{0}' ".format(fed_params.get('en_federation')))
+
+        coord_port = fed_params.get('coordinator_port', '6000')
+        if not chk_int(coord_port):
+            error_list.append("Federation coordinator_port must be a valid port number. Currently it is: '{0}' ".format(coord_port))
+        elif int(coord_port) < 1 or int(coord_port) > 65535:
+            error_list.append("Federation coordinator_port must be a valid port number (1-65535). Currently it is: '{0}' ".format(coord_port))
+
     return error_list
 
 if __name__ == "__main__":    

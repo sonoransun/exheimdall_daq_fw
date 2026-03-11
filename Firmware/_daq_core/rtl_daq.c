@@ -77,6 +77,7 @@ pthread_cond_t buff_ind_cond; // This signal is used to notice the main thread t
 pthread_t fifo_read_thread;  
 static pthread_barrier_t rtl_init_barrier;
 
+int rtl_daq_zmq_port = 1130; // Set from config via federation instance_id
 int reconfig_trigger=0, exit_flag=0;
 int noise_source_state = 0; // Noise source state is used also to track the calibration frame status!
 int last_noise_source_state = 0;
@@ -112,6 +113,8 @@ typedef struct
     const char* hw_name;
     int hw_unit_id;
     int ioo_type;
+    int instance_id;
+    int port_stride;
 } configuration;
 
 /*
@@ -145,9 +148,13 @@ static int handler(void* conf_struct, const char* section, const char* name,
         {pconfig->en_noise_source_ctr = atoi(value);}
     else if (MATCH("daq", "ctr_channel_serial_no"))
         {pconfig->ctr_channel_serial_no = atoi(value);}
-    else if (MATCH("daq", "log_level")) 
+    else if (MATCH("daq", "log_level"))
         {pconfig->log_level = atoi(value);}
-    else 
+    else if (MATCH("federation", "instance_id"))
+        {pconfig->instance_id = atoi(value);}
+    else if (MATCH("federation", "port_stride"))
+        {pconfig->port_stride = atoi(value);}
+    else
         {return 0;}  /* unknown section/name, error */
     return 0;
 }
@@ -169,7 +176,9 @@ void * fifo_read_tf(void* arg)
     // Initialize ZMQ Socket
     void *context   = zmq_ctx_new ();
     void *responder = zmq_socket (context, ZMQ_REP);
-    int rc          = zmq_bind (responder, "tcp://*:1130");
+    char zmq_addr[64];
+    sprintf(zmq_addr, "tcp://*:%d", rtl_daq_zmq_port);
+    int rc          = zmq_bind (responder, zmq_addr);
     assert (rc == 0);
     if(rc!=0)
     {        
@@ -426,6 +435,8 @@ int main( int argc, char** argv )
 {   
     log_set_level(LOG_TRACE);
     configuration config;
+    config.instance_id = 0;
+    config.port_stride = 100;
 
     #ifdef USEPIGPIO
     // PIGPIO
@@ -449,6 +460,7 @@ int main( int argc, char** argv )
     }   
     buffer_size = config.daq_buffer_size*2;
     ch_no = config.num_ch;
+    rtl_daq_zmq_port = compute_port(1130, config.instance_id, config.port_stride);
     
     log_set_level(config.log_level);
     /* -> Parse bias tree config */

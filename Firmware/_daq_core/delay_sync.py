@@ -27,6 +27,7 @@
 import logging
 from ntpath import join
 import sys
+import time
 from struct import pack
 from time import sleep
 from os.path import join
@@ -47,6 +48,9 @@ from numba import jit, njit
 from iq_header import IQHeader
 from shmemIface import outShmemIface, inShmemIface
 import inter_module_messages
+from daq_db_records import (CAL_EVENT_CAL_START, CAL_EVENT_SAMPLE_CAL_DONE,
+                            CAL_EVENT_IQ_CAL_DONE, CAL_EVENT_TRACK_LOCK,
+                            CAL_EVENT_TRACK_LOST, CAL_EVENT_FREQ_CHANGE)
 
 # Linear curve definition for curve fitting
 def linear_func(x, a, b):
@@ -109,6 +113,24 @@ class delaySynchronizer():
         self.last_update_ind=-3 # Hold the last index when the compensation has sent
         self.last_rf = 0 # Tracks the RF center frequency, recalibration is initiated when changed 
                 
+        # Database
+        self.db = None
+        self._en_db = False
+
+        # Monitoring
+        self.metrics = None
+        self.event_bus = None
+        self.status_server = None
+        self._cal_start_frame = 0
+        self._last_frame_time = 0.0
+        self._heartbeat_interval = 100
+        self._heartbeat_counter = 0
+
+        # Federation
+        self.instance_id = 0
+        self.port_stride = 100
+        self.federation_health = None
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
 
@@ -216,7 +238,104 @@ class delaySynchronizer():
         self.iq_adjust /= self.iq_adjust[self.std_ch_ind]
         self.logger.info(f"IQ adjustment vector: abs:{abs(self.iq_adjust)}")
         self.logger.info(f"IQ adjustment vector: phase:{np.rad2deg(np.angle(self.iq_adjust))}")
-         
+
+        # Database configuration
+        if parser.has_section('database'):
+            self._en_db = parser.getint('database', 'en_db', fallback=0) == 1
+            if self._en_db:
+                try:
+                    from daq_db import DAQDatabase
+                    self.db = DAQDatabase(
+                        db_dir=parser.get('database', 'db_dir', fallback='_db'),
+                        max_db_size_mb=parser.getint('database', 'max_db_size_mb', fallback=500),
+                        rotation_max_age_hours=parser.getint('database', 'rotation_max_age_hours', fallback=168),
+                        write_batch_size=parser.getint('database', 'write_batch_size', fallback=50),
+                        write_flush_interval_sec=parser.getfloat('database', 'write_flush_interval_sec', fallback=1.0),
+                        num_channels=self.M
+                    )
+                    self.logger.info("DAQ database enabled")
+                except Exception as e:
+                    self.logger.error("Failed to initialize DAQ database: {:s}".format(str(e)))
+                    self.db = None
+
+        # Federation configuration (read early so instance_id is available for port offsets)
+        if parser.has_section('federation'):
+            self.instance_id = parser.getint('federation', 'instance_id', fallback=0)
+            self.port_stride = parser.getint('federation', 'port_stride', fallback=100)
+            if self.instance_id != 0:
+                self.logger.info("Federation instance_id={:d}, port_stride={:d}".format(
+                    self.instance_id, self.port_stride))
+
+            en_federation = parser.getint('federation', 'en_federation', fallback=0) == 1
+            if en_federation:
+                peer_list_str = parser.get('federation', 'peer_list', fallback='')
+                if peer_list_str.strip():
+                    try:
+                        from federation_health import FederationHealth
+                        peers = [p.strip() for p in peer_list_str.split(',') if p.strip()]
+                        self.federation_health = FederationHealth(
+                            instance_id=self.instance_id,
+                            peer_addresses=peers,
+                            event_bus=self.event_bus
+                        )
+                        self.logger.info("Federation health monitor configured with {:d} peers".format(len(peers)))
+                    except Exception as e:
+                        self.logger.error("Failed to initialize federation health: {:s}".format(str(e)))
+                        self.federation_health = None
+
+        # Monitoring configuration
+        if parser.has_section('monitoring'):
+            en_monitoring = parser.getint('monitoring', 'en_monitoring', fallback=0) == 1
+            if en_monitoring:
+                try:
+                    from daq_events import (EventBus, LoggingHandler, SysLogEventHandler, ZMQPubHandler)
+                    ring_size = parser.getint('monitoring', 'event_ring_size', fallback=500)
+                    self.event_bus = EventBus(enabled=True, ring_size=ring_size)
+                    self.event_bus.register_handler(LoggingHandler())
+
+                    if parser.getint('monitoring', 'en_syslog', fallback=0) == 1:
+                        syslog_handler = SysLogEventHandler(
+                            address=parser.get('monitoring', 'syslog_address', fallback='/dev/log'),
+                            facility=parser.get('monitoring', 'syslog_facility', fallback='daemon'),
+                            min_severity=parser.get('monitoring', 'syslog_min_severity', fallback='warning')
+                        )
+                        self.event_bus.register_handler(syslog_handler)
+
+                    if parser.getint('monitoring', 'en_zmq_pub', fallback=0) == 1:
+                        zmq_port = parser.getint('monitoring', 'zmq_pub_port', fallback=5003)
+                        zmq_port += self.instance_id * self.port_stride
+                        self.event_bus.register_handler(ZMQPubHandler(port=zmq_port))
+
+                    self.logger.info("Event bus enabled")
+                except Exception as e:
+                    self.logger.error("Failed to initialize event bus: {:s}".format(str(e)))
+                    self.event_bus = None
+
+            en_metrics = parser.getint('monitoring', 'en_metrics', fallback=0) == 1
+            if en_metrics:
+                try:
+                    from daq_metrics import MetricsCollector
+                    window_size = parser.getint('monitoring', 'metrics_window_size', fallback=1000)
+                    self.metrics = MetricsCollector(window_size=window_size)
+                    self.logger.info("Performance metrics enabled")
+                except Exception as e:
+                    self.logger.error("Failed to initialize metrics: {:s}".format(str(e)))
+                    self.metrics = None
+
+            self._heartbeat_interval = parser.getint('monitoring', 'heartbeat_interval', fallback=100)
+
+            en_status_server = parser.getint('monitoring', 'en_status_server', fallback=0) == 1
+            if en_status_server:
+                try:
+                    from daq_status_server import StatusServer
+                    port = parser.getint('monitoring', 'status_server_port', fallback=5002)
+                    port += self.instance_id * self.port_stride
+                    self.status_server = StatusServer(port=port, metrics=self.metrics,
+                                                      event_bus=self.event_bus)
+                    self.logger.info("Status server configured on port {:d}".format(port))
+                except Exception as e:
+                    self.logger.error("Failed to initialize status server: {:s}".format(str(e)))
+                    self.status_server = None
 
         return 0
     def open_interfaces(self):
@@ -237,22 +356,24 @@ class delaySynchronizer():
                         -1: Failed to initialize one the interfaces
         """ 
         # Open RTL-DAQ control socket
-        context = zmq.Context()        
+        zmq_port = 1130 + self.instance_id * self.port_stride
+        context = zmq.Context()
         self.rtl_daq_socket = context.socket(zmq.REQ)
-        self.rtl_daq_socket.connect("tcp://localhost:1130")
-        
+        self.rtl_daq_socket.connect("tcp://localhost:{:d}".format(zmq_port))
+
         # Open shared memory interface to receive data from the decimator
-        self.in_shmem_iface = inShmemIface("decimator_out")
+        self.in_shmem_iface = inShmemIface("decimator_out", instance_id=self.instance_id)
         if not self.in_shmem_iface.init_ok:
             self.logger.critical("Shared memory (Decimator) initialization failed, exiting..")
             return -1
-        
+
         # Open shared memory interface towards the iq server module
         if self.N >= self.N_proc: out_shmem_size = int(1024+self.N*2*self.M*(32/8))
         else: out_shmem_size = int(1024+self.N_proc*2*self.M*(32/8))
         self.out_shmem_iface_iq = outShmemIface("delay_sync_iq",
                                  out_shmem_size,
-                                 drop_mode = True)
+                                 drop_mode = True,
+                                 instance_id=self.instance_id)
         if not self.out_shmem_iface_iq.init_ok:
             self.logger.critical("Shared memory (IQ server) initialization failed, exiting..")
             return -1
@@ -260,7 +381,8 @@ class delaySynchronizer():
         # Open shared memory interface towards the hardware controller module
         self.out_shmem_iface_hwc = outShmemIface("delay_sync_hwc",
                                  out_shmem_size,
-                                 drop_mode = True)
+                                 drop_mode = True,
+                                 instance_id=self.instance_id)
         if not self.out_shmem_iface_hwc.init_ok:
             self.logger.critical("Shared memory (HWC) initialization failed, exiting..")
             return -1
@@ -436,7 +558,9 @@ class delaySynchronizer():
             #############################################
             
             # Acquire data
-            active_buff_index_dec = self.in_shmem_iface.wait_buff_free()  
+            active_buff_index_dec = self.in_shmem_iface.wait_buff_free()
+            if self.metrics is not None:
+                _t_frame_start = time.monotonic()
             if active_buff_index_dec < 0 or active_buff_index_dec > 1:
                 self.logger.critical("Failed to acquire new data frame, exiting..")
                 break;          
@@ -517,9 +641,17 @@ class delaySynchronizer():
                     # Reset IQ corrections
                     self.iq_corrections    = np.ones(self.M, dtype=np.complex64) 
                     self.iq_corrections[:] = self.iq_adjust[:]
-                    # Calibration frame                    
-                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL: 
+                    # Calibration frame
+                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
                         self.current_state = "STATE_SAMPLE_CAL"
+                        self._cal_start_frame = self.iq_header.cpi_index
+                        if self.db is not None:
+                            self.db.put_cal_event(CAL_EVENT_CAL_START, self.iq_header,
+                                                  sync_state_before=1, sync_state_after=2)
+                        if self.event_bus is not None:
+                            from daq_events import DAQEvent, EVT_CAL_START
+                            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                                event_type=EVT_CAL_START, payload={"freq": self.iq_header.rf_center_freq}))
                         
                 #
                 #------------------------------------------>
@@ -577,8 +709,12 @@ class delaySynchronizer():
                         self.current_state = "STATE_SYNC_WAIT"
                         
                     if sample_sync_flag:
-                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far 
-                        self.current_state = "STATE_FRAC_SAMPLE_CAL"  
+                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far
+                        self.current_state = "STATE_FRAC_SAMPLE_CAL"
+                        if self.db is not None:
+                            self.db.put_cal_event(CAL_EVENT_SAMPLE_CAL_DONE, self.iq_header,
+                                                  delays=self.delays,
+                                                  sync_state_before=2, sync_state_after=3)
                 #
                 #------------------------------------------>
                 #
@@ -666,8 +802,22 @@ class delaySynchronizer():
                     if not sample_sync_flag:
                         self.current_state = "STATE_SAMPLE_CAL"
                     
-                    if sample_sync_flag and iq_sync_flag:                    
-                        self.current_state = "STATE_TRACK_LOCK"  
+                    if sample_sync_flag and iq_sync_flag:
+                        self.current_state = "STATE_TRACK_LOCK"
+                        if self.db is not None:
+                            self.db.put_cal_event(CAL_EVENT_IQ_CAL_DONE, self.iq_header,
+                                                  iq_corrections=self.iq_corrections,
+                                                  sync_state_before=4, sync_state_after=5)
+                            self.db.put_cal_event(CAL_EVENT_TRACK_LOCK, self.iq_header,
+                                                  iq_corrections=self.iq_corrections,
+                                                  sync_state_before=4, sync_state_after=5)
+                        if self.event_bus is not None:
+                            from daq_events import DAQEvent, EVT_SYNC_LOCK
+                            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                                event_type=EVT_SYNC_LOCK, payload={"freq": self.iq_header.rf_center_freq}))
+                        if self.metrics is not None:
+                            convergence = self.iq_header.cpi_index - self._cal_start_frame
+                            self.metrics.record("cal_convergence_frames", float(convergence))
                         if self.cal_track_mode == 2 and self.en_iq_cal:
                             self.iq_diff_ref[:] = iq_diffs[:]
                 #
@@ -730,6 +880,14 @@ class delaySynchronizer():
                         if self.sync_failed_cntr == self.max_sync_fails:
                             self.current_state = "STATE_INIT"
                             self.sync_failed_cntr = 0
+                            if self.db is not None:
+                                self.db.put_cal_event(CAL_EVENT_TRACK_LOST, self.iq_header,
+                                                      iq_corrections=self.iq_corrections,
+                                                      sync_state_before=6, sync_state_after=1)
+                            if self.event_bus is not None:
+                                from daq_events import DAQEvent, EVT_SYNC_LOST
+                                self.event_bus.emit(DAQEvent(severity="warning", module="delay_sync",
+                                    event_type=EVT_SYNC_LOST, payload={"total_fails": self.sync_failed_cntr_total}))
                         elif self.sync_failed_cntr < 0: # Sync tracking holds
                             self.sync_failed_cntr = 0
 
@@ -745,6 +903,16 @@ class delaySynchronizer():
                         iq_sync_flag = False
                         self.sync_failed_cntr = 0
                         self.current_state = "STATE_INIT"
+                        if self.db is not None:
+                            self.db.put_cal_event(CAL_EVENT_FREQ_CHANGE, self.iq_header,
+                                                  iq_corrections=self.iq_corrections,
+                                                  sync_state_before=6, sync_state_after=1)
+                        if self.event_bus is not None:
+                            from daq_events import DAQEvent, EVT_FREQ_CHANGE
+                            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                                event_type=EVT_FREQ_CHANGE, payload={
+                                    "old_freq": self.last_rf,
+                                    "new_freq": self.iq_header.rf_center_freq}))
     
                 # Uncomment it for long term delay compenstation stress!
                 self.logger.info("Delay track statistic [sync fails ,sample, iq, total][{:d},{:d},{:d}/{:d}]".format(
@@ -765,8 +933,14 @@ class delaySynchronizer():
                     
 
 
-            #############################################   
-            #         SEND PROCESSED DATA BLOCK         #  
+            #############################################
+            #        DATABASE: FRAME METRICS            #
+            #############################################
+            if self.db is not None and self.iq_header.frame_type != IQHeader.FRAME_TYPE_DUMMY:
+                self.db.put_frame_metrics(self.iq_header, snr=0.0, cal_quality=0.0)
+
+            #############################################
+            #         SEND PROCESSED DATA BLOCK         #
             #############################################
             # -> Update header field
             if sample_sync_flag: 
@@ -787,6 +961,11 @@ class delaySynchronizer():
                 self.out_shmem_iface_iq.send_ctr_buff_ready(active_buffer_index_iq)
             else:
                 if not self.ignore_frame_drop_warning: self.logger.warning("Dropping frame - IQ server, Total: {:d}".format(self.out_shmem_iface_iq.dropped_frame_cntr))
+                if self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_FRAME_DROP
+                    self.event_bus.emit(DAQEvent(severity="warning", module="delay_sync",
+                        event_type=EVT_FRAME_DROP, payload={"target": "iq_server",
+                            "total": self.out_shmem_iface_iq.dropped_frame_cntr}))
 
             # -> Send IQ frame toward the hwc module
             if active_buffer_index_hwc !=3 :
@@ -795,7 +974,47 @@ class delaySynchronizer():
                 self.out_shmem_iface_hwc.send_ctr_buff_ready(active_buffer_index_hwc)
             else:
                 if not self.ignore_frame_drop_warning: self.logger.warning("Dropping frame - HWC, Total: {:d}".format(self.out_shmem_iface_hwc.dropped_frame_cntr))
-            
+                if self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_FRAME_DROP
+                    self.event_bus.emit(DAQEvent(severity="warning", module="delay_sync",
+                        event_type=EVT_FRAME_DROP, payload={"target": "hwc",
+                            "total": self.out_shmem_iface_hwc.dropped_frame_cntr}))
+
+            # -> Performance metrics recording
+            if self.metrics is not None:
+                _t_now = time.monotonic()
+                self.metrics.record("frame_processing_latency_ms", (_t_now - _t_frame_start) * 1000)
+                if self._last_frame_time > 0:
+                    self.metrics.record("frame_throughput_fps", 1.0 / (_t_now - self._last_frame_time))
+                self._last_frame_time = _t_now
+                self.metrics.record("dropped_frames_iq", float(self.out_shmem_iface_iq.dropped_frame_cntr))
+                self.metrics.record("dropped_frames_hwc", float(self.out_shmem_iface_hwc.dropped_frame_cntr))
+
+            # -> Periodic heartbeat and status update
+            if self._heartbeat_interval > 0:
+                self._heartbeat_counter += 1
+                if self._heartbeat_counter >= self._heartbeat_interval:
+                    self._heartbeat_counter = 0
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_HEARTBEAT
+                        self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                            event_type=EVT_HEARTBEAT, payload={"cpi_index": self.iq_header.cpi_index,
+                                "sync_state": sync_state}))
+                    if self.status_server is not None:
+                        self.status_server.update_status({
+                            "sync_state": sync_state,
+                            "current_frequency_hz": self.iq_header.rf_center_freq,
+                            "frame_count": self.iq_header.cpi_index,
+                            "calibration_status": "locked" if sync_state >= 5 else ("calibrating" if sync_state >= 2 else "lost"),
+                            "counters": {
+                                "dropped_frames_iq": self.out_shmem_iface_iq.dropped_frame_cntr,
+                                "dropped_frames_hwc": self.out_shmem_iface_hwc.dropped_frame_cntr,
+                                "sync_fails_total": self.sync_failed_cntr_total,
+                                "sample_compensations": self.sample_compensation_cntr,
+                                "iq_compensations": self.iq_compensation_cntr,
+                            },
+                        })
+
             # -> Inform the preceeding block that we have finished the processing
             self.in_shmem_iface.send_ctr_buff_ready(active_buff_index_dec)
 
@@ -816,7 +1035,27 @@ def copy_iq(iq_samples_in, iq_samples_out, M):
 
 if __name__ == '__main__':
     delay_synchronizer_inst0 = delaySynchronizer()
-    if delay_synchronizer_inst0.open_interfaces() == 0:
-        delay_synchronizer_inst0.start()
-    
-    delay_synchronizer_inst0.close_interfaces()
+    try:
+        if delay_synchronizer_inst0.open_interfaces() == 0:
+            if delay_synchronizer_inst0.status_server is not None:
+                delay_synchronizer_inst0.status_server.start()
+            if delay_synchronizer_inst0.federation_health is not None:
+                delay_synchronizer_inst0.federation_health.start()
+            if delay_synchronizer_inst0.event_bus is not None:
+                from daq_events import DAQEvent, EVT_PROCESS_START
+                delay_synchronizer_inst0.event_bus.emit(DAQEvent(severity="info",
+                    module="delay_sync", event_type=EVT_PROCESS_START, payload={}))
+            delay_synchronizer_inst0.start()
+    finally:
+        if delay_synchronizer_inst0.event_bus is not None:
+            from daq_events import DAQEvent, EVT_PROCESS_STOP
+            delay_synchronizer_inst0.event_bus.emit(DAQEvent(severity="info",
+                module="delay_sync", event_type=EVT_PROCESS_STOP, payload={}))
+            delay_synchronizer_inst0.event_bus.close()
+        if delay_synchronizer_inst0.federation_health is not None:
+            delay_synchronizer_inst0.federation_health.close()
+        if delay_synchronizer_inst0.status_server is not None:
+            delay_synchronizer_inst0.status_server.close()
+        if delay_synchronizer_inst0.db is not None:
+            delay_synchronizer_inst0.db.close()
+        delay_synchronizer_inst0.close_interfaces()

@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #define ERR_FCNTL -20
 
@@ -76,6 +77,16 @@ void send_ctr_terminate(struct shmem_transfer_struct*);
 int wait_buff_free(struct shmem_transfer_struct*);
 int wait_buff_ready(struct shmem_transfer_struct*);
 int wait_ctr_init_read(struct shmem_transfer_struct*);
+
+/*
+*-------------------------------------
+*    Federation instance helpers
+*-------------------------------------
+*/
+
+void build_shmem_name(char* dest, int instance_id, const char* base_name);
+void build_fifo_path(char* dest, int instance_id, const char* base_path);
+int  compute_port(int base_port, int instance_id, int stride);
 
 
 

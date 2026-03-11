@@ -34,6 +34,8 @@ from iq_header import IQHeader
 from shmemIface import inShmemIface
 import zmq
 import inter_module_messages
+from daq_db_records import (CAL_EVENT_NOISE_ON, CAL_EVENT_NOISE_OFF,
+                            CAL_EVENT_FREQ_CHANGE, CAL_EVENT_GAIN_CHANGE)
 
 # Global: Used to communicate between the HWC module and the Control Interface server
 ctr_request = [] # This list stores the confiuration command and parameters [cmd, param 1, param 2, ..]
@@ -83,6 +85,20 @@ class HWC():
         self.require_track_lock_intervention = True
         self.rf_center_frequency = 1
 
+        # Scheduler and database
+        self.scheduler = None
+        self.db = None
+        self._en_db = False
+        self._hw_snapshot_interval = 100
+        self._hw_snapshot_counter = 0
+
+        # Monitoring
+        self.event_bus = None
+
+        # Federation
+        self.instance_id = 0
+        self.port_stride = 100
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
         self.iq_header = IQHeader()
@@ -96,7 +112,8 @@ class HWC():
         self.logger.setLevel(self.log_level)
 
         # Control interface server
-        self.ctr_iface_server = CtrIfaceServer(self.M)
+        hwc_port = 5001 + self.instance_id * self.port_stride
+        self.ctr_iface_server = CtrIfaceServer(self.M, port=hwc_port)
         self.ctr_iface_server.start()
 
         self.logger.info("Antenna channles {:d}".format(self.M))
@@ -183,6 +200,83 @@ class HWC():
                 self.gains=[0]*self.M
                 self.last_gains=[0]*self.M
 
+        # Schedule configuration
+        if parser.has_section('schedule'):
+            en_schedule = parser.getint('schedule', 'en_schedule', fallback=0)
+            if en_schedule:
+                try:
+                    from signal_scheduler import SignalScheduler, ScheduleParser
+                    sample_rate = parser.getint('daq', 'sample_rate', fallback=2400000)
+                    decimation_ratio = parser.getint('pre_processing', 'decimation_ratio', fallback=1)
+                    self.scheduler = SignalScheduler(self.M, sample_rate, self.N, decimation_ratio)
+                    self.scheduler.max_cal_wait_frames = parser.getint('schedule', 'max_cal_wait_frames', fallback=500)
+                    sched_mode = parser.get('schedule', 'schedule_mode', fallback='none')
+                    if sched_mode == 'inline':
+                        sched = ScheduleParser.from_ini_section(parser, 'schedule')
+                        if sched is not None:
+                            self.scheduler.load_schedule(sched)
+                            logging.info("Inline schedule loaded with {:d} entries".format(len(sched.entries)))
+                    elif sched_mode == 'file':
+                        sched_file = parser.get('schedule', 'schedule_file', fallback='')
+                        if sched_file:
+                            sched = ScheduleParser.from_file(sched_file)
+                            self.scheduler.load_schedule(sched)
+                            logging.info("File schedule loaded from {:s}".format(sched_file))
+                except Exception as e:
+                    logging.error("Failed to initialize scheduler: {:s}".format(str(e)))
+                    self.scheduler = None
+
+        # Database configuration
+        if parser.has_section('database'):
+            self._en_db = parser.getint('database', 'en_db', fallback=0) == 1
+            self._hw_snapshot_interval = parser.getint('database', 'hw_snapshot_interval', fallback=100)
+            if self._en_db:
+                try:
+                    from daq_db import DAQDatabase
+                    self.db = DAQDatabase(
+                        db_dir=parser.get('database', 'db_dir', fallback='_db'),
+                        max_db_size_mb=parser.getint('database', 'max_db_size_mb', fallback=500),
+                        rotation_max_age_hours=parser.getint('database', 'rotation_max_age_hours', fallback=168),
+                        write_batch_size=parser.getint('database', 'write_batch_size', fallback=50),
+                        write_flush_interval_sec=parser.getfloat('database', 'write_flush_interval_sec', fallback=1.0),
+                        num_channels=self.M
+                    )
+                    logging.info("DAQ database enabled")
+                except Exception as e:
+                    logging.error("Failed to initialize DAQ database: {:s}".format(str(e)))
+                    self.db = None
+
+        # Monitoring configuration
+        if parser.has_section('monitoring'):
+            en_monitoring = parser.getint('monitoring', 'en_monitoring', fallback=0) == 1
+            if en_monitoring:
+                try:
+                    from daq_events import (EventBus, LoggingHandler, SysLogEventHandler, ZMQPubHandler)
+                    ring_size = parser.getint('monitoring', 'event_ring_size', fallback=500)
+                    self.event_bus = EventBus(enabled=True, ring_size=ring_size)
+                    self.event_bus.register_handler(LoggingHandler())
+
+                    if parser.getint('monitoring', 'en_syslog', fallback=0) == 1:
+                        syslog_handler = SysLogEventHandler(
+                            address=parser.get('monitoring', 'syslog_address', fallback='/dev/log'),
+                            facility=parser.get('monitoring', 'syslog_facility', fallback='daemon'),
+                            min_severity=parser.get('monitoring', 'syslog_min_severity', fallback='warning')
+                        )
+                        self.event_bus.register_handler(syslog_handler)
+
+                    logging.info("Event bus enabled (hw_controller)")
+                except Exception as e:
+                    logging.error("Failed to initialize event bus: {:s}".format(str(e)))
+                    self.event_bus = None
+
+        # Federation configuration
+        if parser.has_section('federation'):
+            self.instance_id = parser.getint('federation', 'instance_id', fallback=0)
+            self.port_stride = parser.getint('federation', 'port_stride', fallback=100)
+            if self.instance_id != 0:
+                logging.info("Federation instance_id={:d}, port_stride={:d}".format(
+                    self.instance_id, self.port_stride))
+
     def init(self):
         """
             Initializes the Hardware Controller module
@@ -193,19 +287,22 @@ class HWC():
                 - Sets initial IQ values in the ADPIS
         """
         # Open RTL-DAQ control socket
-        context = zmq.Context()        
+        zmq_port = 1130 + self.instance_id * self.port_stride
+        context = zmq.Context()
         self.rtl_daq_socket = context.socket(zmq.REQ)
-        self.rtl_daq_socket.connect("tcp://localhost:1130")
+        self.rtl_daq_socket.connect("tcp://localhost:{:d}".format(zmq_port))
 
-        # Open control FIFOs
-        try:            
+        # Open control FIFOs (namespaced by instance_id)
+        if self.instance_id != 0:
+            self.track_lock_ctr_fname = "_data_control/inst{:d}_iq_track_lock".format(self.instance_id)
+        try:
             self.track_lock_ctr_fd = open(self.track_lock_ctr_fname, 'r')
         except OSError as err:
             self.logger.critical("OS error: {0}".format(err))
             self.logger.critical("Failed to open control fifos, exiting..")
-            return -1        
+            return -1
         # Initialize shared memory interface
-        self.in_shmem_iface = inShmemIface("delay_sync_hwc")
+        self.in_shmem_iface = inShmemIface("delay_sync_hwc", instance_id=self.instance_id)
         if not self.in_shmem_iface.init_ok:
             logging.critical("Shared memory initialization failed")
             return -3
@@ -231,13 +328,16 @@ class HWC():
     def close(self):
         """
             Close the communication and data interfaces that are opened during the start of the module
-        """         
+        """
         if self.track_lock_ctr_fd is not None:
             self.track_lock_ctr_fd.close()
-        
+
         if self.in_shmem_iface is not None:
             self.in_shmem_iface.destory_sm_buffer()
-            
+
+        if self.db is not None:
+            self.db.close()
+
         self.logger.info("Module interfaces are closed")
 
 
@@ -323,11 +423,17 @@ class HWC():
             - GAIN: Sets the IF gain values
 
         """
-        if command == "FREQ":            
+        if command == "FREQ":
             msg_byte_array = inter_module_messages.pack_msg_rf_tune(self.module_identifier, params[0])
             self.rtl_daq_socket.send(msg_byte_array)
             reply = self.rtl_daq_socket.recv()
             self.logger.debug(f"Received reply: {reply}")
+            if self.db is not None:
+                self.db.put_cal_event(CAL_EVENT_FREQ_CHANGE, self.iq_header)
+            if self.event_bus is not None:
+                from daq_events import DAQEvent, EVT_FREQ_CHANGE
+                self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                    event_type=EVT_FREQ_CHANGE, payload={"frequency": params[0]}))
         elif command == "GAIN":
             try:
                 if self.noise_source_state: # The noise source is turned on, we are storing only the gains
@@ -337,6 +443,12 @@ class HWC():
                     for m in range(self.M):
                         self.gains[m] = self.valid_gains.index(params[m])
                     self._change_gains()
+                    if self.db is not None:
+                        self.db.put_cal_event(CAL_EVENT_GAIN_CHANGE, self.iq_header)
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_GAIN_CHANGE
+                        self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                            event_type=EVT_GAIN_CHANGE, payload={"gains": list(params)}))
                 # Setting gain implies disabling AGC
                 self.agc = False
             except ValueError:
@@ -347,6 +459,34 @@ class HWC():
             else:
                 self.agc = True
                 self._enable_agc()
+        elif command == "SCHD":
+            # Load schedule from JSON payload or file path
+            if self.scheduler is not None:
+                try:
+                    from signal_scheduler import ScheduleParser
+                    payload = params[0] if params else ""
+                    if isinstance(payload, str) and payload.strip():
+                        if payload.strip().startswith('{'):
+                            sched = ScheduleParser.from_json(payload)
+                        else:
+                            sched = ScheduleParser.from_file(payload.strip())
+                        self.scheduler.load_schedule(sched)
+                        self.logger.info("Schedule loaded via control command")
+                except Exception as e:
+                    self.logger.error("Failed to load schedule: {:s}".format(str(e)))
+        elif command == "SCHS":
+            # Stop/clear schedule
+            if self.scheduler is not None:
+                self.scheduler.clear_schedule()
+        elif command == "SCHQ":
+            # Query status (logged for now)
+            if self.scheduler is not None:
+                status = self.scheduler.get_status()
+                self.logger.info("Schedule status: {:s}".format(str(status)))
+        elif command == "SCHN":
+            # Skip to next entry
+            if self.scheduler is not None:
+                self.scheduler.skip_to_next()
 
     
     def _control_noise_source(self, noise_source_state):
@@ -378,7 +518,13 @@ class HWC():
             msg_byte_array = inter_module_messages.pack_msg_noise_source_ctr(self.module_identifier, True)
             self.rtl_daq_socket.send(msg_byte_array)
             reply = self.rtl_daq_socket.recv()
-            self.logger.debug(f"Received reply: {reply}")                 
+            self.logger.debug(f"Received reply: {reply}")
+            if self.db is not None:
+                self.db.put_cal_event(CAL_EVENT_NOISE_ON, self.iq_header)
+            if self.event_bus is not None:
+                from daq_events import DAQEvent, EVT_NOISE_SOURCE_ON
+                self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                    event_type=EVT_NOISE_SOURCE_ON, payload={"cpi_index": self.iq_header.cpi_index}))
             self.noise_source_state = True # Next state
             self.current_state = "STATE_NOISE_CTR_WAIT"
         else:
@@ -387,6 +533,12 @@ class HWC():
             self.rtl_daq_socket.send(msg_byte_array)
             reply = self.rtl_daq_socket.recv()
             self.logger.debug(f"Received reply: {reply}")
+            if self.db is not None:
+                self.db.put_cal_event(CAL_EVENT_NOISE_OFF, self.iq_header)
+            if self.event_bus is not None:
+                from daq_events import DAQEvent, EVT_NOISE_SOURCE_OFF
+                self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                    event_type=EVT_NOISE_SOURCE_OFF, payload={"cpi_index": self.iq_header.cpi_index}))
             self.noise_source_state = False # Next state
 
             self.logger.info("Restore gain values after calibration")            
@@ -432,6 +584,15 @@ class HWC():
             	# iq_samples = buffer[1024:1024 + incoming_payload_size].view(dtype=np.complex64).reshape(self.iq_header.active_ant_chs, self.iq_header.cpi_length) [:,0:self.N_proc] 
                 
             self.logger.debug("Type:{:d}, CPI: {:d}, State:{:s}".format(self.iq_header.frame_type, self.iq_header.cpi_index, self.current_state))
+
+            # --> Periodic HW snapshot
+            if self.db is not None:
+                self._hw_snapshot_counter += 1
+                if self._hw_snapshot_counter >= self._hw_snapshot_interval:
+                    self._hw_snapshot_counter = 0
+                    self.db.put_hw_snapshot(self.iq_header,
+                                            overdrive_events=self.iq_header.adc_overdrive_flags)
+
             ##############################################
             #  Hardware Controller Finite State Machine  #
             ##############################################
@@ -446,9 +607,16 @@ class HWC():
                                         self.iq_header.if_gains[m], self.iq_header.cpi_index))                                            
 
                 # -> Chech overdrive per channel
+                overdrive_detected = False
                 for m in range(self.M):
                     if(self.iq_header.adc_overdrive_flags & 1<<m):
                         self.logger.warning("Overdrive ch {:d} [{:d}]".format(m, self.iq_header.cpi_index))
+                        overdrive_detected = True
+                if overdrive_detected and self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_OVERDRIVE
+                    self.event_bus.emit(DAQEvent(severity="warning", module="hw_controller",
+                        event_type=EVT_OVERDRIVE, payload={"flags": self.iq_header.adc_overdrive_flags,
+                            "cpi_index": self.iq_header.cpi_index}))
 
                 #
                 #------------------------------------------>
@@ -547,8 +715,26 @@ class HWC():
                         else: # self.iq_header.sync_state < 6
                             self.cal_frame_cntr = 0
                     
+                    # --> Scheduler tick
+                    if self.scheduler is not None:
+                        sched_cmd = self.scheduler.tick(self.iq_header)
+                        if sched_cmd is not None:
+                            self.logger.info("Schedule command: {:s}".format(sched_cmd[0]))
+                            if self.event_bus is not None:
+                                from daq_events import DAQEvent, EVT_SCHEDULE_TRANSITION
+                                self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                                    event_type=EVT_SCHEDULE_TRANSITION, payload={
+                                        "command": sched_cmd[0], "value": sched_cmd[1]}))
+                            self._handle_control_reqest(sched_cmd[0], [sched_cmd[1]])
+                            if sched_cmd[0] == "FREQ":
+                                self.cal_frame_cntr = 0  # Reset burst counter for new freq
+                                # Issue gain command if entry has gains
+                                gain_cmd = self.scheduler.get_pending_gain()
+                                if gain_cmd is not None:
+                                    self._handle_control_reqest(gain_cmd[0], gain_cmd[1])
+
                     # --> External control request handling
-                    ctr_request_condition.acquire()                    
+                    ctr_request_condition.acquire()
                     if len(ctr_request) !=0 :
                         self.logger.info("Control request: {:s}".format(ctr_request[0]))
                         self._handle_control_reqest(ctr_request[0], ctr_request[1:])
@@ -575,20 +761,22 @@ class HWC():
 
 class CtrIfaceServer(threading.Thread):
             
-    def __init__(self, M):
+    def __init__(self, M, port=5001):
         """
             Initialize the Ethernet socket based control interface
             Parameters:
             -----------
             :param: M: Number of receiver channels in the system
             :type:  M: int
+            :param: port: TCP port number for the control interface
+            :type:  port: int
         """
 
         self.logger = logging.getLogger(__name__)
-        threading.Thread.__init__(self)  
+        threading.Thread.__init__(self)
 
         # Control interface server parameters
-        self.ctr_iface_port_no = 5001 # TODO: Set this port number from the ini file
+        self.ctr_iface_port_no = port
         self.ctr_iface_socket =  socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.ctr_iface_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.ctr_iface_addr = ("", self.ctr_iface_port_no)
@@ -689,6 +877,30 @@ class CtrIfaceServer(threading.Thread):
             self.logger.info("Inititalization command received")
             ctr_request.clear()
             ctr_request.append(command)
+
+        elif command == "SCHD":
+            # Schedule load: payload is file path or compact JSON
+            payload = msg_bytes[4:128].decode('utf-8', errors='ignore').rstrip('\x00').strip()
+            self.logger.info("Received schedule load command")
+            ctr_request.clear()
+            ctr_request.append(command)
+            ctr_request.append(payload)
+
+        elif command == "SCHS":
+            self.logger.info("Received schedule stop command")
+            ctr_request.clear()
+            ctr_request.append(command)
+
+        elif command == "SCHQ":
+            self.logger.info("Received schedule query command")
+            ctr_request.clear()
+            ctr_request.append(command)
+
+        elif command == "SCHN":
+            self.logger.info("Received schedule next command")
+            ctr_request.clear()
+            ctr_request.append(command)
+
         else:
             self.logger.error("Unidentified control command: {:s}".format(command))
 
@@ -698,7 +910,17 @@ class CtrIfaceServer(threading.Thread):
 
 if __name__ == "__main__":
     HWC_inst0 = HWC()
-    if HWC_inst0.init() == 0:
-        HWC_inst0.start()
-
-HWC_inst0.close()
+    try:
+        if HWC_inst0.init() == 0:
+            if HWC_inst0.event_bus is not None:
+                from daq_events import DAQEvent, EVT_PROCESS_START
+                HWC_inst0.event_bus.emit(DAQEvent(severity="info",
+                    module="hw_controller", event_type=EVT_PROCESS_START, payload={}))
+            HWC_inst0.start()
+    finally:
+        if HWC_inst0.event_bus is not None:
+            from daq_events import DAQEvent, EVT_PROCESS_STOP
+            HWC_inst0.event_bus.emit(DAQEvent(severity="info",
+                module="hw_controller", event_type=EVT_PROCESS_STOP, payload={}))
+            HWC_inst0.event_bus.close()
+        HWC_inst0.close()

@@ -37,7 +37,7 @@
 
 #define IQ_SERVER_PORT  	    5000
 
-int iq_stream_con(int * sockets)
+int iq_stream_con(int * sockets, int port)
 {
    /*
 	*	Description:
@@ -64,7 +64,7 @@ int iq_stream_con(int * sockets)
 	}
 	// Set server address parameters
 	server_addr.sin_family = AF_INET; // Address family
-	server_addr.sin_port = htons(IQ_SERVER_PORT);
+	server_addr.sin_port = htons(port);
 	server_addr.sin_addr.s_addr = INADDR_ANY; // Set the server IP address to own
 	bzero(&(server_addr.sin_zero),8);
 
@@ -79,7 +79,7 @@ int iq_stream_con(int * sockets)
 		return(-1);
 	}
 
-	log_info("IQ Data TCP Server waiting for client on port %d",IQ_SERVER_PORT);	
+	log_info("IQ Data TCP Server waiting for client on port %d",port);	
 
     sin_size = sizeof(struct sockaddr_in);
     connected = accept(sock, (struct sockaddr *)&client_addr,&sin_size);

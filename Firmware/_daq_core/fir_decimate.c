@@ -60,6 +60,8 @@ typedef struct
     int en_filter_reset;
     int tap_size;
     int log_level;
+    int instance_id;
+    int port_stride;
 } configuration;
 
 /*
@@ -82,8 +84,12 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {pconfig->en_filter_reset = atoi(value);}
     else if(MATCH("pre_processing", "fir_tap_size"))
     {pconfig->tap_size = atoi(value);}
-    else if (MATCH("daq", "log_level")) 
+    else if (MATCH("daq", "log_level"))
     {pconfig->log_level = atoi(value);}
+    else if (MATCH("federation", "instance_id"))
+    {pconfig->instance_id = atoi(value);}
+    else if (MATCH("federation", "port_stride"))
+    {pconfig->port_stride = atoi(value);}
     else {return 0;  /* unknown section/name, error */}
     return 0;
 }
@@ -98,6 +104,8 @@ int main(int argc, char **argv)
 {
     log_set_level(LOG_TRACE);
     configuration config;
+    config.instance_id = 0;
+    config.port_stride = 100;
     bool filter_reset;
     int ch_no,dec;     
     int exit_flag=0;
@@ -137,10 +145,10 @@ int main(int argc, char **argv)
     {input_sm_buff->shared_memory_size = config.cal_size*config.num_ch*4*2+IQ_HEADER_LENGTH;}
     input_sm_buff->io_type = 1; // Input type
     
-    strcpy(input_sm_buff->shared_memory_names[0], DECIMATOR_IN_SM_NAME_A);
-    strcpy(input_sm_buff->shared_memory_names[1], DECIMATOR_IN_SM_NAME_B);
-    strcpy(input_sm_buff->fw_ctr_fifo_name, DECIMATOR_IN_FW_FIFO);
-    strcpy(input_sm_buff->bw_ctr_fifo_name, DECIMATOR_IN_BW_FIFO);
+    build_shmem_name(input_sm_buff->shared_memory_names[0], config.instance_id, DECIMATOR_IN_SM_NAME_A);
+    build_shmem_name(input_sm_buff->shared_memory_names[1], config.instance_id, DECIMATOR_IN_SM_NAME_B);
+    build_fifo_path(input_sm_buff->fw_ctr_fifo_name, config.instance_id, DECIMATOR_IN_FW_FIFO);
+    build_fifo_path(input_sm_buff->bw_ctr_fifo_name, config.instance_id, DECIMATOR_IN_BW_FIFO);
     
     int succ = init_in_sm_buffer(input_sm_buff);
     if (succ !=0) {FATAL_ERR("Input shared memory iniyialization failed")}
@@ -151,10 +159,10 @@ int main(int argc, char **argv)
     output_sm_buff->shared_memory_size = MAX_IQFRAME_PAYLOAD_SIZE*ch_no*4*2+IQ_HEADER_LENGTH;         
     output_sm_buff->io_type = 0; // Output type
     output_sm_buff->drop_mode = drop_mode;
-    strcpy(output_sm_buff->shared_memory_names[0], DECIMATOR_OUT_SM_NAME_A);
-    strcpy(output_sm_buff->shared_memory_names[1], DECIMATOR_OUT_SM_NAME_B);
-    strcpy(output_sm_buff->fw_ctr_fifo_name, DECIMATOR_OUT_FW_FIFO);
-    strcpy(output_sm_buff->bw_ctr_fifo_name, DECIMATOR_OUT_BW_FIFO);
+    build_shmem_name(output_sm_buff->shared_memory_names[0], config.instance_id, DECIMATOR_OUT_SM_NAME_A);
+    build_shmem_name(output_sm_buff->shared_memory_names[1], config.instance_id, DECIMATOR_OUT_SM_NAME_B);
+    build_fifo_path(output_sm_buff->fw_ctr_fifo_name, config.instance_id, DECIMATOR_OUT_FW_FIFO);
+    build_fifo_path(output_sm_buff->bw_ctr_fifo_name, config.instance_id, DECIMATOR_OUT_BW_FIFO);
 
     succ = init_out_sm_buffer(output_sm_buff);
     if(succ !=0){FATAL_ERR("Shared memory initialization failed")}

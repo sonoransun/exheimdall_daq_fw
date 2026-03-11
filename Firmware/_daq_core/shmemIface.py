@@ -31,20 +31,25 @@ TERMINATE    = 255
 class outShmemIface():
    
 
-    def __init__(self, shmem_name, shmem_size, drop_mode = False):
-        
-        self.init_ok = True        
+    def __init__(self, shmem_name, shmem_size, drop_mode = False, instance_id=0):
+
+        self.init_ok = True
         self.logger = logging.getLogger(__name__)
         self.ignore_frame_drop_warning = True
         self.drop_mode = drop_mode
         self.dropped_frame_cntr = 0
-        
+
+        # Apply instance namespacing
+        original_name = shmem_name
+        if instance_id != 0:
+            shmem_name = f"inst{instance_id}_{shmem_name}"
+
         self.shmem_name = shmem_name
         self.buffer_free = [True, True]
 
         self.memories = []
         self.buffers = []
-        
+
         # Try to remove shared memories if already exist
         try:
             shmem_A = shared_memory.SharedMemory(name=shmem_name+'_A',create=False, size=shmem_size)
@@ -58,21 +63,24 @@ class outShmemIface():
             #shmem_B.unlink()
         except FileNotFoundError as err:
             self.logger.warning("Shared memory not exist")
-        
+
         # Create the shared memories
         self.memories.append(shared_memory.SharedMemory(name=shmem_name+'_A',create=True, size=shmem_size))
         self.memories.append(shared_memory.SharedMemory(name=shmem_name+'_B',create=True, size=shmem_size))
         self.buffers.append(np.ndarray((shmem_size,), dtype=np.uint8, buffer=self.memories[0].buf))
-        self.buffers.append(np.ndarray((shmem_size,), dtype=np.uint8, buffer=self.memories[1].buf))                
-        
+        self.buffers.append(np.ndarray((shmem_size,), dtype=np.uint8, buffer=self.memories[1].buf))
+
         # Opening control FIFOs
+        fifo_prefix = '_data_control/'
+        if instance_id != 0:
+            fifo_prefix += f'inst{instance_id}_'
         if self.drop_mode:
             bw_fifo_flags = os.O_RDONLY | os.O_NONBLOCK
         else:
             bw_fifo_flags = os.O_RDONLY
-        try:            
-            self.fw_ctr_fifo = os.open('_data_control/'+'fw_'+shmem_name, os.O_WRONLY)             
-            self.bw_ctr_fifo = os.open('_data_control/'+'bw_'+shmem_name, bw_fifo_flags)            
+        try:
+            self.fw_ctr_fifo = os.open(fifo_prefix+'fw_'+original_name, os.O_WRONLY)
+            self.bw_ctr_fifo = os.open(fifo_prefix+'bw_'+original_name, bw_fifo_flags)
         except OSError as err:
             self.logger.critical("OS error: {0}".format(err))
             self.logger.critical("Failed to open control fifos")
@@ -134,27 +142,35 @@ class outShmemIface():
 
 class inShmemIface():
 
-    def __init__(self, shmem_name):
-        
-        self.init_ok = True                
+    def __init__(self, shmem_name, instance_id=0):
+
+        self.init_ok = True
         self.logger = logging.getLogger(__name__)
         self.drop_mode = False
-        
-        self.shmem_name = shmem_name
-        
-        self.memories = []
-        self.buffers = []        
 
-        try:            
-            self.fw_ctr_fifo = os.open('_data_control/'+'fw_'+shmem_name, os.O_RDONLY)
-            self.bw_ctr_fifo = os.open('_data_control/'+'bw_'+shmem_name, os.O_WRONLY)                         
+        # Apply instance namespacing
+        original_name = shmem_name
+        if instance_id != 0:
+            shmem_name = f"inst{instance_id}_{shmem_name}"
+
+        self.shmem_name = shmem_name
+
+        self.memories = []
+        self.buffers = []
+
+        fifo_prefix = '_data_control/'
+        if instance_id != 0:
+            fifo_prefix += f'inst{instance_id}_'
+        try:
+            self.fw_ctr_fifo = os.open(fifo_prefix+'fw_'+original_name, os.O_RDONLY)
+            self.bw_ctr_fifo = os.open(fifo_prefix+'bw_'+original_name, os.O_WRONLY)
         except OSError as err:
             self.logger.critical("OS error: {0}".format(err))
             self.logger.critical("Failed to open control fifos")
             self.bw_ctr_fifo = None
             self.fw_ctr_fifo = None
             self.init_ok = False
-        
+
         if self.fw_ctr_fifo is not None:
             if unpack('B', os.read(self.fw_ctr_fifo, 1))[0] == INIT_READY:
                 self.memories.append(shared_memory.SharedMemory(name=shmem_name+'_A'))

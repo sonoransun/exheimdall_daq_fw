@@ -90,6 +90,54 @@ data_interface = {
     "out_data_iface_type" : "shmem"
 }
 
+#[schedule]
+schedule = {
+    "en_schedule"          :"0",
+    "schedule_mode"        :"none",
+    "schedule_file"        :"",
+    "frequencies"          :"",
+    "gains"                :"",
+    "dwell_frames"         :"",
+    "repeat_mode"          :"loop",
+    "require_cal_on_hop"   :"1",
+    "max_cal_wait_frames"  :"500"
+}
+#[database]
+database = {
+    "en_db"                    :"0",
+    "db_dir"                   :"_db",
+    "max_db_size_mb"           :"500",
+    "rotation_max_age_hours"   :"168",
+    "write_batch_size"         :"50",
+    "write_flush_interval_sec" :"1.0",
+    "hw_snapshot_interval"     :"100"
+}
+#[monitoring]
+monitoring = {
+    "en_monitoring"            :"0",
+    "en_syslog"                :"0",
+    "syslog_address"           :"/dev/log",
+    "syslog_facility"          :"daemon",
+    "syslog_min_severity"      :"warning",
+    "en_metrics"               :"0",
+    "metrics_window_size"      :"1000",
+    "heartbeat_interval"       :"100",
+    "en_status_server"         :"0",
+    "status_server_port"       :"5002",
+    "en_zmq_pub"               :"0",
+    "zmq_pub_port"             :"5003",
+    "event_ring_size"          :"500"
+}
+#[federation]
+federation = {
+    "instance_id"              :"0",
+    "port_stride"              :"100",
+    "en_federation"            :"0",
+    "coordinator_host"         :"",
+    "coordinator_port"         :"6000",
+    "peer_list"                :""
+}
+
 daq_chain_ini_cfg = {"meta"           : meta,
                      "hw"             : hw,
                      "daq"            : daq,
@@ -97,7 +145,11 @@ daq_chain_ini_cfg = {"meta"           : meta,
                      "pre_processing" : pre_processing,
                      "calibration"    : calibration,
                      "adpis"          : adpis,
-                     "data_interface" : data_interface
+                     "data_interface" : data_interface,
+                     "schedule"       : schedule,
+                     "database"       : database,
+                     "monitoring"     : monitoring,
+                     "federation"     : federation
                      }
 
 

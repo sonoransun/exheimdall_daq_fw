@@ -216,6 +216,39 @@ int init_in_sm_buffer(struct shmem_transfer_struct* sm_buff)
     return 0;
 }
 
+/*
+*-------------------------------------
+*    Federation instance helpers
+*-------------------------------------
+*/
+
+void build_shmem_name(char* dest, int instance_id, const char* base_name) {
+    if (instance_id == 0) {
+        strcpy(dest, base_name);
+    } else {
+        sprintf(dest, "inst%d_%s", instance_id, base_name);
+    }
+}
+
+void build_fifo_path(char* dest, int instance_id, const char* base_path) {
+    if (instance_id == 0) {
+        strcpy(dest, base_path);
+    } else {
+        const char* prefix = "_data_control/";
+        size_t prefix_len = strlen(prefix);
+        if (strncmp(base_path, prefix, prefix_len) == 0) {
+            const char* suffix = base_path + prefix_len;
+            sprintf(dest, "%sinst%d_%s", prefix, instance_id, suffix);
+        } else {
+            sprintf(dest, "inst%d_%s", instance_id, base_path);
+        }
+    }
+}
+
+int compute_port(int base_port, int instance_id, int stride) {
+    return base_port + instance_id * stride;
+}
+
 int destory_sm_buffer(struct shmem_transfer_struct* sm_buff)
 {
     /* Unmap the shared memory object */    

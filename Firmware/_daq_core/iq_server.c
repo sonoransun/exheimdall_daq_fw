@@ -48,8 +48,10 @@
 typedef struct
 {
     int num_ch;
-    int cpi_size;    
-    int log_level;      
+    int cpi_size;
+    int log_level;
+    int instance_id;
+    int port_stride;
 } configuration;
 
 /*
@@ -70,9 +72,17 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {
         pconfig->cpi_size = atoi(value);
     }
-    else if (MATCH("daq", "log_level")) 
+    else if (MATCH("daq", "log_level"))
     {
         pconfig->log_level = atoi(value);
+    }
+    else if (MATCH("federation", "instance_id"))
+    {
+        pconfig->instance_id = atoi(value);
+    }
+    else if (MATCH("federation", "port_stride"))
+    {
+        pconfig->port_stride = atoi(value);
     }
     else {
         return 0;  /* unknown section/name, error */
@@ -99,6 +109,8 @@ int main(int argc, char* argv[])
 {
     log_set_level(LOG_TRACE);
     configuration config;
+    config.instance_id = 0;
+    config.port_stride = 100;
 	int ret = 0;
     int active_buff_ind;
     char eth_cmd[1024]; // Ethernet command buffer   
@@ -114,10 +126,10 @@ int main(int argc, char* argv[])
     struct shmem_transfer_struct* input_sm_buff = calloc(1, sizeof(struct shmem_transfer_struct));
     input_sm_buff->shared_memory_size = MAX_IQFRAME_PAYLOAD_SIZE*config.num_ch*4*2+IQ_HEADER_LENGTH;         
     input_sm_buff->io_type = 1; // Input type
-    strcpy(input_sm_buff->shared_memory_names[0], DELAY_SYNC_IQ_SM_NAME_A);
-    strcpy(input_sm_buff->shared_memory_names[1], DELAY_SYNC_IQ_SM_NAME_B);
-    strcpy(input_sm_buff->fw_ctr_fifo_name, DELAY_SYNC_IQ_FW_FIFO);
-    strcpy(input_sm_buff->bw_ctr_fifo_name, DELAY_SYNC_IQ_BW_FIFO);
+    build_shmem_name(input_sm_buff->shared_memory_names[0], config.instance_id, DELAY_SYNC_IQ_SM_NAME_A);
+    build_shmem_name(input_sm_buff->shared_memory_names[1], config.instance_id, DELAY_SYNC_IQ_SM_NAME_B);
+    build_fifo_path(input_sm_buff->fw_ctr_fifo_name, config.instance_id, DELAY_SYNC_IQ_FW_FIFO);
+    build_fifo_path(input_sm_buff->bw_ctr_fifo_name, config.instance_id, DELAY_SYNC_IQ_BW_FIFO);
 	
 	ret= init_in_sm_buffer(input_sm_buff);
     if (ret !=0) {FATAL_ERR("Failed to init shared memory interface")} 
@@ -130,7 +142,7 @@ int main(int argc, char* argv[])
 		
 		/* This function blocks until a client connects to the server */
 		int * sockets = malloc(2*sizeof(int)); //[server, client] 
-        iq_stream_con(sockets);        
+        iq_stream_con(sockets, compute_port(5000, config.instance_id, config.port_stride));
         // TODO: Check and handle success
         
         int exit_flag =0;
