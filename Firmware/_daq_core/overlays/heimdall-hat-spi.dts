@@ -1,0 +1,187 @@
+/*
+ * Device Tree Overlay: HeIMDALL HAT SPI0 (62.5 MHz)
+ *
+ * Enables SPI0 on the BCM2711 and configures it for high-speed
+ * communication with the HeIMDALL FPGA HAT at 62.5 MHz.
+ *
+ * The FPGA HAT uses SPI for:
+ *   - Register read/write access to FPGA control/status registers
+ *   - Bitstream loading during FPGA configuration
+ *   - Small burst IQ data transfers (when PCIe/USB3 is not available)
+ *   - Noise source control and calibration commands
+ *
+ * The BCM2711 SPI0 peripheral can run up to 125 MHz (core_clk / 2),
+ * but 62.5 MHz (core_clk / 8) is the fastest reliable speed for
+ * FPGA targets with multi-layer PCB trace lengths typical of HAT
+ * form factors.
+ *
+ * GPIO assignments (active by default):
+ *   SPI0 (data channel):
+ *     GPIO10 (pin 19) = SPI0_MOSI
+ *     GPIO9  (pin 21) = SPI0_MISO
+ *     GPIO11 (pin 23) = SPI0_SCLK
+ *     GPIO8  (pin 24) = SPI0_CE0_N
+ *
+ *   GPIO25 (pin 22) = DRDY (data ready, FPGA -> Pi, active high)
+ *   GPIO26 (pin 37) = RESET (Pi -> FPGA, active low)
+ *
+ * CE0 is active-low and directly connected to the FPGA SPI slave.
+ * CE1 is optionally routed to a configuration flash on the HAT.
+ *
+ * Load with:
+ *   dtoverlay=heimdall-hat-spi
+ * or with a lower speed:
+ *   dtoverlay=heimdall-hat-spi,spi0_speed=32000000
+ *
+ * Project : HeIMDALL DAQ Firmware
+ * License : GNU GPL V3
+ *
+ * Copyright (C) 2018-2024  HeIMDALL DAQ Contributors
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    /*
+     * Enable SPI0 for bulk data transfers to the FPGA HAT.
+     * CE0 connects to the FPGA SPI slave core.
+     *
+     * SPI mode 0 (CPOL=0, CPHA=0) is used by the HeIMDALL
+     * FPGA SPI slave core.  The spi-max-frequency is advisory;
+     * the actual clock is set by the spidev driver or userspace
+     * ioctl.  We declare 62.5 MHz as the upper bound.
+     */
+    fragment@0 {
+        target = <&spi0>;
+        __overlay__ {
+            status = "okay";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            heimdall_fpga_data: spidev@0 {
+                compatible = "heimdall,fpga-spi", "spidev";
+                reg = <0>;  /* CE0 */
+                spi-max-frequency = <62500000>;
+
+                /*
+                 * Data-ready GPIO: active-high interrupt from FPGA
+                 * indicating that a complete IQ block is available
+                 * for SPI readout.
+                 */
+                drdy-gpios = <&gpio 25 0>;  /* GPIO 25, active high */
+            };
+        };
+    };
+
+    /*
+     * Pin configuration for SPI0 lines.
+     * Alt0 selects SPI0 on GPIO 7-11 (BCM2711 datasheet Table 6-31).
+     */
+    fragment@1 {
+        target = <&gpio>;
+        __overlay__ {
+            spi0_pins: spi0_pins {
+                brcm,pins = <7 8 9 10 11>;
+                brcm,function = <4>;  /* alt0 = SPI0 */
+                brcm,pull = <
+                    0   /* CE1:  none */
+                    0   /* CE0:  none */
+                    2   /* MISO: pull-up */
+                    0   /* MOSI: none */
+                    0   /* SCLK: none */
+                >;
+            };
+        };
+    };
+
+    /*
+     * FPGA data-ready interrupt pin (active-high).
+     * Configured as input with no pull so the FPGA drives it directly.
+     */
+    fragment@2 {
+        target = <&gpio>;
+        __overlay__ {
+            heimdall_hat_pins: heimdall_hat_pins {
+                /* DRDY input (GPIO25), RESET output (GPIO26) */
+                brcm,pins = <25 26>;
+                brcm,function = <0 1>;  /* 0=input, 1=output */
+                brcm,pull = <1 0>;      /* DRDY: pull-down, RESET: none */
+            };
+        };
+    };
+
+    /*
+     * Optional: SPI1 command/register channel at 10 MHz.
+     * Some HAT revisions use a second SPI bus for low-speed register
+     * access, leaving SPI0 dedicated to bulk data.  Dormant by default;
+     * activated via the "spi1_cmd" override.
+     */
+    fragment@3 {
+        target = <&spi1>;
+        __dormant__ {
+            status = "okay";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            heimdall_fpga_cmd: spidev@0 {
+                compatible = "heimdall,fpga-spi-cmd", "spidev";
+                reg = <0>;
+                spi-max-frequency = <10000000>;
+            };
+        };
+    };
+
+    /*
+     * Optional: configuration flash on SPI0 CE1.
+     * Dormant by default; enabling this adds a second spidev node
+     * for direct access to an SPI NOR flash on the HAT.
+     */
+    fragment@4 {
+        target = <&spi0>;
+        __dormant__ {
+            config_flash: spidev@1 {
+                compatible = "jedec,spi-nor", "spidev";
+                reg = <1>;  /* CE1 */
+                spi-max-frequency = <25000000>;
+            };
+        };
+    };
+
+    __overrides__ {
+        /*
+         * spi0_speed: SPI0 clock frequency in Hz (default 62500000).
+         * Useful for debugging or boards with marginal signal integrity.
+         * Common values: 1000000, 10000000, 32000000, 62500000.
+         */
+        spi0_speed    = <&heimdall_fpga_data>, "spi-max-frequency:0";
+
+        /*
+         * drdy_pin: GPIO number for data-ready interrupt (default 25).
+         */
+        drdy_pin      = <&heimdall_hat_pins>, "brcm,pins:0";
+
+        /*
+         * reset_pin: GPIO number for FPGA reset (default 26).
+         */
+        reset_pin     = <&heimdall_hat_pins>, "brcm,pins:4";
+
+        /*
+         * spi1_cmd: enable the SPI1 command channel.
+         */
+        spi1_cmd      = <0>, "+3";
+
+        /*
+         * spi1_speed: SPI1 clock frequency in Hz (default 10000000).
+         * Only effective when spi1_cmd is also set.
+         */
+        spi1_speed    = <&heimdall_fpga_cmd>, "spi-max-frequency:0";
+
+        /*
+         * config_flash: enable the CE1 configuration flash device.
+         */
+        config_flash  = <0>, "+4";
+    };
+};

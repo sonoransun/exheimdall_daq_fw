@@ -78,6 +78,44 @@ if test $out -ne 0
         echo -e "\e[91mDAQ chain not started!\e[39m"
         exit
 fi
+
+# --- Hardware Discovery & Initialization ---
+echo "Discovering available hardware..."
+python3 _daq_core/hw_discover.py > _data_control/hw_caps.json 2>/dev/null || true
+python3 _daq_core/auto_config.py _data_control/hw_caps.json daq_chain_config.ini 2>/dev/null || true
+
+# FPGA bitstream loading (if enabled)
+FPGA_ENABLE=$(python3 -c "
+from configparser import ConfigParser
+c = ConfigParser()
+c.read('daq_chain_config.ini')
+print(c.get('fpga', 'enable', fallback='0'))
+" 2>/dev/null || echo "0")
+if [ "$FPGA_ENABLE" = "1" ]; then
+    FPGA_BITSTREAM=$(python3 -c "
+from configparser import ConfigParser
+c = ConfigParser()
+c.read('daq_chain_config.ini')
+print(c.get('fpga', 'bitstream', fallback=''))
+" 2>/dev/null)
+    if [ -n "$FPGA_BITSTREAM" ] && [ -f "$FPGA_BITSTREAM" ]; then
+        echo "Loading FPGA bitstream: $FPGA_BITSTREAM"
+        python3 _daq_core/fpga_loader.py "$FPGA_BITSTREAM" || echo "FPGA load failed, continuing with CPU-only mode"
+    fi
+fi
+
+# GPU initialization (if enabled)
+GPU_ENABLE=$(python3 -c "
+from configparser import ConfigParser
+c = ConfigParser()
+c.read('daq_chain_config.ini')
+print(c.get('gpu', 'enable', fallback='0'))
+" 2>/dev/null || echo "0")
+if [ "$GPU_ENABLE" = "1" ]; then
+    echo "Initializing GPU offload..."
+    python3 _daq_core/gpu_init.py || echo "GPU init failed, continuing with CPU-only mode"
+fi
+
 # Create PID directory for this instance
 PID_DIR="_logs/inst${instance_id}/pids"
 mkdir -p "$PID_DIR"

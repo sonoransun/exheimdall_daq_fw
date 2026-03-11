@@ -32,6 +32,7 @@ from configparser import ConfigParser
 # Import HeIMDALL modules
 from iq_header import IQHeader
 from shmemIface import inShmemIface
+from transportIface import TransportConsumer
 import zmq
 import inter_module_messages
 from daq_db_records import (CAL_EVENT_NOISE_ON, CAL_EVENT_NOISE_OFF,
@@ -98,6 +99,9 @@ class HWC():
         # Federation
         self.instance_id = 0
         self.port_stride = 100
+
+        # Offload / transport defaults
+        self.transport_type = 'shm'
 
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
@@ -277,6 +281,10 @@ class HWC():
                 logging.info("Federation instance_id={:d}, port_stride={:d}".format(
                     self.instance_id, self.port_stride))
 
+        # Offload / transport configuration
+        if parser.has_section('offload'):
+            self.transport_type = parser.get('offload', 'delay_sync_transport', fallback='shm')
+
     def init(self):
         """
             Initializes the Hardware Controller module
@@ -301,10 +309,15 @@ class HWC():
             self.logger.critical("OS error: {0}".format(err))
             self.logger.critical("Failed to open control fifos, exiting..")
             return -1
-        # Initialize shared memory interface
-        self.in_shmem_iface = inShmemIface("delay_sync_hwc", instance_id=self.instance_id)
+        # Initialize data input interface (shared memory or transport abstraction)
+        if self.transport_type == 'shm':
+            self.in_shmem_iface = inShmemIface("delay_sync_hwc", instance_id=self.instance_id)
+        else:
+            self.in_shmem_iface = TransportConsumer("delay_sync_hwc",
+                                                     instance_id=self.instance_id,
+                                                     transport_type=self.transport_type)
         if not self.in_shmem_iface.init_ok:
-            logging.critical("Shared memory initialization failed")
+            logging.critical("Data input interface initialization failed (transport={:s})".format(self.transport_type))
             return -3
         # ADPIS
         if self.en_adpis:

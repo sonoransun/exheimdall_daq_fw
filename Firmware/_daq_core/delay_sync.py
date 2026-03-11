@@ -47,6 +47,8 @@ from numba import jit, njit
 # Import HeIMDALL modules
 from iq_header import IQHeader
 from shmemIface import outShmemIface, inShmemIface
+from transportIface import TransportProducer, TransportConsumer
+from offload_engines import FFTEngine, CorrelationEngine
 import inter_module_messages
 from daq_db_records import (CAL_EVENT_CAL_START, CAL_EVENT_SAMPLE_CAL_DONE,
                             CAL_EVENT_IQ_CAL_DONE, CAL_EVENT_TRACK_LOCK,
@@ -131,14 +133,22 @@ class delaySynchronizer():
         self.port_stride = 100
         self.federation_health = None
 
+        # Offload / transport defaults
+        self.transport_type = 'shm'
+        self.fft_engine_type = 'cpu_scipy'
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
 
-        # Configure logger        
+        # Configure logger
         self.logger.setLevel(self.log_level)
         float_formatter = "{:.2f}".format
         np.set_printoptions(formatter={'float_kind':float_formatter})
-        
+
+        # Initialize compute engines
+        self.fft_engine = FFTEngine(engine_type=self.fft_engine_type)
+        self.logger.info("FFT engine: {:s}".format(self.fft_engine_type))
+
         self.iq_header = IQHeader()
         """
             Block sizes measured in bytes        
@@ -337,6 +347,17 @@ class delaySynchronizer():
                     self.logger.error("Failed to initialize status server: {:s}".format(str(e)))
                     self.status_server = None
 
+        # Offload / transport configuration
+        if parser.has_section('offload'):
+            self.transport_type = parser.get('offload', 'delay_sync_transport', fallback='shm')
+            fft_engine_cfg = parser.get('offload', 'fft_engine', fallback='auto')
+            if fft_engine_cfg == 'auto':
+                self.fft_engine_type = 'cpu_scipy'
+            else:
+                self.fft_engine_type = fft_engine_cfg
+            self.logger.info("Offload config: transport={:s}, fft_engine={:s}".format(
+                self.transport_type, self.fft_engine_type))
+
         return 0
     def open_interfaces(self):
         """
@@ -361,30 +382,49 @@ class delaySynchronizer():
         self.rtl_daq_socket = context.socket(zmq.REQ)
         self.rtl_daq_socket.connect("tcp://localhost:{:d}".format(zmq_port))
 
-        # Open shared memory interface to receive data from the decimator
-        self.in_shmem_iface = inShmemIface("decimator_out", instance_id=self.instance_id)
+        # Open input interface to receive data from the decimator
+        if self.transport_type == 'shm':
+            self.in_shmem_iface = inShmemIface("decimator_out", instance_id=self.instance_id)
+        else:
+            self.in_shmem_iface = TransportConsumer("decimator_out",
+                                     instance_id=self.instance_id,
+                                     transport_type=self.transport_type)
         if not self.in_shmem_iface.init_ok:
-            self.logger.critical("Shared memory (Decimator) initialization failed, exiting..")
+            self.logger.critical("Input interface (Decimator) initialization failed, exiting..")
             return -1
 
-        # Open shared memory interface towards the iq server module
+        # Open output interface towards the iq server module
         if self.N >= self.N_proc: out_shmem_size = int(1024+self.N*2*self.M*(32/8))
         else: out_shmem_size = int(1024+self.N_proc*2*self.M*(32/8))
-        self.out_shmem_iface_iq = outShmemIface("delay_sync_iq",
-                                 out_shmem_size,
-                                 drop_mode = True,
-                                 instance_id=self.instance_id)
+        if self.transport_type == 'shm':
+            self.out_shmem_iface_iq = outShmemIface("delay_sync_iq",
+                                     out_shmem_size,
+                                     drop_mode = True,
+                                     instance_id=self.instance_id)
+        else:
+            self.out_shmem_iface_iq = TransportProducer("delay_sync_iq",
+                                     out_shmem_size,
+                                     drop_mode = True,
+                                     instance_id=self.instance_id,
+                                     transport_type=self.transport_type)
         if not self.out_shmem_iface_iq.init_ok:
-            self.logger.critical("Shared memory (IQ server) initialization failed, exiting..")
+            self.logger.critical("Output interface (IQ server) initialization failed, exiting..")
             return -1
 
-        # Open shared memory interface towards the hardware controller module
-        self.out_shmem_iface_hwc = outShmemIface("delay_sync_hwc",
-                                 out_shmem_size,
-                                 drop_mode = True,
-                                 instance_id=self.instance_id)
+        # Open output interface towards the hardware controller module
+        if self.transport_type == 'shm':
+            self.out_shmem_iface_hwc = outShmemIface("delay_sync_hwc",
+                                     out_shmem_size,
+                                     drop_mode = True,
+                                     instance_id=self.instance_id)
+        else:
+            self.out_shmem_iface_hwc = TransportProducer("delay_sync_hwc",
+                                     out_shmem_size,
+                                     drop_mode = True,
+                                     instance_id=self.instance_id,
+                                     transport_type=self.transport_type)
         if not self.out_shmem_iface_hwc.init_ok:
-            self.logger.critical("Shared memory (HWC) initialization failed, exiting..")
+            self.logger.critical("Output interface (HWC) initialization failed, exiting..")
             return -1
         return 0
     def close_interfaces(self):
@@ -520,7 +560,7 @@ class delaySynchronizer():
         std_ch_w_block = np.zeros((N//block_size, block_size), dtype=np.complex64)
         #  - Transform standard channel to frequency domain block-wise
         for block_index, block_start in enumerate(np.arange(0,N, block_size)):
-            std_ch_w_block[block_index,:] =  fft.fftshift(fft.fft(iq_samples[0, block_start:block_start+block_size], workers=4, overwrite_x=False))
+            std_ch_w_block[block_index,:] =  fft.fftshift(self.fft_engine.forward(iq_samples[0, block_start:block_start+block_size], overwrite_x=False))
 
         for m in range(M-1):
             # Correct fix phase offset
@@ -529,7 +569,7 @@ class delaySynchronizer():
             
             for block_index, block_start in enumerate(np.arange(0,N, block_size)):
                 # Transform current block of the m-th channel to frequency domain
-                corr_ch_w_block  = fft.fftshift(fft.fft(iq_samples[m+1, block_start:block_start+block_size], workers=4, overwrite_x=True))
+                corr_ch_w_block  = fft.fftshift(self.fft_engine.forward(iq_samples[m+1, block_start:block_start+block_size], overwrite_x=True))
                 # Calculate phase transfer with non-coherent integration
                 phase_diff_w[m,:] += std_ch_w_block[block_index,:]/corr_ch_w_block
             phase_diff_w[m,:] /= (N//block_size) # Normalization
@@ -665,12 +705,12 @@ class delaySynchronizer():
                     # ->  Calculate correlation functions            
                     np_zeros = np.zeros(self.N_proc, dtype=np.complex64)
                     x_padd = np.concatenate([iq_samples[self.std_ch_ind, 0:self.N_proc], np_zeros])
-                    x_fft = fft.fft(x_padd, workers=4, overwrite_x=True)
-                    
+                    x_fft = self.fft_engine.forward(x_padd, overwrite_x=True)
+
                     for m in self.channel_list:
                         y_padd = np.concatenate([np_zeros, iq_samples[m, 0:self.N_proc]])
-                        y_fft = fft.fft(y_padd, workers=4, overwrite_x=True)
-                        self.corr_functions[m,:] = np.abs(fft.ifft(x_fft.conj() * y_fft, workers=4, overwrite_x=True))**2
+                        y_fft = self.fft_engine.forward(y_padd, overwrite_x=True)
+                        self.corr_functions[m,:] = np.abs(self.fft_engine.inverse(x_fft.conj() * y_fft, overwrite_x=True))**2
                     # ->  Calculate sample delays, check dynamic range
                     # WARNING: This dynamic range checking assumes dirac like coorelation peak                    
                     for m in self.channel_list:

@@ -42,6 +42,7 @@
 #include "ini.h"
 #include "iq_header.h"
 #include "sh_mem_util.h"
+#include "transport.h"
 
 #define INI_FNAME "daq_chain_config.ini"
 #define FATAL_ERR(l) log_fatal(l); return -1;
@@ -59,6 +60,7 @@ typedef struct
     int log_level;
     int instance_id;
     int port_stride;
+    char rebuffer_transport[64];
 } configuration;
 
 /*
@@ -86,6 +88,8 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {pconfig->instance_id = atoi(value);}
     else if (MATCH("federation", "port_stride"))
     {pconfig->port_stride = atoi(value);}
+    else if (MATCH("offload", "rebuffer_transport"))
+    {strncpy(pconfig->rebuffer_transport, value, sizeof(pconfig->rebuffer_transport)-1);}
     else {return 0;  /* unknown section/name, error */}
     return 0;
 }
@@ -103,6 +107,7 @@ int main(int argc, char* argv[])
     configuration config;
     config.instance_id = 0;
     config.port_stride = 100;
+    strcpy(config.rebuffer_transport, "shm");
 
     int exit_flag=0;
     int ch_num;
@@ -160,25 +165,22 @@ int main(int argc, char* argv[])
         circ_buff_structs[m].iq_circ_buffer = calloc(buffer_num * in_buffer_size*2, sizeof(uint8_t)); // *2-> I and Q
     }
     
-    /* Initializing output shared memory interface */
-    struct shmem_transfer_struct* output_sm_buff = calloc(1, sizeof(struct shmem_transfer_struct));
+    /* Initializing output transport interface */
+    transport_type_t transport_type = transport_type_from_string(config.rebuffer_transport);
+    size_t output_buf_size;
     if (out_buffer_size >= cal_out_buffer_size)
-    {
-        output_sm_buff->shared_memory_size = out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
-    }
+        output_buf_size = out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
     else
-    {
-        output_sm_buff->shared_memory_size = cal_out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
-    }
-    output_sm_buff->io_type = 0; // Output type
-    output_sm_buff->drop_mode = drop_mode;
-    build_shmem_name(output_sm_buff->shared_memory_names[0], config.instance_id, DECIMATOR_IN_SM_NAME_A);
-    build_shmem_name(output_sm_buff->shared_memory_names[1], config.instance_id, DECIMATOR_IN_SM_NAME_B);
-    build_fifo_path(output_sm_buff->fw_ctr_fifo_name, config.instance_id, DECIMATOR_IN_FW_FIFO);
-    build_fifo_path(output_sm_buff->bw_ctr_fifo_name, config.instance_id, DECIMATOR_IN_BW_FIFO);
+        output_buf_size = cal_out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
 
-    succ = init_out_sm_buffer(output_sm_buff);
-    if(succ !=0){FATAL_ERR("Shared memory initialization failed")}
+    struct transport_handle* output_transport = transport_create(
+        "decimator_in", output_buf_size, true,
+        drop_mode ? FLOW_DROP : FLOW_BACKPRESSURE,
+        config.instance_id, transport_type);
+    if (!output_transport) {FATAL_ERR("Failed to create output transport")}
+
+    succ = transport_init(output_transport);
+    if(succ !=0){FATAL_ERR("Output transport initialization failed")}
 	
     /*
      *
@@ -268,19 +270,18 @@ int main(int argc, char* argv[])
         if (iq_header->frame_type == FRAME_TYPE_DUMMY)
         {
             /*Acquire buffer from the sink block*/
-            active_buff_ind = wait_buff_free(output_sm_buff);            
+            active_buff_ind = transport_get_write_buf(output_transport, &frame_ptr);            
             switch(active_buff_ind)
             { 
                 case 0:
                 case 1:
                     active_out_buffer_size=0;
-                    frame_ptr = output_sm_buff->shm_ptr[active_buff_ind];                        
-                    
+
                     iq_header->cpi_length = 0;
-                    
+
                     /* Place IQ header into the output buffer*/
                     memcpy(frame_ptr, iq_header,1024);
-                    send_ctr_buff_ready(output_sm_buff, active_buff_ind);
+                    transport_submit_write(output_transport, active_buff_ind);
                     log_trace("--> Transfering frame: type: %d, daq ind:[%d]",iq_header->frame_type, iq_header->daq_block_index);
 		    break;
                 case 3: // Frame drop                    
@@ -299,13 +300,12 @@ int main(int argc, char* argv[])
         if (active_out_buffer_size) // Data has been accumulated (Either for cal frame or data frame)            
         {
             /*Acquire buffer from the sink block*/
-            active_buff_ind = wait_buff_free(output_sm_buff);  
+            active_buff_ind = transport_get_write_buf(output_transport, &frame_ptr);  
             log_debug("Acquired free buffer: %d",active_buff_ind);
             switch(active_buff_ind)
             { 
                 case 0:
-                case 1:                
-                    frame_ptr = output_sm_buff->shm_ptr[active_buff_ind];                        
+                case 1:                        
                     
                     /* Place IQ header into the output buffer*/
                     iq_header->cpi_length = active_out_buffer_size;
@@ -345,7 +345,7 @@ int main(int argc, char* argv[])
                         wr_offset = chunk_size_2;
                     }   
                     available -= active_out_buffer_size*2;                
-                    send_ctr_buff_ready(output_sm_buff, active_buff_ind);                                      
+                    transport_submit_write(output_transport, active_buff_ind);
                     log_trace("--> Transfering frame: type: %d, daq ind:[%d]",iq_header->frame_type, iq_header->daq_block_index);
 		    break;
                 case 3: // Frame drop
@@ -358,9 +358,10 @@ int main(int argc, char* argv[])
     }    
     error_code_log(exit_flag);
     log_info("Send terminate and wait..");
-    send_ctr_terminate(output_sm_buff);
-    sleep(3);    
-    destory_sm_buffer(output_sm_buff);
+    transport_send_terminate(output_transport);
+    sleep(3);
+    transport_destroy(output_transport);
+    free(output_transport);
     /* Free up buffers */     
     for(int m=0;m<ch_num;m++)
     {

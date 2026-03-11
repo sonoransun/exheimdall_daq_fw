@@ -1,0 +1,35 @@
+# =============================================================================
+# ice40_orangecrab.pcf — Pin constraints for iCE40 OrangeCrab (secondary target)
+#
+# HeIMDALL DAQ signal processing offload HAT
+# Target: Lattice iCE40UP5K on OrangeCrab r0.2
+#
+# Note: iCE40UP5K has limited DSP resources (8 DSP blocks) and BRAM (120 Kbit),
+# so only a reduced configuration is supported (fewer taps, smaller FFT).
+# =============================================================================
+
+# Crystal oscillator — 48 MHz (on-board USB PLL)
+set_io clk_25m    A5
+
+# SPI interface — directly from Raspberry Pi GPIO via breakout
+set_io spi_mosi   A2
+set_io spi_miso   A1
+set_io spi_sclk   B1
+set_io spi_cs_n   C1
+
+# Handshake signals
+set_io drdy       D1
+set_io busy_in    E1
+
+# Reset (active low)
+set_io reset_n    F1
+
+# RGB LED (accent indicators)
+set_io led[0]     K4
+set_io led[1]     M3
+set_io led[2]     J3
+set_io led[3]     A3
+set_io led[4]     A4
+set_io led[5]     B3
+set_io led[6]     B4
+set_io led[7]     C3

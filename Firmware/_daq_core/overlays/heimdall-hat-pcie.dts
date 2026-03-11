@@ -1,0 +1,102 @@
+/*
+ * Device Tree Overlay: HeIMDALL HAT PCIe FPGA Endpoint
+ *
+ * Enables the PCIe interface on Raspberry Pi CM4 carrier boards
+ * for use with a HeIMDALL FPGA endpoint card. Configures the
+ * PCIe root complex for Gen 2 x1 operation and declares the
+ * expected FPGA endpoint so that the XDMA kernel driver can
+ * bind to it and expose /dev/xdma0_* character devices.
+ *
+ * Load with:
+ *   dtoverlay=heimdall-hat-pcie
+ *
+ * Project : HeIMDALL DAQ Firmware
+ * License : GNU GPL V3
+ *
+ * Copyright (C) 2018-2024  HeIMDALL DAQ Contributors
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    /* Enable the PCIe root complex (disabled by default on CM4) */
+    fragment@0 {
+        target = <&pcie0>;
+        __overlay__ {
+            status = "okay";
+
+            /*
+             * Force Gen 2 (5 GT/s) x1 link width.
+             * The BCM2711 PCIe controller only supports x1,
+             * but we set max-link-speed explicitly for clarity.
+             */
+            max-link-speed = <2>;
+
+            /*
+             * Declare the expected FPGA endpoint at BDF 01:00.0.
+             * The XDMA driver matches on the Xilinx vendor ID
+             * (0x10ee) and the HeIMDALL-specific device ID.
+             */
+            pcie@0,0 {
+                #address-cells = <3>;
+                #size-cells = <2>;
+                reg = <0x0 0x0 0x0 0x0 0x0>;
+                device_type = "pci";
+
+                heimdall_fpga: endpoint@0 {
+                    reg = <0x0 0x0 0x0 0x0 0x0>;
+                    compatible = "xlnx,xdma";
+
+                    /*
+                     * BAR0: 64 KB register space for control/status.
+                     * BAR2: reserved for future streaming DMA descriptor ring.
+                     *
+                     * Actual BAR sizes are set by the FPGA bitstream; these
+                     * entries tell the kernel what to expect so enumeration
+                     * completes even if the endpoint is slow to train.
+                     */
+                };
+            };
+        };
+    };
+
+    /*
+     * Pin the PCIe reset GPIO (active-low) so the carrier board
+     * releases reset before the root complex attempts link training.
+     * GPIO 28 is the standard PCIE_nRST on the CM4 IO Board;
+     * custom carrier boards may need a different pin.
+     */
+    fragment@1 {
+        target = <&gpio>;
+        __overlay__ {
+            pcie_pins: pcie_pins {
+                brcm,pins = <28>;
+                brcm,function = <1>;  /* output */
+                brcm,pull = <0>;      /* none */
+            };
+        };
+    };
+
+    /*
+     * Ensure the VL805 USB controller (which also sits on PCIe on
+     * the Pi 4B) does not conflict.  On CM4 there is no VL805, so
+     * this is a no-op, but it prevents warnings on Pi 4B test setups.
+     */
+    fragment@2 {
+        target = <&pcie0>;
+        __dormant__ {
+            brcm,disable-vl805;
+        };
+    };
+
+    __overrides__ {
+        /*
+         * Allow the user to select Gen 1 (2.5 GT/s) if the FPGA
+         * card or carrier board has signal-integrity issues at Gen 2.
+         */
+        pcie_gen = <&pcie0>, "max-link-speed:0";
+    };
+};

@@ -568,6 +568,219 @@ def check_ini(parameters, en_hw_check=True):
         elif int(ring_size) <= 0:
             error_list.append("Monitoring event_ring_size must be a positive integer. Currently it is: '{0}' ".format(ring_size))
 
+    """
+    ----------------------------------------
+        | OFFLOAD | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'offload' in parameters:
+        offload_params = parameters['offload']
+        valid_transports = ['shm', 'spi', 'pcie', 'usb3', 'net']
+        valid_engines = ['auto', 'cpu_neon', 'cpu_kfr', 'fpga', 'gpu']
+
+        for tkey in ['rebuffer_transport', 'decimator_transport', 'delay_sync_transport']:
+            tval = offload_params.get(tkey, 'shm')
+            if tval not in valid_transports:
+                error_list.append("Offload {0} must be one of: {1}. Currently it is: '{2}' ".format(tkey, valid_transports, tval))
+
+        for ekey in ['fir_engine', 'fft_engine']:
+            eval_ = offload_params.get(ekey, 'auto')
+            if eval_ not in valid_engines:
+                error_list.append("Offload {0} must be one of: {1}. Currently it is: '{2}' ".format(ekey, valid_engines, eval_))
+
+    """
+    ----------------------------------------
+        | DMA | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'dma' in parameters:
+        dma_params = parameters['dma']
+
+        if not chk_int(dma_params.get('enable', '0')):
+            error_list.append("DMA enable must be 0 or 1. Currently it is: '{0}' ".format(dma_params.get('enable')))
+        else:
+            if not int(dma_params.get('enable', '0')) in [0,1]:
+                error_list.append("DMA enable must be 0 or 1. Currently it is: '{0}' ".format(dma_params.get('enable')))
+
+        ch_memcpy = dma_params.get('channel_memcpy', '7')
+        if not chk_int(ch_memcpy):
+            error_list.append("DMA channel_memcpy must be a non-negative integer. Currently it is: '{0}' ".format(ch_memcpy))
+        elif int(ch_memcpy) < 0:
+            error_list.append("DMA channel_memcpy must be a non-negative integer. Currently it is: '{0}' ".format(ch_memcpy))
+
+        min_xfer = dma_params.get('min_transfer_size', '65536')
+        if not chk_int(min_xfer):
+            error_list.append("DMA min_transfer_size must be a positive integer. Currently it is: '{0}' ".format(min_xfer))
+        elif int(min_xfer) <= 0:
+            error_list.append("DMA min_transfer_size must be a positive integer. Currently it is: '{0}' ".format(min_xfer))
+
+    """
+    ----------------------------------------
+        | FPGA | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'fpga' in parameters:
+        fpga_params = parameters['fpga']
+
+        if not chk_int(fpga_params.get('enable', '0')):
+            error_list.append("FPGA enable must be 0 or 1. Currently it is: '{0}' ".format(fpga_params.get('enable')))
+        else:
+            if not int(fpga_params.get('enable', '0')) in [0,1]:
+                error_list.append("FPGA enable must be 0 or 1. Currently it is: '{0}' ".format(fpga_params.get('enable')))
+
+        spi_speed = fpga_params.get('spi_speed_hz', '62500000')
+        if not chk_int(spi_speed):
+            error_list.append("FPGA spi_speed_hz must be a positive integer. Currently it is: '{0}' ".format(spi_speed))
+        elif int(spi_speed) <= 0:
+            error_list.append("FPGA spi_speed_hz must be a positive integer. Currently it is: '{0}' ".format(spi_speed))
+
+        for flag_key in ['offload_fir', 'offload_xcorr']:
+            flag_val = fpga_params.get(flag_key, '0')
+            if not chk_int(flag_val):
+                error_list.append("FPGA {0} must be 0 or 1. Currently it is: '{1}' ".format(flag_key, flag_val))
+            else:
+                if not int(flag_val) in [0,1]:
+                    error_list.append("FPGA {0} must be 0 or 1. Currently it is: '{1}' ".format(flag_key, flag_val))
+
+        # Check bitstream file exists when FPGA is enabled
+        if int(fpga_params.get('enable', '0')) == 1:
+            import os
+            bitstream_path = fpga_params.get('bitstream', '')
+            if not bitstream_path.strip():
+                error_list.append("FPGA bitstream path must be set when FPGA is enabled")
+            elif en_hw_check and not os.path.isfile(bitstream_path):
+                error_list.append("FPGA bitstream file does not exist: '{0}' ".format(bitstream_path))
+
+    """
+    ----------------------------------------
+        | GPU | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'gpu' in parameters:
+        gpu_params = parameters['gpu']
+
+        if not chk_int(gpu_params.get('enable', '0')):
+            error_list.append("GPU enable must be 0 or 1. Currently it is: '{0}' ".format(gpu_params.get('enable')))
+        else:
+            if not int(gpu_params.get('enable', '0')) in [0,1]:
+                error_list.append("GPU enable must be 0 or 1. Currently it is: '{0}' ".format(gpu_params.get('enable')))
+
+        for flag_key in ['offload_fft', 'offload_fir']:
+            flag_val = gpu_params.get(flag_key, '0')
+            if not chk_int(flag_val):
+                error_list.append("GPU {0} must be 0 or 1. Currently it is: '{1}' ".format(flag_key, flag_val))
+            else:
+                if not int(flag_val) in [0,1]:
+                    error_list.append("GPU {0} must be 0 or 1. Currently it is: '{1}' ".format(flag_key, flag_val))
+
+        fft_batch = gpu_params.get('fft_batch_size', '4')
+        if not chk_int(fft_batch):
+            error_list.append("GPU fft_batch_size must be a positive integer. Currently it is: '{0}' ".format(fft_batch))
+        elif int(fft_batch) <= 0:
+            error_list.append("GPU fft_batch_size must be a positive integer. Currently it is: '{0}' ".format(fft_batch))
+
+    """
+    ----------------------------------------
+        | PCIE | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'pcie' in parameters:
+        pcie_params = parameters['pcie']
+
+        if not chk_int(pcie_params.get('enable', '0')):
+            error_list.append("PCIe enable must be 0 or 1. Currently it is: '{0}' ".format(pcie_params.get('enable')))
+        else:
+            if not int(pcie_params.get('enable', '0')) in [0,1]:
+                error_list.append("PCIe enable must be 0 or 1. Currently it is: '{0}' ".format(pcie_params.get('enable')))
+
+        bar_idx = pcie_params.get('bar_index', '0')
+        if not chk_int(bar_idx):
+            error_list.append("PCIe bar_index must be a non-negative integer. Currently it is: '{0}' ".format(bar_idx))
+        elif int(bar_idx) < 0:
+            error_list.append("PCIe bar_index must be a non-negative integer. Currently it is: '{0}' ".format(bar_idx))
+
+    """
+    ----------------------------------------
+        | USB3 | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'usb3' in parameters:
+        usb3_params = parameters['usb3']
+
+        if not chk_int(usb3_params.get('enable', '0')):
+            error_list.append("USB3 enable must be 0 or 1. Currently it is: '{0}' ".format(usb3_params.get('enable')))
+        else:
+            if not int(usb3_params.get('enable', '0')) in [0,1]:
+                error_list.append("USB3 enable must be 0 or 1. Currently it is: '{0}' ".format(usb3_params.get('enable')))
+
+        xfer_size = usb3_params.get('transfer_size', '16384')
+        if not chk_int(xfer_size):
+            error_list.append("USB3 transfer_size must be a positive integer. Currently it is: '{0}' ".format(xfer_size))
+        elif int(xfer_size) <= 0:
+            error_list.append("USB3 transfer_size must be a positive integer. Currently it is: '{0}' ".format(xfer_size))
+
+        num_xfer = usb3_params.get('num_transfers', '32')
+        if not chk_int(num_xfer):
+            error_list.append("USB3 num_transfers must be a positive integer. Currently it is: '{0}' ".format(num_xfer))
+        elif int(num_xfer) <= 0:
+            error_list.append("USB3 num_transfers must be a positive integer. Currently it is: '{0}' ".format(num_xfer))
+
+    """
+    ----------------------------------------
+        | HAT_UART | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'hat_uart' in parameters:
+        uart_params = parameters['hat_uart']
+
+        if not chk_int(uart_params.get('enable', '0')):
+            error_list.append("HAT UART enable must be 0 or 1. Currently it is: '{0}' ".format(uart_params.get('enable')))
+        else:
+            if not int(uart_params.get('enable', '0')) in [0,1]:
+                error_list.append("HAT UART enable must be 0 or 1. Currently it is: '{0}' ".format(uart_params.get('enable')))
+
+        baud = uart_params.get('baud', '3000000')
+        if not chk_int(baud):
+            error_list.append("HAT UART baud must be a positive integer. Currently it is: '{0}' ".format(baud))
+        elif int(baud) <= 0:
+            error_list.append("HAT UART baud must be a positive integer. Currently it is: '{0}' ".format(baud))
+
+        framing = uart_params.get('framing', 'cobs')
+        if framing not in ['cobs', 'slip', 'raw']:
+            error_list.append("HAT UART framing must be one of: cobs, slip, raw. Currently it is: '{0}' ".format(framing))
+
+    """
+    ----------------------------------------
+        | HAT_I2C | Parameter group (optional)
+    ----------------------------------------
+    """
+    if 'hat_i2c' in parameters:
+        i2c_params = parameters['hat_i2c']
+
+        if not chk_int(i2c_params.get('enable', '0')):
+            error_list.append("HAT I2C enable must be 0 or 1. Currently it is: '{0}' ".format(i2c_params.get('enable')))
+        else:
+            if not int(i2c_params.get('enable', '0')) in [0,1]:
+                error_list.append("HAT I2C enable must be 0 or 1. Currently it is: '{0}' ".format(i2c_params.get('enable')))
+
+        bus = i2c_params.get('bus', '1')
+        if not chk_int(bus):
+            error_list.append("HAT I2C bus must be a non-negative integer. Currently it is: '{0}' ".format(bus))
+        elif int(bus) < 0:
+            error_list.append("HAT I2C bus must be a non-negative integer. Currently it is: '{0}' ".format(bus))
+
+        speed = i2c_params.get('speed', '400000')
+        if not chk_int(speed):
+            error_list.append("HAT I2C speed must be a positive integer. Currently it is: '{0}' ".format(speed))
+        elif int(speed) <= 0:
+            error_list.append("HAT I2C speed must be a positive integer. Currently it is: '{0}' ".format(speed))
+
+        retry = i2c_params.get('retry_count', '3')
+        if not chk_int(retry):
+            error_list.append("HAT I2C retry_count must be a non-negative integer. Currently it is: '{0}' ".format(retry))
+        elif int(retry) < 0:
+            error_list.append("HAT I2C retry_count must be a non-negative integer. Currently it is: '{0}' ".format(retry))
+
     # ---> Federation section check <---
     if 'federation' in daq_cfg:
         fed_params = daq_cfg['federation']

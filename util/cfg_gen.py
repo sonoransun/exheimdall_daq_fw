@@ -128,6 +128,68 @@ monitoring = {
     "zmq_pub_port"             :"5003",
     "event_ring_size"          :"500"
 }
+#[offload]
+offload = {
+    "rebuffer_transport"       :"shm",
+    "decimator_transport"      :"shm",
+    "delay_sync_transport"     :"shm",
+    "fir_engine"               :"auto",
+    "fft_engine"               :"auto"
+}
+#[dma]
+dma = {
+    "enable"                   :"0",
+    "channel_memcpy"           :"7",
+    "min_transfer_size"        :"65536"
+}
+#[fpga]
+fpga = {
+    "enable"                   :"0",
+    "spi_device"               :"/dev/spidev0.0",
+    "spi_speed_hz"             :"62500000",
+    "gpio_drdy"                :"25",
+    "gpio_reset"               :"26",
+    "bitstream"                :"_data_control/heimdall_fpga.bin",
+    "offload_fir"              :"1",
+    "offload_xcorr"            :"0"
+}
+#[gpu]
+gpu = {
+    "enable"                   :"0",
+    "backend"                  :"vc4cl",
+    "offload_fft"              :"1",
+    "offload_fir"              :"0",
+    "fft_batch_size"           :"4"
+}
+#[pcie]
+pcie = {
+    "enable"                   :"0",
+    "device"                   :"0000:01:00.0",
+    "bar_index"                :"0",
+    "driver"                   :"xdma"
+}
+#[usb3]
+usb3 = {
+    "enable"                   :"0",
+    "vid"                      :"0x0403",
+    "pid"                      :"0x601f",
+    "transfer_size"            :"16384",
+    "num_transfers"            :"32"
+}
+#[hat_uart]
+hat_uart = {
+    "enable"                   :"0",
+    "device"                   :"/dev/ttyAMA1",
+    "baud"                     :"3000000",
+    "framing"                  :"cobs"
+}
+#[hat_i2c]
+hat_i2c = {
+    "enable"                   :"0",
+    "bus"                      :"1",
+    "speed"                    :"400000",
+    "retry_count"              :"3"
+}
 #[federation]
 federation = {
     "instance_id"              :"0",
@@ -146,6 +208,14 @@ daq_chain_ini_cfg = {"meta"           : meta,
                      "calibration"    : calibration,
                      "adpis"          : adpis,
                      "data_interface" : data_interface,
+                     "offload"        : offload,
+                     "dma"            : dma,
+                     "fpga"           : fpga,
+                     "gpu"            : gpu,
+                     "pcie"           : pcie,
+                     "usb3"           : usb3,
+                     "hat_uart"       : hat_uart,
+                     "hat_i2c"        : hat_i2c,
                      "schedule"       : schedule,
                      "database"       : database,
                      "monitoring"     : monitoring,

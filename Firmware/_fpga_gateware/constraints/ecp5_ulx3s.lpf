@@ -1,0 +1,81 @@
+# =============================================================================
+# ecp5_ulx3s.lpf — Pin constraints for Lattice ECP5-85F on ULX3S board
+#
+# HeIMDALL DAQ signal processing offload HAT
+# Target: ECP5-85F-6BG381C (ULX3S v3.x)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Crystal oscillator — 25 MHz
+# -----------------------------------------------------------------------------
+LOCATE COMP "clk_25m" SITE "G2";
+IOBUF PORT "clk_25m" PULLMODE=NONE IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk_25m" 25.0 MHz;
+
+# -----------------------------------------------------------------------------
+# SPI interface — directly from Raspberry Pi GPIO header
+# SPI pins mapped to GP/GN connector J1 on ULX3S
+# -----------------------------------------------------------------------------
+
+# SPI MOSI: GP[0]
+LOCATE COMP "spi_mosi" SITE "B11";
+IOBUF PORT "spi_mosi" PULLMODE=NONE IO_TYPE=LVCMOS33;
+
+# SPI MISO: GN[0]
+LOCATE COMP "spi_miso" SITE "A10";
+IOBUF PORT "spi_miso" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+
+# SPI SCLK: GP[1]
+LOCATE COMP "spi_sclk" SITE "A9";
+IOBUF PORT "spi_sclk" PULLMODE=NONE IO_TYPE=LVCMOS33;
+
+# SPI CS_N: GN[1]
+LOCATE COMP "spi_cs_n" SITE "B10";
+IOBUF PORT "spi_cs_n" PULLMODE=UP IO_TYPE=LVCMOS33;
+
+# DRDY (FPGA -> Pi): GP[2]
+LOCATE COMP "drdy" SITE "A11";
+IOBUF PORT "drdy" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+
+# BUSY (Pi -> FPGA): GN[2]
+LOCATE COMP "busy_in" SITE "B12";
+IOBUF PORT "busy_in" PULLMODE=DOWN IO_TYPE=LVCMOS33;
+
+# RESET_N (active low): GP[3]
+LOCATE COMP "reset_n" SITE "C12";
+IOBUF PORT "reset_n" PULLMODE=UP IO_TYPE=LVCMOS33;
+
+# -----------------------------------------------------------------------------
+# LEDs — accent LEDs D0..D7 on ULX3S board
+# -----------------------------------------------------------------------------
+LOCATE COMP "led[0]" SITE "B2";
+LOCATE COMP "led[1]" SITE "C2";
+LOCATE COMP "led[2]" SITE "C1";
+LOCATE COMP "led[3]" SITE "D2";
+LOCATE COMP "led[4]" SITE "D1";
+LOCATE COMP "led[5]" SITE "E2";
+LOCATE COMP "led[6]" SITE "E1";
+LOCATE COMP "led[7]" SITE "H3";
+
+IOBUF PORT "led[0]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[1]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[2]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[3]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[4]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[5]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[6]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+IOBUF PORT "led[7]" PULLMODE=NONE IO_TYPE=LVCMOS33 DRIVE=4;
+
+# -----------------------------------------------------------------------------
+# Timing constraints
+# -----------------------------------------------------------------------------
+# SPI clock (max 62.5 MHz)
+FREQUENCY NET "spi_sclk" 62.5 MHz;
+
+# System PLL output (100 MHz)
+FREQUENCY NET "sys_clk" 100.0 MHz;
+
+# Clock domain crossings — SPI to system domain
+# These are handled by FIFO-based CDC in the design; mark as false paths
+# for timing analysis.
+# BLOCK PATH FROM PORT "spi_sclk" TO NET "sys_clk";

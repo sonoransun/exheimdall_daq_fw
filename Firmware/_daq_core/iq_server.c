@@ -37,6 +37,7 @@
 #include "sh_mem_util.h"
 #include "iq_header.h"
 #include "rtl_daq.h"
+#include "transport.h"
 #define INI_FNAME "daq_chain_config.ini" 
 
 #define FATAL_ERR(l) log_fatal(l); return -1;
@@ -122,18 +123,16 @@ int main(int argc, char* argv[])
 	log_set_level(config.log_level);          
     struct iq_frame_struct_32* iq_frame =calloc(1, sizeof(struct iq_frame_struct_32));
 
-    /* Initializing input shared memory interface */
-    struct shmem_transfer_struct* input_sm_buff = calloc(1, sizeof(struct shmem_transfer_struct));
-    input_sm_buff->shared_memory_size = MAX_IQFRAME_PAYLOAD_SIZE*config.num_ch*4*2+IQ_HEADER_LENGTH;         
-    input_sm_buff->io_type = 1; // Input type
-    build_shmem_name(input_sm_buff->shared_memory_names[0], config.instance_id, DELAY_SYNC_IQ_SM_NAME_A);
-    build_shmem_name(input_sm_buff->shared_memory_names[1], config.instance_id, DELAY_SYNC_IQ_SM_NAME_B);
-    build_fifo_path(input_sm_buff->fw_ctr_fifo_name, config.instance_id, DELAY_SYNC_IQ_FW_FIFO);
-    build_fifo_path(input_sm_buff->bw_ctr_fifo_name, config.instance_id, DELAY_SYNC_IQ_BW_FIFO);
-	
-	ret= init_in_sm_buffer(input_sm_buff);
-    if (ret !=0) {FATAL_ERR("Failed to init shared memory interface")} 
-	else{log_info("Shared memory interface succesfully initialized");}
+    /* Initializing input transport interface */
+    size_t input_buf_size = MAX_IQFRAME_PAYLOAD_SIZE*config.num_ch*4*2+IQ_HEADER_LENGTH;
+    struct transport_handle* input_transport = transport_create(
+        "delay_sync_iq", input_buf_size, false,
+        FLOW_BACKPRESSURE, config.instance_id, TRANSPORT_SHM);
+    if (!input_transport) {FATAL_ERR("Failed to create input transport")}
+
+    ret = transport_init(input_transport);
+    if (ret !=0) {FATAL_ERR("Failed to init transport interface")}
+    else{log_info("Transport interface succesfully initialized");}
 	
     /* Starting IQ ethernet server */
 	int run_server=1;
@@ -149,16 +148,17 @@ int main(int argc, char* argv[])
         while(!exit_flag) 
         {
         	// Acquire data buffer on the shared memory interface
-        	active_buff_ind = wait_buff_ready(input_sm_buff);
+        	void* buf_ptr;
+        	active_buff_ind = transport_get_read_buf(input_transport, &buf_ptr);
        	    if (active_buff_ind < 0){exit_flag = active_buff_ind; break;}
-            iq_frame->header = (struct iq_header_struct*) input_sm_buff->shm_ptr[active_buff_ind];
-			iq_frame->payload = ((float *) input_sm_buff->shm_ptr[active_buff_ind] )+ IQ_HEADER_LENGTH/sizeof(float);
+            iq_frame->header = (struct iq_header_struct*) buf_ptr;
+			iq_frame->payload = ((float *) buf_ptr) + IQ_HEADER_LENGTH/sizeof(float);
 			CHK_SYNC_WORD(check_sync_word(iq_frame->header));
 			iq_frame->payload_size=iq_frame->header->cpi_length * iq_frame->header->active_ant_chs;
 			//dump_iq_header(iq_frame->header);
-			
+
 			ret=send_iq_frame(iq_frame, sockets[1]);
-			send_ctr_buff_free(input_sm_buff, active_buff_ind);
+			transport_release_read(input_transport, active_buff_ind);
 			if(ret !=0){log_error("Closing connection"); break;}
 			
 			/* Waiting for further download commands on the Ethernet link*/
@@ -168,6 +168,7 @@ int main(int argc, char* argv[])
        }
         iq_stream_close(sockets);
     }
-	destory_sm_buffer(input_sm_buff);
+	transport_destroy(input_transport);
+	free(input_transport);
 	log_info("DAQ chain IQ server has exited.");
 }

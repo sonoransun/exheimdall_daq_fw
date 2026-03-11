@@ -1,0 +1,141 @@
+/*
+ * Device Tree Overlay: HeIMDALL HAT UART2 (PL011)
+ *
+ * Enables the second PL011 UART (uart2) on the BCM2711 and routes it
+ * to GPIO pins 0 and 1 (ID_SD / ID_SC on the 40-pin header) for
+ * communication with the HeIMDALL FPGA HAT at up to 3 Mbaud.
+ *
+ * The FPGA HAT uses this UART for:
+ *   - Low-latency command/response control messages
+ *   - Firmware update streaming to the FPGA configuration flash
+ *   - Heartbeat and status reporting
+ *
+ * The PL011 UART is preferred over the mini-UART because it has a
+ * 16-byte FIFO, hardware flow control, and a baud rate independent
+ * of the VPU core clock.
+ *
+ * Load with:
+ *   dtoverlay=heimdall-hat-uart
+ * or with a custom baud rate:
+ *   dtoverlay=heimdall-hat-uart,baudrate=3000000
+ *
+ * The overlay also supports optional CTS/RTS hardware flow control
+ * on GPIO 2 and 3:
+ *   dtoverlay=heimdall-hat-uart,flow_control
+ *
+ * Project : HeIMDALL DAQ Firmware
+ * License : GNU GPL V3
+ *
+ * Copyright (C) 2018-2024  HeIMDALL DAQ Contributors
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    /*
+     * Enable uart2 (PL011) which is disabled by default.
+     * On BCM2711 this is the third UART (after uart0 and uart1).
+     * Device node: /dev/ttyAMA1
+     */
+    fragment@0 {
+        target = <&uart2>;
+        __overlay__ {
+            status = "okay";
+            pinctrl-names = "default";
+            pinctrl-0 = <&uart2_pins>;
+        };
+    };
+
+    /*
+     * Route uart2 TX/RX to GPIO 0 (TXD) and GPIO 1 (RXD).
+     * Alt function 4 selects UART2 on these pins (BCM2711 datasheet
+     * Table 6-31).  These pins are normally reserved for HAT ID EEPROM
+     * I2C, but the HeIMDALL HAT uses a different identification scheme.
+     */
+    fragment@1 {
+        target = <&gpio>;
+        __overlay__ {
+            uart2_pins: uart2_pins {
+                brcm,pins = <0 1>;
+                brcm,function = <4>;  /* alt4 = UART2 */
+                brcm,pull = <0 2>;    /* TX: none, RX: pull-up */
+            };
+        };
+    };
+
+    /*
+     * Set the UART reference clock to 48 MHz for high baud rates.
+     * The PL011 divisor for 3 Mbaud at 48 MHz is 48e6 / (16 * 3e6) = 1,
+     * giving an exact baud rate with zero error.
+     */
+    fragment@2 {
+        target = <&uart2>;
+        __overlay__ {
+            clock-frequency = <48000000>;
+        };
+    };
+
+    /*
+     * Optional CTS/RTS flow control pins (GPIO 2 = CTS, GPIO 3 = RTS).
+     * Dormant by default; activated via the "flow_control" override.
+     */
+    fragment@3 {
+        target = <&gpio>;
+        __dormant__ {
+            uart2_ctsrts_pins: uart2_ctsrts_pins {
+                brcm,pins = <2 3>;
+                brcm,function = <4>;  /* alt4 = UART2 CTS/RTS */
+                brcm,pull = <2 0>;    /* CTS: pull-up, RTS: none */
+            };
+        };
+    };
+
+    fragment@4 {
+        target = <&uart2>;
+        __dormant__ {
+            uart-has-rtscts;
+            pinctrl-0 = <&uart2_pins>, <&uart2_ctsrts_pins>;
+        };
+    };
+
+    /*
+     * Disable Bluetooth on uart0 so there is no contention if the user
+     * also needs uart0 for debugging.  This is dormant by default.
+     */
+    fragment@5 {
+        target = <&uart0>;
+        __dormant__ {
+            status = "disabled";
+        };
+    };
+
+    __overrides__ {
+        /*
+         * baudrate: initial baud rate (default 3000000).
+         * The PL011 supports non-standard rates; the actual achievable
+         * rate depends on the 48 MHz UART reference clock.  Common
+         * values: 115200, 921600, 1500000, 3000000.
+         */
+        baudrate      = <&uart2>, "current-speed:0";
+
+        /*
+         * txd_pin / rxd_pin: override default GPIO assignments.
+         */
+        txd_pin       = <&uart2_pins>, "brcm,pins:0";
+        rxd_pin       = <&uart2_pins>, "brcm,pins:4";
+
+        /*
+         * flow_control: activate CTS/RTS hardware flow control.
+         * Merges fragment@3 and fragment@4 into the live tree.
+         */
+        flow_control  = <0>, "+3+4";
+
+        /*
+         * disable_bt: disable Bluetooth to free uart0.
+         */
+        disable_bt    = <0>, "+5";
+    };
+};
