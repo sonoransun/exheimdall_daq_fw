@@ -20,6 +20,11 @@ echo -e "\e[33mConfig file check bypassed [ WARNING ]\e[39m"
 
 sudo sysctl -w kernel.sched_rt_runtime_us=-1
 
+# Apply IRQ tuning for optimal performance
+if [ -x "../util/irq_tuning.sh" ]; then
+    sudo ../util/irq_tuning.sh
+fi
+
 # Read config ini file
 out_data_iface_type=$(awk -F'=' '/out_data_iface_type/ {gsub (" ", "", $0); print $2}' daq_chain_config.ini)
 
@@ -171,28 +176,53 @@ fi
 PID_DIR="_logs/inst${instance_id}/pids"
 mkdir -p "$PID_DIR"
 
-# Start main program chain -Thread 0 Normal (non squelch mode)
-echo "Starting DAQ Subsystem (instance ${instance_id})"
-chrt -f 99 _daq_core/rtl_daq.out 2> _logs/rtl_daq.log | \
-chrt -f 99 _daq_core/rebuffer.out 0 2> _logs/rebuffer.log &
+# Detect number of CPU cores for affinity assignment
+NUM_CORES=$(nproc)
+HOST_ARCH=$(uname -m)
+
+# Differentiated Real-Time Priority & CPU Affinity Assignment
+echo "Starting DAQ Subsystem (instance ${instance_id}) with RT optimization"
+echo "Platform: $HOST_ARCH, Cores: $NUM_CORES"
+
+# Tier 1: Hardware I/O Critical (95-99) - Core 0 & 1
+# RTL-SDR USB acquisition (highest priority) + Rebuffer pipeline
+taskset -c 0 chrt -f 99 _daq_core/rtl_daq.out 2> _logs/rtl_daq.log | \
+taskset -c 1 chrt -f 94 _daq_core/rebuffer.out 0 2> _logs/rebuffer.log &
 echo $! > "$PID_DIR/rebuffer.pid"
 
-# Decimator - Thread 1
-chrt -f 99 _daq_core/decimate.out 2> _logs/decimator.log &
+# FIR Decimation (high priority) - Core 1 (shared with rebuffer for cache locality)
+taskset -c 1 chrt -f 92 _daq_core/decimate.out 2> _logs/decimator.log &
 echo $! > "$PID_DIR/decimate.pid"
 
-# Delay synchronizer - Thread 2
-chrt -f 99 python3 _daq_core/delay_sync.py 2> _logs/delay_sync.log &
+# FFT Cross-correlation (high priority) - Core 2
+if [ $NUM_CORES -ge 4 ]; then
+    taskset -c 2 chrt -f 90 python3 _daq_core/delay_sync.py 2> _logs/delay_sync.log &
+elif [ $NUM_CORES -ge 3 ]; then
+    taskset -c 2 chrt -f 90 python3 _daq_core/delay_sync.py 2> _logs/delay_sync.log &
+else
+    # Fallback for dual-core systems
+    taskset -c 1 chrt -f 90 python3 _daq_core/delay_sync.py 2> _logs/delay_sync.log &
+fi
 echo $! > "$PID_DIR/delay_sync.pid"
 
-# Hardware Controller data path - Thread 3
-chrt -f 99 sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> _logs/hwc.log &
+# Tier 2: Control Plane (75-84) - Core 3 (or available)
+if [ $NUM_CORES -ge 4 ]; then
+    taskset -c 3 chrt -f 82 sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> _logs/hwc.log &
+else
+    # Use any available core for systems with fewer cores
+    chrt -f 82 sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> _logs/hwc.log &
+fi
 echo $! > "$PID_DIR/hw_controller.pid"
 # root priviliges are needed to drive the i2c master
 
 if [ $out_data_iface_type = eth ]; then
     echo "Output data interface: IQ ethernet server"
-    chrt -f 99 _daq_core/iq_server.out 2>_logs/iq_server.log &
+    # IQ server (medium-high priority) - Core 2 or 3 depending on system
+    if [ $NUM_CORES -ge 4 ]; then
+        taskset -c 2 chrt -f 88 _daq_core/iq_server.out 2>_logs/iq_server.log &
+    else
+        chrt -f 88 _daq_core/iq_server.out 2>_logs/iq_server.log &
+    fi
     echo $! > "$PID_DIR/iq_server.pid"
 elif [ $out_data_iface_type = shmem ]; then
     echo "Output data interface: Shared memory"

@@ -274,3 +274,78 @@ int destory_sm_buffer(struct shmem_transfer_struct* sm_buff)
 
     return 0;
 }
+
+/*
+*-------------------------------------
+*    Optimized Batched Control Functions
+*-------------------------------------
+*/
+
+#include <time.h>  // For clock_gettime
+
+int init_ctr_batch(struct shmem_control_batch* batch, uint32_t initial_sequence)
+{
+    if (!batch) return -1;
+
+    memset(batch, 0, sizeof(*batch));
+    batch->sequence = initial_sequence;
+    update_ctr_batch_timestamp(batch);
+    return 0;
+}
+
+void update_ctr_batch_timestamp(struct shmem_control_batch* batch)
+{
+    if (!batch) return;
+
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        batch->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+}
+
+void update_ctr_batch_buffer_ready(struct shmem_control_batch* batch, int buffer_index)
+{
+    if (!batch || buffer_index < 0 || buffer_index > 1) return;
+
+    // Set appropriate bit in buffer mask
+    if (buffer_index == 0) {
+        batch->buffer_mask |= 0x01;  // A_BUFF_READY equivalent
+    } else {
+        batch->buffer_mask |= 0x02;  // B_BUFF_READY equivalent
+    }
+
+    batch->frame_count++;
+    batch->sequence++;
+    update_ctr_batch_timestamp(batch);
+}
+
+void send_ctr_batch(struct shmem_transfer_struct* sm_buff, struct shmem_control_batch* batch)
+{
+    if (!sm_buff || !batch) return;
+
+    // Single write operation for entire batch structure
+    fwrite(batch, sizeof(*batch), 1, sm_buff->fw_ctr_fifo);
+    fflush(sm_buff->fw_ctr_fifo);  // Single flush for batched data
+
+    // Reset buffer mask after sending
+    batch->buffer_mask = 0;
+}
+
+void send_ctr_buff_ready_batch(struct shmem_transfer_struct* sm_buff, int active_buff_index,
+                              struct shmem_control_batch* batch)
+{
+    if (!sm_buff || !batch) {
+        // Fallback to original single-byte protocol
+        send_ctr_buff_ready(sm_buff, active_buff_index);
+        return;
+    }
+
+    // Update batch with buffer ready status
+    update_ctr_batch_buffer_ready(batch, active_buff_index);
+
+    // Mark buffer as not free
+    sm_buff->buffer_free[active_buff_index] = false;
+
+    // Send batched control data
+    send_ctr_batch(sm_buff, batch);
+}

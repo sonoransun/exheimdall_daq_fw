@@ -1,10 +1,36 @@
 # Makefile for compiling the DAQ firmware
 # Author: Tamás Pető, Sándor Bajusz
 CC=gcc
-CFLAGS=-Wall -std=gnu99 -march=native -O2 -I.
 
-# Optimized C-flags for Pi 4
-#CFLAGS=-Wall -std=gnu99 -mcpu=cortex-a72 -mtune=cortex-a72 -Ofast -funsafe-math-optimizations -funroll-loops
+# Performance-optimized flags based on architecture
+HOST_ARCH := $(shell uname -m)
+
+ifeq ($(HOST_ARCH), x86_64)
+# x86_64 aggressive optimization
+CFLAGS=-Wall -std=gnu99 -march=native -Ofast -ffast-math -funroll-loops \
+       -fomit-frame-pointer -DNDEBUG -flto -fno-signed-zeros \
+       -fno-trapping-math -fassociative-math -freciprocal-math -I.
+else ifeq ($(HOST_ARCH), aarch64)
+# ARM64 optimization (Apple Silicon, newer ARM)
+CFLAGS=-Wall -std=gnu99 -mcpu=native -Ofast -ffast-math -funroll-loops \
+       -fomit-frame-pointer -DNDEBUG -flto -fno-signed-zeros \
+       -fno-trapping-math -fassociative-math -freciprocal-math -I.
+else ifeq ($(HOST_ARCH), arm64)
+# ARM64 optimization (macOS naming)
+CFLAGS=-Wall -std=gnu99 -mcpu=native -Ofast -ffast-math -funroll-loops \
+       -fomit-frame-pointer -DNDEBUG -flto -fno-signed-zeros \
+       -fno-trapping-math -fassociative-math -freciprocal-math -I.
+else ifneq (,$(findstring arm,$(HOST_ARCH)))
+# ARM optimization (Raspberry Pi 4 and similar)
+CFLAGS=-Wall -std=gnu99 -mcpu=cortex-a72 -mtune=cortex-a72 -Ofast \
+       -ffast-math -funroll-loops -fomit-frame-pointer -DNDEBUG \
+       -fno-signed-zeros -fno-trapping-math -fassociative-math \
+       -freciprocal-math -I.
+else
+# Generic fallback
+CFLAGS=-Wall -std=gnu99 -O3 -ffast-math -funroll-loops \
+       -fomit-frame-pointer -DNDEBUG -I.
+endif
 # Uncomment if you are using third party switches from ckoval on a Rpi device and have pigpio installed
 #PIGPIO=-lpigpio -DUSEPIGPIO
 
@@ -144,6 +170,16 @@ libdma_hal.so: bcm2711_dma.c
 
 # Build all offload/transport components
 all-offload: all transport_spi transport_usb3 transport_pcie transport_net dma_engine gpio_ctrl offload_fpga offload_gpu
+
+# Profile-Guided Optimization targets
+pgo-profile:
+	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-generate" clean all
+	@echo "Run benchmark workload now, then execute 'make pgo-optimize'"
+	@echo "Example: cd ../.. && sudo ./benchmark_workload.sh"
+
+pgo-optimize:
+	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-use" clean all
+	@echo "PGO-optimized binaries built"
 
 clean:
 	$(RM) ini.o log.o iq_header.o sh_mem_util.o fir_decimate.o decimate.o \

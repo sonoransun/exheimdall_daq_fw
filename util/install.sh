@@ -55,9 +55,55 @@ sudo python3 -m pip install plotly
 
 
 sudo apt install libzmq3-dev -y
-echo "6/6 Build HeIMDALL DAQ Firmware"
+
+echo "6/6 Install performance optimization tools"
+# Real-time performance tools
+sudo apt install linux-tools-generic cpuset-tools numactl stress-ng -y
+
+# Python packages for monitoring
+sudo python3 -m pip install psutil
+# Optional: Berkeley DB for advanced features
+sudo python3 -m pip install berkeleydb || echo "Warning: berkeleydb not installed (optional)"
+
+echo "6/7 Configure system for real-time performance"
+
+# Configure system limits for real-time audio group
+if ! grep -q "@audio.*rtprio" /etc/security/limits.conf; then
+    echo "@audio - rtprio 95" | sudo tee -a /etc/security/limits.conf
+    echo "@audio - memlock unlimited" | sudo tee -a /etc/security/limits.conf
+    echo "@audio - nice -19" | sudo tee -a /etc/security/limits.conf
+    echo "Added real-time limits configuration"
+fi
+
+# Copy kernel tuning parameters
+if [ -f "kernel_tuning.conf" ]; then
+    sudo cp kernel_tuning.conf /etc/sysctl.d/99-heimdall-rt.conf
+    echo "Applied kernel tuning parameters (will take effect after reboot)"
+fi
+
+# Set up user in audio group for real-time privileges
+sudo usermod -a -G audio $USER
+echo "Added $USER to audio group for RT privileges"
+
+echo "6/8 Build HeIMDALL DAQ Firmware with optimizations"
 cd heimdall_daq_fw/Firmware/_daq_core
+make clean  # Clean build with new optimization flags
 make
+
+echo ""
+echo "Installation complete!"
+echo "===================="
+echo ""
+echo "Next steps:"
+echo "1. Log out and back in to activate group membership"
+echo "2. Reboot to apply kernel parameters: sudo reboot"
+echo "3. Run system optimization: sudo python3 ../util/system_tuning.py --full"
+echo "4. Test with: ./daq_synthetic_start.sh"
+echo ""
+echo "Performance monitoring:"
+echo "- Check CPU affinity: python3 ../util/performance_monitor.py --check-affinity"
+echo "- Monitor performance: python3 ../util/performance_monitor.py"
+echo "- Run benchmarks: ./benchmark_workload.sh"
 
 # TODO: Check installed versions:
 # Scipy: 1.8 or later

@@ -112,13 +112,14 @@ static int neon_fir_decimate(struct fir_engine* eng, int ch_index,
     struct neon_fir_ctx* ctx = (struct neon_fir_ctx*)eng->ctx;
 
     for (size_t b = 0; b < input_len / ctx->fir_blocksize; b++) {
-        ne10_fir_decimate_float_c(
+        // Use NEON-accelerated decimation instead of C reference
+        ne10_fir_decimate_float_neon(
             &ctx->fir_cfgs[2 * ch_index],
             (ne10_float32_t*)(input_i + b * ctx->fir_blocksize),
             (ne10_float32_t*)(output_i + b * ctx->block_size),
             ctx->fir_blocksize);
 
-        ne10_fir_decimate_float_c(
+        ne10_fir_decimate_float_neon(
             &ctx->fir_cfgs[2 * ch_index + 1],
             (ne10_float32_t*)(input_q + b * ctx->fir_blocksize),
             (ne10_float32_t*)(output_q + b * ctx->block_size),

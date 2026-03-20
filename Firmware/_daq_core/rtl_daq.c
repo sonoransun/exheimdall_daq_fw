@@ -42,6 +42,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <sys/time.h>  // Used for latency estimation
+#include <sys/mman.h>  // For memory locking (mlockall)
 #include <zmq.h>
 
 #include "ini.h"
@@ -431,9 +432,31 @@ return NULL;
 }
 
 
+// Memory locking for real-time performance
+int init_rt_memory(void) {
+    // Lock all current and future memory
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        log_error("mlockall failed: %s", strerror(errno));
+        return -1;
+    }
+
+    // Pre-fault stack pages to avoid page faults during RT operation
+    char dummy[64 * 1024];
+    memset(dummy, 0, sizeof(dummy));
+
+    log_info("Real-time memory locking initialized");
+    return 0;
+}
+
 int main( int argc, char** argv )
-{   
+{
     log_set_level(LOG_TRACE);
+
+    // Initialize real-time memory management
+    if (init_rt_memory() != 0) {
+        log_warn("Failed to initialize RT memory locking - continuing anyway");
+    }
+
     configuration config;
     config.instance_id = 0;
     config.port_stride = 100;
