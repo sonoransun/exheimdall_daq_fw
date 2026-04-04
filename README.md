@@ -181,6 +181,291 @@ graph LR
 - **TCP control** -- 128-byte command frames (4-byte command + 124-byte payload) for external integration
 - **1024-byte IQ headers** -- Binary frame headers with sync word, metadata, calibration state, and per-channel gains
 
+The shared memory transport is the default backend of the pluggable [Transport Abstraction Layer](#transport-abstraction-layer) described below.
+
+## Platform Architecture
+
+### Transport Abstraction Layer
+
+The data plane between pipeline stages uses a pluggable transport layer, allowing the same pipeline binaries to communicate over shared memory, SPI, PCIe, USB 3.0, or Ethernet depending on the deployment topology.
+
+```mermaid
+graph TD
+    PS[Pipeline Stage] --> TP[Transport Producer<br/>vtable dispatch]
+    TP --> SHM["Shared Memory<br/>(POSIX shmem — default)"]
+    TP --> SPI["SPI + DMA<br/>(FPGA HAT, CRC-32 framing)"]
+    TP --> PCIE["PCIe / XDMA<br/>(UIO BAR + DMA channels)"]
+    TP --> USB["USB 3.0<br/>(libusb async bulk)"]
+    TP --> NET["TCP / Ethernet<br/>(LEN_32 + PAYLOAD framing)"]
+
+    SHM --> TC[Transport Consumer]
+    SPI --> TC
+    PCIE --> TC
+    USB --> TC
+    NET --> TC
+```
+
+- **Backend selection** -- Configured per pipeline link via `[offload]` keys: `rebuffer_transport`, `decimator_transport`, `delay_sync_transport`
+- **C vtable interface** -- `transport.h` defines `struct transport_ops` with `init/destroy/get_write_buf/submit_write/get_read_buf/release_read/send_terminate` operations; `transport_create()` factory returns a handle for the requested type
+- **Python wrapper** -- `transportIface.py` provides `TransportProducer` / `TransportConsumer` as drop-in replacements for `shmemIface.py`
+- **Flow control modes** -- Backpressure (block until buffer available) or drop (skip frame on contention, via `O_NONBLOCK`)
+- **Instance-aware naming** -- Channel names incorporate `instance_id` for multi-instance federation (e.g., `inst1_decimator_out`)
+- **Performance counters** -- Each handle tracks `total_bytes`, `total_frames`, `dropped_frames`
+- **Compile-time driver selection** -- Optional backends enabled via Makefile flags: `HAS_SPI_TRANSPORT`, `HAS_PCIE_TRANSPORT`, `HAS_USB3_TRANSPORT`, `HAS_NET_TRANSPORT`
+
+### Offload Engine Abstraction
+
+Signal processing operations (FIR decimation, FFT, cross-correlation, data conversion) use pluggable compute engines selected at runtime, enabling transparent acceleration on different hardware.
+
+```mermaid
+graph LR
+    subgraph "C Layer — fir_engine vtable"
+        FE[fir_engine_create<br/>auto-detect] --> NEON["CPU NEON<br/>(ARM)"]
+        FE --> KFR["CPU KFR<br/>(x86_64)"]
+        FE --> FPGA_E["FPGA<br/>(SPI triple-buffer)"]
+        FE --> GPU_E["GPU<br/>(VideoCore VI)"]
+    end
+
+    subgraph "Python Layer"
+        FFT[FFTEngine] --> SP["SciPy<br/>(configurable workers)"]
+        FFT --> GP["GPU OpenCL"]
+        FFT --> FP["FPGA stub"]
+        COR[CorrelationEngine] --> NP["NumPy FFT-based"]
+        COR --> GP2["GPU batch"]
+        COR --> FP2["FPGA stub"]
+    end
+```
+
+**Auto-detect priority:** FPGA > GPU > CPU NEON (ARM) / CPU KFR (x86)
+
+- **FIR engine** (`offload.h`) -- vtable with `init/decimate/reset/destroy` per channel; supports NEON, KFR, FPGA, and GPU backends
+- **Data conversion engine** -- U8-to-F32 deinterleave with SIMD-optimized paths: `(sample - 127.5) / 127.5`
+- **Python FFT engine** (`offload_engines.py`) -- SciPy (configurable worker threads), GPU (OpenCL radix-2), FPGA (stub for future expansion)
+- **Python correlation engine** (`offload_engines.py`) -- FFT-based cross-correlation with GPU batch mode support
+- **Auto-detection** -- `fir_engine_create()` with `OFFLOAD_AUTO` probes hardware at startup and falls back gracefully to the platform default
+- **Configuration** -- `[offload] fir_engine = auto` and `[offload] fft_engine = auto` in config INI; `auto` triggers runtime detection
+
+### FPGA Gateware
+
+An optional FPGA HAT can offload the FIR decimation and cross-correlation stages to dedicated hardware, freeing CPU cycles for calibration and control.
+
+```mermaid
+graph LR
+    RX[SPI RX] --> DI[iq_deinterleave<br/>I/Q separation]
+    DI --> CONV[u8_to_f32<br/>normalization]
+    CONV --> FIR[fir_decimate<br/>polyphase FIR]
+    FIR --> RI[output_reinterleave] --> TX[SPI TX]
+    FIR --> XC[xcorr_engine<br/>FFT-based]
+    XC --> TX2[SPI TX<br/>mode 1/2]
+
+    style RX fill:#f9f,stroke:#333
+    style TX fill:#f9f,stroke:#333
+    style TX2 fill:#f9f,stroke:#333
+```
+
+- **Target devices** -- Lattice ECP5 (ULX3S dev board) and iCE40 (OrangeCrab)
+- **Open-source toolchain** -- Yosys (synthesis) + nextpnr (place-and-route) + ecppack (bitstream generation)
+- **RTL modules** -- SPI slave with CRC-32, IQ deinterleave, U8-to-F32, polyphase FIR (configurable taps up to 128, decimation ratio), radix-2 FFT (1024-point), cross-correlation engine (multi-channel, max 5), config registers with device ID
+- **Processing modes** -- FIR-only (mode 0), FIR + cross-correlation (mode 1), cross-correlation only (mode 2), selected via SPI config register
+- **Clock architecture** -- 100 MHz system clock from 25 MHz oscillator via ECP5 PLL; separate SPI clock domain for host interface
+- **Simulation and verification** -- Icarus Verilog testbenches (`make sim`, `make sim_fir`, `make sim_xcorr`), Python test vector generation and output comparison (`make gen_vectors && make verify`)
+- **Integration** -- Bitstream loaded at startup by `fpga_loader.py` when `[fpga] enable = 1`; host communicates via the SPI transport driver
+
+### GPU Compute
+
+On Raspberry Pi 4, the VideoCore VI GPU can accelerate FFT and cross-correlation via OpenCL, reducing CPU load during calibration-intensive phases.
+
+- **Engine** -- `offload_gpu.py` implements radix-2 Cooley-Tukey FFT as OpenCL kernels (bit-reverse permutation + butterfly stages)
+- **Operations** -- Forward FFT, inverse FFT, batch cross-correlation (`xcorr_batch`)
+- **Self-test** -- Built-in verification against NumPy FFT with configurable tolerance at initialization
+- **Graceful fallback** -- Module remains importable without `pyopencl`; `GPUFFTEngine.available` property guards all operations
+- **Configuration** -- `[gpu] enable = 1`, `backend = vc4cl`, `offload_fft = 1`, `fft_batch_size = 4`
+
+### Hardware Discovery & Auto-Configuration
+
+At startup, the DAQ chain probes the system for available accelerators and peripherals, then automatically configures optimal transport and compute engine settings.
+
+```mermaid
+flowchart LR
+    HW[hw_discover.py] -->|probes| HAT["HAT<br/>(device tree + EEPROM)"]
+    HW --> GPU_D["GPU<br/>(DRI + OpenCL)"]
+    HW --> PCIE_D["PCIe<br/>(sysfs vendor scan)"]
+    HW --> USB_D["USB3<br/>(VID:PID table)"]
+    HW --> CPU_D["CPU features<br/>(NEON / AVX)"]
+    HW --> DMA_D["DMA engines"]
+    HW -->|writes| JSON["hw_caps.json"]
+    JSON --> AC[auto_config.py]
+    AC -->|"updates only<br/>fields set to 'auto'"| INI["daq_chain_config.ini"]
+```
+
+- **Probe targets** -- HAT (device tree `/proc/device-tree/hat/` + I2C EEPROM fallback), GPU (DRI devices + pyopencl enumeration), PCIe (sysfs scan for Xilinx/Intel/Lattice/Amazon vendor IDs), USB3 (known VID:PID table), CPU features (NEON/ASIMD from `/proc/cpuinfo`), DMA engines
+- **Priority-ordered recommendations** -- PCIe FPGA > GPU OpenCL > CPU NEON > CPU KFR
+- **Non-destructive updates** -- `auto_config.py` only modifies fields whose current value is the string `auto` (case-insensitive); pre-configured values are preserved
+- **Standalone usage** -- `python3 hw_discover.py` outputs JSON to stdout; `python3 auto_config.py hw_caps.json daq_chain_config.ini`
+- **Automatic at startup** -- The start scripts run both tools before launching pipeline processes
+
+## Distributed Operation
+
+### Federation System
+
+Multiple HeIMDALL DAQ instances can operate as a federation, with coordinated frequency scheduling, health monitoring, and IQ stream aggregation across hosts.
+
+```mermaid
+graph TD
+    subgraph "Federation Control Plane"
+        COORD["Coordinator<br/>TCP :6000"]
+        HEALTH["Health Monitor<br/>(peer polling)"]
+        ELECT["Coordinator Election<br/>(lowest healthy instance_id)"]
+        HEALTH --> ELECT
+    end
+
+    subgraph "Instance 0 — Host A"
+        HWC0["hw_controller :5001"]
+        ST0["status_server :5002"]
+        IQ0["iq_server :5000"]
+    end
+
+    subgraph "Instance 1 — Host B"
+        HWC1["hw_controller :5101"]
+        ST1["status_server :5102"]
+        IQ1["iq_server :5100"]
+    end
+
+    subgraph "Federation Data Plane"
+        SCHED["FederationScheduler<br/>partition master schedule"]
+        ROUTER["IQ Router :7000<br/>aggregates all streams"]
+    end
+
+    COORD -->|"fan-out FREQ,<br/>GAIN, STATUS"| HWC0
+    COORD --> HWC1
+    HEALTH -->|poll| ST0
+    HEALTH -->|poll| ST1
+    SCHED -->|sub-schedule| HWC0
+    SCHED -->|sub-schedule| HWC1
+    IQ0 --> ROUTER
+    IQ1 --> ROUTER
+```
+
+- **Coordinator** (`federation_coordinator.py`) -- Single control endpoint on port 6000; fans out FREQ, GAIN, STATUS, and REBALANCE commands to all registered instances
+- **Port formula** -- `base_port + instance_id × port_stride` (default stride=100). Instance 0: ports 5000/5001/5002; Instance 1: 5100/5101/5102; etc.
+- **Schedule partitioning** (`federation_scheduler.py`) -- Master frequency schedule divided across healthy instances using `round_robin` (alternate frequency assignment) or `range` (contiguous frequency blocks) strategies
+- **Health monitoring** (`federation_health.py`) -- Background thread polls peer StatusServers every 5 seconds; emits `peer_up`, `peer_down`, `peer_degraded` events via EventBus
+- **Coordinator election** -- Lowest `instance_id` among healthy peers automatically becomes coordinator; transparent failover on coordinator loss
+- **IQ stream aggregation** (`federation_iq_router.py`) -- Connects to each instance's IQ server, tags frames with `unit_id`, and forwards to a unified TCP output on port 7000
+- **Instance-aware FIFOs** -- Start script prefixes control FIFO and shared memory names with `inst{N}_` for multi-instance co-location on the same host
+- **Configuration** -- `[federation]` section: `instance_id`, `port_stride`, `en_federation`, `coordinator_host`, `coordinator_port`, `peer_list`
+
+```bash
+# Start federation coordinator
+python3 _daq_core/federation_coordinator.py \
+    --port 6000 \
+    --instances "localhost:0,192.168.1.10:1,192.168.1.11:2"
+```
+
+## Monitoring & Observability
+
+The DAQ pipeline includes a built-in observability stack: structured events, rolling performance metrics, and a JSON status endpoint.
+
+```mermaid
+graph LR
+    subgraph "Pipeline Modules"
+        DS4[delay_sync]
+        HWC4[hw_controller]
+        SCHED2[scheduler]
+    end
+
+    subgraph "Event Bus (non-blocking)"
+        EB[EventBus<br/>emit → queue → dispatch]
+    end
+
+    subgraph "Handlers"
+        LOG[LoggingHandler<br/>Python logging]
+        SYS[SysLogHandler<br/>RFC3164 syslog]
+        ZMQ2["ZMQ PUB :5003<br/>(topic-filtered)"]
+        RING["Ring Buffer<br/>(last 500 events)"]
+    end
+
+    subgraph "Metrics"
+        MC["MetricsCollector<br/>circular numpy buffers"]
+    end
+
+    subgraph "Status API"
+        SS["StatusServer<br/>TCP :5002<br/>JSON responses"]
+    end
+
+    DS4 --> EB
+    HWC4 --> EB
+    SCHED2 --> EB
+    EB --> LOG
+    EB --> SYS
+    EB --> ZMQ2
+    EB --> RING
+
+    DS4 --> MC
+    HWC4 --> MC
+    MC --> SS
+    RING --> SS
+```
+
+### Status Server
+
+TCP endpoint on port 5002 (+ instance offset) accepting line-based commands with JSON responses:
+
+- **PING** -- Health check: `{"ok": true, "ts": <timestamp>}`
+- **STATUS** -- Pipeline state: sync state, current frequency, per-channel gains, pipeline health, latency statistics, throughput, uptime
+- **METRICS** -- Performance statistics: `{min, max, avg, p95}` for frame processing latency and throughput
+- **EVENTS** -- Recent event log from ring buffer
+
+**Health derivation:** `ok` when sync_state >= 5 and zero recent drops; `degraded` when sync_state >= 2; `error` otherwise.
+
+### Metrics Collector
+
+- **O(1) recording** into pre-allocated circular numpy buffers (configurable window, default 1000 samples)
+- **Tracked metrics** -- `frame_processing_latency_ms`, `frame_throughput_fps`, and arbitrary named metrics
+- **Statistics** -- min, max, avg, p95, count, last value
+
+### Event Bus
+
+- **24+ event types** covering the full pipeline lifecycle: `process_start/stop`, `sync_lock/lost`, `freq_change`, `gain_change`, `overdrive`, `cal_start/sample_done/iq_done/timeout`, `noise_source_on/off`, `schedule_loaded/transition/complete`, `db_error/queue_full`, `frame_drop`, `heartbeat`, `peer_up/down/degraded`, `coordinator_elected`
+- **Non-blocking dispatch** -- `emit()` enqueues to background thread; drops silently on queue full
+- **Three handler types** -- Python logging (always enabled), syslog (configurable facility and severity threshold), ZMQ PUB (topic = event_type, for remote subscribers)
+- **Configuration** -- `[monitoring]` section enables each component independently: `en_monitoring`, `en_syslog`, `en_metrics`, `en_status_server`, `en_zmq_pub`
+
+## Performance Optimization
+
+The build system and start scripts include multiple layers of performance optimization for real-time operation on resource-constrained platforms.
+
+### Compiler Optimization
+
+- **Architecture auto-detection** -- `x86_64` gets `-march=native -Ofast -flto`; ARM gets `-mcpu=cortex-a72` (Pi 4) or `-mcpu=native` with NEON intrinsics
+- **Aggressive math flags** -- `-ffast-math -fno-signed-zeros -fno-trapping-math -fassociative-math -freciprocal-math -funroll-loops`
+- **Profile-Guided Optimization** -- Two-phase build: `make pgo-profile` (instrumented), run benchmark workload, then `make pgo-optimize` (feedback-optimized)
+
+### Real-Time Scheduling
+
+The start script launches pipeline stages with tiered SCHED_FIFO priorities and CPU core affinity:
+
+| RT Priority | Process | CPU Core | Role |
+|-------------|---------|----------|------|
+| 99 | rtl_daq.out | 0 | USB I/O critical path |
+| 94 | rebuffer.out | 1 | Shared memory handoff |
+| 92 | decimate.out | 1 | Cache locality with rebuffer |
+| 90 | delay_sync.py | 2 | FFT / cross-correlation |
+| 88 | iq_server.out | 2–3 | TCP output |
+| 82 | hw_controller.py | 3 | Control plane |
+
+RT throttling is disabled at startup: `sysctl kernel.sched_rt_runtime_us=-1`.
+
+### Performance Profiles
+
+Three presets in `config_files/performance/`:
+
+| Profile | Use Case | Key Settings |
+|---------|----------|-------------|
+| **minimal** | Low overhead, debugging | Single-thread, no affinity, `-O2` |
+| **balanced** | Production (recommended) | CPU affinity, memory locking, IRQ tuning, `-Ofast` + LTO, performance governor |
+| **maximum** | Maximum throughput | All of balanced + huge pages, PGO, CPU isolation, core pinning |
+
 ## Configuration
 
 All configuration is in `Firmware/daq_chain_config.ini`:
@@ -194,8 +479,15 @@ All configuration is in `Firmware/daq_chain_config.ini`:
 | `[schedule]` | `en_schedule`, `frequencies`, `dwell_frames`, `repeat_mode` |
 | `[database]` | `en_db`, `db_dir`, `rotation_max_age_hours`, `write_batch_size` |
 | `[data_interface]` | `out_data_iface_type` (shmem/eth) |
+| `[offload]` | `rebuffer_transport`, `decimator_transport`, `fir_engine`, `fft_engine` (all support `auto`) |
+| `[monitoring]` | `en_monitoring`, `en_syslog`, `en_metrics`, `en_status_server` (port 5002), `en_zmq_pub` (port 5003) |
+| `[federation]` | `instance_id`, `port_stride`, `en_federation`, `coordinator_port`, `peer_list` |
+| `[fpga]` | `enable`, `spi_device`, `spi_speed_hz`, `bitstream`, `offload_fir`, `offload_xcorr` |
+| `[gpu]` | `enable`, `backend`, `offload_fft`, `fft_batch_size` |
+| `[pcie]` | `enable`, `device`, `driver` |
+| `[usb3]` | `enable`, `vid`, `pid`, `transfer_size` |
 
-Both `[schedule]` and `[database]` are **disabled by default** (`en_schedule=0`, `en_db=0`) for full backward compatibility.
+All optional sections (`[schedule]`, `[database]`, `[offload]`, `[monitoring]`, `[federation]`, `[fpga]`, `[gpu]`, `[pcie]`, `[usb3]`) are **disabled by default** for full backward compatibility.
 
 Use `util/cfg_gen.py` for automatic configuration generation from signal parameters:
 ```bash
@@ -268,6 +560,10 @@ python3 -m unittest -v _testing/unit_test/test_signal_scheduler.py
 
 # Database record + integration tests
 python3 -m unittest -v _testing/unit_test/test_daq_db.py
+
+# Monitoring and federation tests (no sudo required)
+python3 -m unittest -v _testing/unit_test/test_monitoring.py
+python3 -m unittest -v _testing/unit_test/test_federation.py
 
 # Existing pipeline tests (require unit_test_k4 config)
 sudo python3 -W ignore -m unittest -v _testing/unit_test/test_decimator.py
@@ -507,31 +803,74 @@ Now you will probably want to install the direction of arrival DSP code found in
 ```
 heimdall_daq_fw/
 ├── Firmware/
-│   ├── _daq_core/               # Core pipeline modules
-│   │   ├── rtl_daq.c/h          # Multi-tuner SDR reader
-│   │   ├── rebuffer.c           # CPI block reshaper
-│   │   ├── fir_decimate.c       # FIR filter + decimation
-│   │   ├── iq_server.c          # TCP IQ data server
-│   │   ├── delay_sync.py        # Delay & IQ synchronizer
-│   │   ├── hw_controller.py     # Hardware control + scheduling
-│   │   ├── signal_scheduler.py  # Dynamic frequency scheduler
-│   │   ├── daq_db.py            # BerkeleyDB persistent storage
-│   │   ├── daq_db_records.py    # Binary record definitions
-│   │   ├── iq_header.py         # 1024-byte IQ frame header
-│   │   ├── inter_module_messages.py  # ZMQ message protocol
-│   │   └── shmemIface.py        # Shared memory interface
-│   ├── _testing/                # Test suite
-│   ├── _data_control/           # Runtime control FIFOs
-│   ├── _db/                     # Database files (runtime)
-│   ├── _logs/                   # Log files (runtime)
-│   ├── daq_chain_config.ini     # Main configuration
-│   ├── daq_start_sm.sh          # Start with real hardware
-│   ├── daq_synthetic_start.sh   # Start in simulation mode
-│   ├── daq_stop.sh              # Stop all processes
-│   └── ini_checker.py           # Configuration validator
-├── config_files/                # Preset configurations
+│   ├── _daq_core/                    # Core pipeline modules
+│   │   ├── rtl_daq.c/h               # Multi-tuner SDR reader
+│   │   ├── rebuffer.c                # CPI block reshaper
+│   │   ├── fir_decimate.c            # FIR filter + decimation
+│   │   ├── iq_server.c               # TCP IQ data server
+│   │   ├── iq_header.h/c/py          # 1024-byte IQ frame header (C + Python)
+│   │   ├── delay_sync.py             # Delay & IQ synchronizer
+│   │   ├── hw_controller.py          # Hardware control + scheduling
+│   │   ├── signal_scheduler.py       # Dynamic frequency scheduler
+│   │   ├── shmemIface.py             # Shared memory interface
+│   │   ├── transportIface.py         # Pluggable transport abstraction (Python)
+│   │   ├── transport.c/h             # Transport vtable dispatch (C)
+│   │   ├── transport_shm.c           # Shared memory transport driver
+│   │   ├── transport_spi.c           # SPI+DMA transport driver
+│   │   ├── transport_pcie.c          # PCIe/XDMA transport driver
+│   │   ├── transport_usb3.c          # USB 3.0 transport driver
+│   │   ├── transport_net.c           # TCP/Ethernet transport driver
+│   │   ├── offload.c/h               # Offload engine vtable dispatch (C)
+│   │   ├── offload_cpu_neon.c        # ARM NEON FIR/convert engine
+│   │   ├── offload_cpu_kfr.c         # x86 KFR FIR/convert engine
+│   │   ├── offload_fpga.c            # FPGA FIR engine (SPI-based)
+│   │   ├── offload_gpu.c             # GPU compute engine (C)
+│   │   ├── offload_engines.py        # Python FFT/correlation engines
+│   │   ├── offload_gpu.py            # GPU FFT via OpenCL (Python)
+│   │   ├── daq_db.py                 # BerkeleyDB persistent storage
+│   │   ├── daq_db_records.py         # Binary record definitions
+│   │   ├── daq_status_server.py      # JSON status endpoint (TCP :5002)
+│   │   ├── daq_metrics.py            # Rolling performance metrics
+│   │   ├── daq_events.py             # Structured event bus
+│   │   ├── federation_coordinator.py # Multi-instance coordinator
+│   │   ├── federation_scheduler.py   # Distributed schedule partitioning
+│   │   ├── federation_health.py      # Peer health monitoring
+│   │   ├── federation_iq_router.py   # IQ stream aggregation
+│   │   ├── hw_discover.py            # Hardware capability discovery
+│   │   ├── auto_config.py            # Auto-configuration from capabilities
+│   │   └── inter_module_messages.py  # ZMQ message protocol
+│   ├── _fpga_gateware/               # FPGA acceleration
+│   │   ├── rtl/                      # Verilog RTL source
+│   │   │   ├── top.v                 # Top-level (PLL, SPI, orchestration)
+│   │   │   ├── spi_slave.v           # SPI interface + CRC-32
+│   │   │   ├── fir_decimate.v        # Polyphase FIR filter
+│   │   │   ├── fft_radix2.v          # Radix-2 FFT engine
+│   │   │   ├── xcorr_engine.v        # Cross-correlation engine
+│   │   │   └── ...                   # Supporting modules
+│   │   ├── tb/                       # Testbenches (Icarus Verilog)
+│   │   ├── constraints/              # Pin constraints (ECP5, iCE40)
+│   │   └── Makefile                  # Yosys + nextpnr build
+│   ├── _testing/                     # Test suite
+│   ├── _data_control/                # Runtime control FIFOs
+│   ├── _db/                          # Database files (runtime)
+│   ├── _logs/                        # Log files (runtime)
+│   ├── daq_chain_config.ini          # Main configuration
+│   ├── daq_start_sm.sh               # Start with real hardware
+│   ├── daq_synthetic_start.sh        # Start in simulation mode
+│   ├── daq_stop.sh                   # Stop all processes
+│   └── ini_checker.py                # Configuration validator
+├── config_files/
+│   ├── kraken_default/               # 5-channel KrakenSDR preset
+│   ├── kerberos_default/             # KerberosSDR preset
+│   ├── unit_test_k4/                 # Test configuration
+│   └── performance/                  # Performance profiles
+│       ├── minimal.conf              # Low overhead
+│       ├── balanced.conf             # Production (recommended)
+│       └── maximum.conf              # Maximum throughput
 ├── util/
-│   └── cfg_gen.py               # Auto config generator
+│   ├── cfg_gen.py                    # Auto config generator
+│   ├── system_tuning.py              # RT system optimization
+│   └── performance_monitor.py        # Per-process perf tracking
 └── Documentation/
 ```
 
