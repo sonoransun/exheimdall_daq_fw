@@ -61,8 +61,14 @@ mkfifo _data_control/${FIFO_PREFIX}bw_delay_sync_hwc
 # Create database directory
 mkdir -p _db
 
-# Remove old log files
-rm _logs/*.log 2> /dev/null
+# Archive old log files instead of deleting
+if ls _logs/*.log 1>/dev/null 2>&1; then
+    archive_dir="_logs/archive/$(date -Iseconds)"
+    mkdir -p "$archive_dir"
+    mv _logs/*.log "$archive_dir/" 2>/dev/null
+    # Keep only the last 10 archives
+    ls -1dt _logs/archive/*/ 2>/dev/null | tail -n +11 | xargs rm -rf 2>/dev/null
+fi
 
 # Useful to set this on low power ARM devices 
 #sudo cpufreq-set -g performance

@@ -1,0 +1,10 @@
+/var/log/heimdall/*.log
+/opt/heimdall/Firmware/_logs/*.log {
+    size 50M
+    rotate 7
+    copytruncate
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

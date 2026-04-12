@@ -1,0 +1,16 @@
+[project]
+name = "heimdall-daq-fw"
+version = "0.1.0"
+requires-python = ">=3.8"
+
+[tool.pytest.ini_options]
+testpaths = [
+    "Firmware/_testing/unit_test",
+    "util/heimdall_ctl/tests",
+]
+markers = [
+    "sudo: requires root privileges",
+    "hardware: requires real SDR hardware",
+    "gpu: requires OpenCL/GPU",
+]
+addopts = "-m 'not sudo and not hardware and not gpu'"

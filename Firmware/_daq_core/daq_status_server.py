@@ -97,8 +97,11 @@ class StatusServer:
             resp = self._build_metrics()
         elif cmd == "EVENTS":
             resp = self._build_events()
+        elif cmd == "EVENTS_DROPPED":
+            resp = self._build_events_dropped()
         else:
-            resp = {"error": "unknown command", "valid": ["PING", "STATUS", "METRICS", "EVENTS"]}
+            resp = {"error": "unknown command",
+                    "valid": ["PING", "STATUS", "METRICS", "EVENTS", "EVENTS_DROPPED"]}
         try:
             conn.sendall((json.dumps(resp) + "\n").encode())
         except Exception:
@@ -147,3 +150,8 @@ class StatusServer:
             return {"error": "event bus not enabled"}
         events = self._event_bus.get_recent_events(100)
         return {"events": [e.to_dict() for e in events]}
+
+    def _build_events_dropped(self):
+        if self._event_bus is None:
+            return {"error": "event bus not enabled"}
+        return {"dropped_events": self._event_bus.dropped_events}

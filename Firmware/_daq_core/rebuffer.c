@@ -37,12 +37,33 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include "rtl_daq.h"
 #include "log.h"
 #include "ini.h"
 #include "iq_header.h"
 #include "sh_mem_util.h"
 #include "transport.h"
+
+static volatile sig_atomic_t sig_exit_flag = 0;
+
+static void shutdown_handler(int sig)
+{
+    (void)sig;
+    sig_exit_flag = 1;
+}
+
+static void install_signal_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = shutdown_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(64,      &sa, NULL);
+}
 
 #define INI_FNAME "daq_chain_config.ini"
 #define FATAL_ERR(l) log_fatal(l); return -1;
@@ -104,6 +125,7 @@ int main(int argc, char* argv[])
  */
 {    
     log_set_level(LOG_TRACE);
+    install_signal_handlers();
     configuration config;
     config.instance_id = 0;
     config.port_stride = 100;
@@ -187,7 +209,7 @@ int main(int argc, char* argv[])
      * ---> Main Processing Loop <---
      *
      */
-    while(!exit_flag)
+    while(!exit_flag && !sig_exit_flag)
     {
         CHK_DATA_PIPE(stdin);
         /*
@@ -356,7 +378,10 @@ int main(int argc, char* argv[])
             }
         }                
     }    
-    error_code_log(exit_flag);
+    if (sig_exit_flag)
+        log_info("Received shutdown signal");
+    else
+        error_code_log(exit_flag);
     log_info("Send terminate and wait..");
     transport_send_terminate(output_transport);
     sleep(3);
@@ -367,9 +392,10 @@ int main(int argc, char* argv[])
     {
         free((circ_buff_structs + m * sizeof(*circ_buff_structs))->iq_circ_buffer);       
     }
+    free(iq_header);
+    free(circ_buff_structs);
     log_info("Rebuffering block exited");
     return 0;
-    
 }
 
 

@@ -41,8 +41,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
-#include <sys/time.h>  // Used for latency estimation
-#include <sys/mman.h>  // For memory locking (mlockall)
+#include <signal.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/mman.h>
 #include <zmq.h>
 
 #include "ini.h"
@@ -79,7 +81,8 @@ pthread_t fifo_read_thread;
 static pthread_barrier_t rtl_init_barrier;
 
 int rtl_daq_zmq_port = 1130; // Set from config via federation instance_id
-int reconfig_trigger=0, exit_flag=0;
+int reconfig_trigger=0;
+volatile sig_atomic_t exit_flag = 0;
 int noise_source_state = 0; // Noise source state is used also to track the calibration frame status!
 int last_noise_source_state = 0;
 int gain_change_flag;
@@ -160,8 +163,28 @@ static int handler(void* conf_struct, const char* section, const char* name,
     return 0;
 }
 
+static void shutdown_handler(int sig)
+{
+    (void)sig;
+    exit_flag = 1;
+}
+
+static void install_signal_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = shutdown_handler;
+    sigemptyset(&sa.sa_mask);
+    /* No SA_RESTART so blocked syscalls (zmq_recv, pthread_cond_wait) return */
+    sa.sa_flags = 0;
+
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(64,      &sa, NULL);  /* SIGRT used by legacy daq_stop.sh */
+}
+
 void * fifo_read_tf(void* arg)
-/*   
+/*
  *  Control FIFO read thread function
  *
  *  This thread function handles the external requests using a ZMQ socket.
@@ -190,17 +213,23 @@ void * fifo_read_tf(void* arg)
         pthread_mutex_unlock(&buff_ind_mutex); 
         return NULL;
     }
-    int zmq_socket_flags = 0;//|ZMQ_NOBLOCK;
+    int zmq_rcv_timeout_ms = 500;
+    zmq_setsockopt(responder, ZMQ_RCVTIMEO, &zmq_rcv_timeout_ms, sizeof(zmq_rcv_timeout_ms));
 
     // Initialize message structure
-    struct hdaq_im_msg_struct* msg;    
+    struct hdaq_im_msg_struct* msg;
     msg = (struct hdaq_im_msg_struct*) malloc(sizeof(struct hdaq_im_msg_struct));
-    
+
     /* Main thread loop*/
     while(!exit_flag){
-        
-        // Blocks until command is received
-        zmq_recv (responder, msg, 128, zmq_socket_flags);        
+
+        int nbytes = zmq_recv(responder, msg, 128, 0);
+        if (nbytes < 0) {
+            if (errno == EAGAIN || errno == EINTR)
+                continue;
+            log_error("ZMQ recv failed: %s", strerror(errno));
+            break;
+        }
         log_info("IM Request from: %d",msg->source_module_identifier);
         log_info("Command id: %c",msg->command_identifier);
         
@@ -288,8 +317,11 @@ void * fifo_read_tf(void* arg)
         zmq_send (responder, "ok", 2, 0);
 
         pthread_cond_signal(&buff_ind_cond);
-        pthread_mutex_unlock(&buff_ind_mutex); 
+        pthread_mutex_unlock(&buff_ind_mutex);
     }
+    free(msg);
+    zmq_close(responder);
+    zmq_ctx_destroy(context);
     return NULL;
 }
 
@@ -451,6 +483,7 @@ int init_rt_memory(void) {
 int main( int argc, char** argv )
 {
     log_set_level(LOG_TRACE);
+    install_signal_handlers();
 
     // Initialize real-time memory management
     if (init_rt_memory() != 0) {
@@ -639,7 +672,14 @@ int main( int argc, char** argv )
          * All the reader threads should reach the same index before we could send out the data,
          * and we could coninue the acquisition.
         */        
-        pthread_cond_wait(&buff_ind_cond, &buff_ind_mutex); // TODO: Check- should we acquire mutex first?
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 250000000L; /* 250 ms */
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&buff_ind_cond, &buff_ind_mutex, &ts);
+        }
+        if (exit_flag) break;
         data_ready = 1;
         for(int i=0; i<ch_no; i++)
         {
@@ -921,11 +961,15 @@ int main( int argc, char** argv )
     }
     pthread_mutex_unlock(&buff_ind_mutex);
     pthread_join(fifo_read_thread, NULL);
-    log_info("All the resources are free now");
+    free(iq_header);
+    free(new_gains);
+    free(new_fs_corrections);
     free(rtl_receivers);
+    pthread_mutex_destroy(&buff_ind_mutex);
+    pthread_cond_destroy(&buff_ind_cond);
+    log_info("All the resources are free now");
 
     #ifdef USEPIGPIO
-    // PIGPIO
     gpioTerminate();
     #endif
 

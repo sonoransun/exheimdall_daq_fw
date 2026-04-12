@@ -42,6 +42,7 @@ EVT_PEER_UP = "peer_up"
 EVT_PEER_DOWN = "peer_down"
 EVT_PEER_DEGRADED = "peer_degraded"
 EVT_COORDINATOR_ELECTED = "coordinator_elected"
+EVT_EVENT_QUEUE_FULL = "event_queue_full"
 
 # Severity string → logging level
 _SEVERITY_MAP = {
@@ -175,6 +176,8 @@ class EventBus:
         self._ring = []
         self._ring_size = ring_size
         self._ring_idx = 0
+        self.dropped_events = 0
+        self._last_drop_notify = 0.0
         if not enabled:
             return
         self._queue = queue.Queue(maxsize=queue_size)
@@ -197,7 +200,23 @@ class EventBus:
         try:
             self._queue.put_nowait(event)
         except queue.Full:
-            pass  # Drop silently rather than block the pipeline
+            self.dropped_events += 1
+            now = time.monotonic()
+            if now - self._last_drop_notify >= 1.0:
+                self._last_drop_notify = now
+                drop_event = DAQEvent(
+                    severity="warning",
+                    module="event_bus",
+                    event_type=EVT_EVENT_QUEUE_FULL,
+                    payload={"dropped_total": self.dropped_events},
+                )
+                drop_event.timestamp = time.time()
+                self._store_ring(drop_event)
+                for handler in self._handlers:
+                    try:
+                        handler(drop_event)
+                    except Exception:
+                        pass
 
     def get_recent_events(self, n=100):
         """Return up to *n* most recent events from the ring buffer."""

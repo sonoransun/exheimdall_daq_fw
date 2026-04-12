@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <string.h>
+#include <signal.h>
 #include "log.h"
 #include "ini.h"
 #include "iq_header.h"
@@ -39,6 +40,26 @@
 #include "rtl_daq.h"
 #include "transport.h"
 #include "offload.h"
+
+static volatile sig_atomic_t sig_exit_flag = 0;
+
+static void shutdown_handler(int sig)
+{
+    (void)sig;
+    sig_exit_flag = 1;
+}
+
+static void install_signal_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = shutdown_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(64,      &sa, NULL);
+}
 
 #define DC 127.5
 #define INI_FNAME "daq_chain_config.ini"
@@ -108,6 +129,7 @@ int main(int argc, char **argv)
  */
 {
     log_set_level(LOG_TRACE);
+    install_signal_handlers();
     configuration config;
     config.instance_id = 0;
     config.port_stride = 100;
@@ -225,7 +247,7 @@ int main(int argc, char **argv)
     void* output_frame_ptr;
 
     /* Main Processing loop*/
-    while(!exit_flag){
+    while(!exit_flag && !sig_exit_flag){
 
         /* Acquire data buffer from input transport */
         active_buff_ind_in = transport_get_read_buf(input_transport, &input_frame_ptr);
@@ -316,7 +338,10 @@ int main(int argc, char **argv)
         }
         transport_release_read(input_transport, active_buff_ind_in);
     } // End of the main processing loop
-    error_code_log(exit_flag);
+    if (sig_exit_flag)
+        log_info("Received shutdown signal");
+    else
+        error_code_log(exit_flag);
     transport_send_terminate(output_transport);
     sleep(3);
     transport_destroy(output_transport);
