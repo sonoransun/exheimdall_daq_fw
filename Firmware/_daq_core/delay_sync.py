@@ -133,6 +133,16 @@ class delaySynchronizer():
         self.port_stride = 100
         self.federation_health = None
 
+        # RF front-end / orientation telemetry (v8 header reserved-region stamping)
+        self.rf_frontend = None
+        self.antenna_profile = None
+        self._en_frontend_telemetry = False
+        self._en_orientation = False
+        self._agg_power_mdb = 0
+        self._orientation_state_fname = "_data_control/orientation_state"
+        self._orientation_read_counter = 0
+        self._orientation_cache = (0.0, 0.0, 0)  # (az_deg, el_deg, rotator_state)
+
         # Offload / transport defaults
         self.transport_type = 'shm'
         self.fft_engine_type = 'cpu_scipy'
@@ -358,7 +368,75 @@ class delaySynchronizer():
             self.logger.info("Offload config: transport={:s}, fft_engine={:s}".format(
                 self.transport_type, self.fft_engine_type))
 
+        # RF front-end / orientation telemetry configuration. delay_sync is the
+        # producer of the outbound IQ header, so it stamps per-frame gain-budget +
+        # aggregate power + antenna bearing into the v8 reserved region.
+        try:
+            from gain_budget import RfFrontendParser
+            from antenna_profile import AntennaProfileParser
+            self.antenna_profile = AntennaProfileParser.from_ini_section(parser, 'antenna')
+            self.rf_frontend = RfFrontendParser.from_ini_section(parser, self.M, 'amplification')
+        except Exception as e:
+            self.logger.error("Failed to load RF front-end telemetry config: {:s}".format(str(e)))
+            self.rf_frontend = None
+            self.antenna_profile = None
+        if parser.has_section('orientation'):
+            self._en_orientation = parser.getint('orientation', 'en_orientation', fallback=0) == 1
+        if self.instance_id != 0:
+            self._orientation_state_fname = "_data_control/inst{:d}_orientation_state".format(self.instance_id)
+        self._en_frontend_telemetry = (self.rf_frontend is not None
+                                       or self.antenna_profile is not None
+                                       or self._en_orientation)
+        if self._en_frontend_telemetry:
+            self.logger.info("RF front-end / orientation telemetry stamping enabled (v8 header)")
+
         return 0
+
+    def _stamp_frontend_telemetry(self):
+        """Populate the v8 reserved-region telemetry on the outbound header:
+        the aggregate channel-power scan objective, per-channel total system
+        gain / cascaded noise figure / compression (from the amplification
+        config and the tuner if_gains), and the antenna bearing relayed from
+        hw_controller via a small control file."""
+        # Aggregate received power objective (milli-dB)
+        self.iq_header.set_aggregate_power_mdb(self._agg_power_mdb)
+
+        # Gain budget from the external LNA chain + antenna profile
+        if self.rf_frontend is not None:
+            ext_tenths = [int(round(g * 10)) for g in self.rf_frontend.ext_lna_gains_db]
+            total_tenths = []
+            nf_mdb = []
+            comp = 0
+            for m in range(min(self.M, 32)):
+                tuner_gain_db = self.iq_header.if_gains[m] / 10.0
+                budget = self.rf_frontend.channel_budget(
+                    m, tuner_gain_db, antenna_profile=self.antenna_profile,
+                    freq_hz=self.iq_header.rf_center_freq)
+                total_tenths.append(int(round(budget["total_gain_db"] * 10)))
+                nf_mdb.append(int(round(budget["system_nf_db"] * 1000)))
+                if budget["compressed"]:
+                    comp |= (1 << m)
+            self.iq_header.set_ext_lna_gains(ext_tenths)
+            self.iq_header.set_total_system_gains(total_tenths)
+            self.iq_header.set_system_nf_mdb(nf_mdb)
+            self.iq_header.set_compression_flags(comp)
+
+        # Antenna bearing / rotator state relayed from hw_controller (throttled read)
+        if self._en_orientation:
+            self._orientation_read_counter += 1
+            if self._orientation_read_counter >= 5:
+                self._orientation_read_counter = 0
+                try:
+                    with open(self._orientation_state_fname, 'r') as f:
+                        parts = f.read().split()
+                    if len(parts) >= 3:
+                        self._orientation_cache = (float(parts[0]), float(parts[1]), int(float(parts[2])))
+                except (OSError, ValueError):
+                    pass
+            az, el, state = self._orientation_cache
+            self.iq_header.set_antenna_bearing(az, el)
+            self.iq_header.set_rotator_state(state)
+
     def open_interfaces(self):
         """
             Opens the communication interfaces of the module including the
@@ -658,7 +736,12 @@ class delaySynchronizer():
                     if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
                         iq_samples = iq_samples_out[:,:] # payload size must be N_proc
                     elif self.N >= self.N_proc: iq_samples = iq_samples_out[:,0:self.N_proc] # Normal truncation
-                    else: iq_samples = iq_samples_out[:,:] # Only N sample is availabe in data frames 
+                    else: iq_samples = iq_samples_out[:,:] # Only N sample is availabe in data frames
+
+                    # -> Aggregate received power for the scan-and-peak objective (v8 telemetry)
+                    if self._en_frontend_telemetry and self.iq_header.frame_type == IQHeader.FRAME_TYPE_DATA:
+                        p_lin = float(np.real(np.vdot(iq_samples, iq_samples))) / max(iq_samples.size, 1)
+                        self._agg_power_mdb = int(round(10.0 * np.log10(p_lin + 1e-20) * 1000.0))
                 #
                 #------------------------------------------>
                 #            
@@ -994,6 +1077,10 @@ class delaySynchronizer():
             
             self.iq_header.sync_state = sync_state
 
+            # -> Stamp RF front-end + orientation telemetry into the reserved region (v8)
+            if self._en_frontend_telemetry:
+                self._stamp_frontend_telemetry()
+
             # -> Send IQ frame toward the iq server
             header_uint8 = np.frombuffer(self.iq_header.encode_header(), dtype=np.uint8)
             if active_buffer_index_iq !=3 :
@@ -1045,6 +1132,7 @@ class delaySynchronizer():
                             "sync_state": sync_state,
                             "current_frequency_hz": self.iq_header.rf_center_freq,
                             "frame_count": self.iq_header.cpi_index,
+                            "aggregate_power_db": self._agg_power_mdb / 1000.0,
                             "calibration_status": "locked" if sync_state >= 5 else ("calibrating" if sync_state >= 2 else "lost"),
                             "counters": {
                                 "dropped_frames_iq": self.out_shmem_iface_iq.dropped_frame_cntr,

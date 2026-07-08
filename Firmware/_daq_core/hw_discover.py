@@ -356,6 +356,41 @@ def discover_dma():
     return result
 
 
+def discover_rotator():
+    """Probe for antenna rotator / pan-tilt hardware.
+
+    Enumerates candidate serial devices (GS-232/Yaesu rotators over USB/UART)
+    and available I2C buses (PCA9685 pan-tilt boards). Does not open/identify
+    the devices — that is left to the rotator backend at runtime.
+
+    Returns
+    -------
+    dict
+        Keys: available (bool), serial_ports (list of str),
+        i2c_buses (list of int).
+    """
+    import glob
+    result = {
+        'available': False,
+        'serial_ports': [],
+        'i2c_buses': [],
+    }
+
+    # Candidate serial devices for GS-232 / Yaesu rotators
+    for pattern in ('/dev/ttyUSB*', '/dev/ttyACM*', '/dev/ttyAMA*'):
+        result['serial_ports'].extend(sorted(glob.glob(pattern)))
+
+    # I2C buses for PCA9685-based pan-tilt drivers
+    for dev in sorted(glob.glob('/dev/i2c-*')):
+        try:
+            result['i2c_buses'].append(int(dev.rsplit('-', 1)[1]))
+        except (ValueError, IndexError):
+            pass
+
+    result['available'] = bool(result['serial_ports'] or result['i2c_buses'])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Recommendation engine
 # ---------------------------------------------------------------------------
@@ -430,6 +465,7 @@ def discover_hardware():
         'usb3': discover_usb3(),
         'cpu': discover_cpu(),
         'dma': discover_dma(),
+        'rotator': discover_rotator(),
         'recommended': {},
     }
     caps['recommended'] = compute_recommendations(caps)

@@ -18,6 +18,25 @@
 #define SYNC_WORD 0x2bf7b95a
 
 #define IQ_HEADER_LENGTH 1024
+
+/* Header layout version. v8 names slots inside the previously-zero reserved[]
+ * region for RF front-end (amplification) and antenna-orientation telemetry.
+ * The struct size (1024 bytes) is unchanged; only reserved[] slots are used. */
+#define IQ_HEADER_VERSION 8
+
+/* Named uint32 slot indices inside iq_header_struct.reserved[192].
+ * Stamped by delay_sync.py (gain budget + aggregate power) and, for the
+ * antenna bearing, relayed from hw_controller.py. See iq_header.py for the
+ * Python-side accessors that must stay in lockstep with these offsets. */
+#define IQH_RSV_EXT_LNA_GAINS      0   /* [0..31]  external LNA gain, dB x10 */
+#define IQH_RSV_TOTAL_GAINS        32  /* [32..63] total system gain, dB x10 */
+#define IQH_RSV_SYSTEM_NF_MDB      64  /* [64..95] system noise figure, milli-dB */
+#define IQH_RSV_COMPRESSION_FLAGS  96  /* per-channel compression bitmask */
+#define IQH_RSV_BIAS_TEE_STATE     97  /* per-channel bias-tee bitmask */
+#define IQH_RSV_ANTENNA_AZ_CDEG    98  /* antenna azimuth, centi-deg (0..36000) */
+#define IQH_RSV_ANTENNA_EL_CDEG    99  /* antenna elevation, centi-deg (+9000 offset) */
+#define IQH_RSV_ROTATOR_STATE      100 /* orientation controller state enum */
+#define IQH_RSV_AGG_POWER_MDB      101 /* aggregate channel power, milli-dB (scan objective) */
 struct iq_frame_struct 
 {
 	struct iq_header_struct* header;

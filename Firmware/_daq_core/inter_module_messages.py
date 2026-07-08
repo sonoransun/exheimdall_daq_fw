@@ -151,8 +151,33 @@ def pack_msg_sample_freq_tune(module_identifier, fs_ppm_offsets):
     msg_byte_array += 's'.encode('ascii') # 1 byte
     for fs_offset in fs_ppm_offsets:
             msg_byte_array += pack('f',  fs_offset) # 4 byte
-    for m in range(msg_length-1-1-len(fs_ppm_offsets)*4):    
-        msg_byte_array +=pack('b',0)    
-       
+    for m in range(msg_length-1-1-len(fs_ppm_offsets)*4):
+        msg_byte_array +=pack('b',0)
+
     return msg_byte_array
-    
+
+def pack_msg_set_bias_tee(module_identifier, states):
+    """
+        Prepares the byte array of an inter-module ZMQ message for runtime
+        inline-LNA bias-tee switching.
+
+        Parameters:
+        -----------
+            :param: module_identifier: Source module id
+            :param: states: Per-channel bias-tee state (0/1) for each receiver
+
+            :type: module_identifier: int
+            :type: states: list of ints [state_ch0, state_ch1, ..]
+
+        Return:
+        -------
+            Assembled 128-byte message structure in byte array
+    """
+    msg_length = 128 # Total message length 128 byte
+    msg_byte_array  = pack("b", module_identifier) # 1 byte
+    msg_byte_array += 'b'.encode('ascii') # 1 byte
+    for state in states:
+        msg_byte_array += pack('I', 1 if state else 0) # 4 byte
+    for m in range(msg_length-1-1-len(states)*4):
+        msg_byte_array += pack('b', 0)
+    return msg_byte_array

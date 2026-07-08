@@ -83,7 +83,44 @@ The hardware controller manages the RF front-end and calibration hardware:
 - **Frequency tuning** -- RF center frequency changes via ZMQ to the receiver module
 - **Noise source control** -- Programmable internal noise source for calibration (with automatic gain preset during cal)
 - **AGC support** -- Optional automatic gain control mode
-- **External control interface** -- TCP server on port 5001 accepting FREQ, GAIN, AGC, and INIT commands
+- **External control interface** -- TCP server on port 5001 accepting FREQ, GAIN, AGC, INIT, and the RF front-end / orientation commands (EGAN, BIAS, RFQ, ORNT, SCAN, PARK, OSTP, OQRY)
+
+### Amplified Receivers & Link Budget
+
+External LNA / inline-amplifier gain-staging modelled on top of the R820T tuner IF gain, for maximum sensitivity and range:
+
+- **External LNA gain-staging** -- Per-channel continuous-dB external amplifier gain, tracked separately from the quantized R820T tuner gain so the calibration gain-lock state machine is never disturbed
+- **Cascaded noise figure** -- Friis-equation system noise-figure budget across antenna feed loss → external LNA → tuner (a high-gain first-stage LNA dominates and drops the system NF)
+- **Compression awareness** -- P1dB headroom modelling that augments (does not replace) the ADC-overdrive flag, warning before an external LNA compresses
+- **Bias-tee power** -- Runtime-switchable bias-tee power for inline LNAs (`BIAS` command), or static config-only power via `[hw] en_bias_tee`
+- **Telemetry** -- Total system gain, cascaded NF, and compression flags are reported per frame in the IQ header (v8 reserved region) and via the status/event/DB paths. Config: `[amplification]`
+
+### High-Gain / Directional Antennas
+
+An antenna profile describes the front-end so both the gain budget and the pointing mechanism know the antenna:
+
+- **Element characterization** -- Gain (dBi), azimuth/elevation beamwidth, polarization, and cable/connector loss, which feed the total-gain and cascaded-NF budget
+- **Boresight correction** -- A mechanical→electrical boresight offset so the DF app can command an electrical bearing while the rotator accounts for mounting skew. Config: `[antenna]`
+
+### Dynamic Antenna Orientation
+
+A rotator / pan-tilt controller slews a directional antenna (or the whole array) to a commanded bearing, tied to the DF workflow:
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> SLEWING : set_bearing() / ORNT
+    SLEWING --> SETTLED : reached + settle_frames (DATA)
+    SETTLED --> SLEWING : new bearing
+    IDLE --> SCANNING : start_scan() / SCAN
+    SCANNING --> SCANNING : dwell + step grid
+    SCANNING --> SLEWING : peak found → go to best bearing
+    SLEWING --> SLEWING : frozen while sync_state < min_sync_state
+```
+
+- **Bearing sources** -- External DF-app / manual set-point (`ORNT`), a fixed/park config bearing, or autonomous **scan-and-peak** (`SCAN`) that maximizes the aggregate channel-power objective stamped by `delay_sync` into the IQ header
+- **Backends** -- GS-232 / Yaesu serial rotators, GPIO/PWM servo pan-tilt, I2C (PCA9685) pan-tilt, plus a mock backend for tests; the factory falls back to the mock if hardware is absent
+- **Calibration-safe** -- Motion is gated on `sync_state` and the noise-source state so the array is never slewed mid-calibration. Config: `[orientation]`
 
 ### Dynamic Signal Scheduling
 
@@ -177,9 +214,9 @@ graph LR
 ```
 
 - **Shared memory ring buffers** -- Double-buffered IQ data transfer between pipeline stages
-- **ZMQ REQ/REP** -- 128-byte message protocol for frequency, gain, noise source, and sampling frequency control
-- **TCP control** -- 128-byte command frames (4-byte command + 124-byte payload) for external integration
-- **1024-byte IQ headers** -- Binary frame headers with sync word, metadata, calibration state, and per-channel gains
+- **ZMQ REQ/REP** -- 128-byte message protocol for frequency, gain, noise source, sampling frequency, and inline-LNA bias-tee (`b`) control
+- **TCP control** -- 128-byte command frames (4-byte command + 124-byte payload) for external integration. Commands: `FREQ`, `GAIN`, `AGC`, `INIT`, `SCHD`/`SCHS`/`SCHQ`/`SCHN` (schedule), `EGAN` (external LNA gain), `BIAS` (bias-tee), `RFQ` (link-budget query), `ORNT`/`SCAN`/`PARK`/`OSTP`/`OQRY` (orientation)
+- **1024-byte IQ headers** -- Binary frame headers (v8) with sync word, metadata, calibration state, per-channel gains, and the reserved-region RF front-end / orientation telemetry (total system gain, cascaded NF, compression flags, antenna bearing, aggregate channel power)
 
 The shared memory transport is the default backend of the pluggable [Transport Abstraction Layer](#transport-abstraction-layer) described below.
 
@@ -486,8 +523,11 @@ All configuration is in `Firmware/daq_chain_config.ini`:
 | `[gpu]` | `enable`, `backend`, `offload_fft`, `fft_batch_size` |
 | `[pcie]` | `enable`, `device`, `driver` |
 | `[usb3]` | `enable`, `vid`, `pid`, `transfer_size` |
+| `[amplification]` | `en_amplification`, `ext_lna_gains_db`, `ext_lna_nf_db`, `ext_lna_p1db_dbm`, `tuner_nf_db`, `max_total_gain_db`, `en_bias_tee_runtime` |
+| `[antenna]` | `en_antenna_profile`, `element_gain_dbi`, `beamwidth_az_deg`, `polarization`, `cable_loss_db`, `boresight_az_offset_deg` |
+| `[orientation]` | `en_orientation`, `backend`, `bearing_mode`, `az_min_deg`/`az_max_deg`, `slew_rate_dps`, `min_sync_state`, `en_scan` |
 
-All optional sections (`[schedule]`, `[database]`, `[offload]`, `[monitoring]`, `[federation]`, `[fpga]`, `[gpu]`, `[pcie]`, `[usb3]`) are **disabled by default** for full backward compatibility.
+All optional sections (`[schedule]`, `[database]`, `[offload]`, `[monitoring]`, `[federation]`, `[fpga]`, `[gpu]`, `[pcie]`, `[usb3]`, `[amplification]`, `[antenna]`, `[orientation]`) are **disabled by default** for full backward compatibility.
 
 Use `util/cfg_gen.py` for automatic configuration generation from signal parameters:
 ```bash
@@ -536,6 +576,53 @@ msg = b"SCHD" + payload.encode().ljust(124, b'\x00')
 s.send(msg)
 ```
 
+### Amplified Receivers & Antenna Orientation Example
+
+Enable the RF front-end and rotator in the config (see `config_files/directional_df/` for a full worked preset):
+```ini
+[amplification]
+en_amplification = 1
+ext_lna_gains_db = 20,20,20,20,20   ; external LNA gain per channel (dB)
+ext_lna_nf_db = 1,1,1,1,1
+en_bias_tee_runtime = 1
+
+[antenna]
+en_antenna_profile = 1
+element_gain_dbi = 12               ; e.g. a Yagi
+beamwidth_az_deg = 40
+polarization = horizontal
+cable_loss_db = 2.5
+
+[orientation]
+en_orientation = 1
+backend = gs232                     ; mock | gs232 | pwm_servo | i2c_pantilt
+bearing_mode = external
+en_scan = 1
+```
+
+Control at runtime via TCP (128-byte frames = 4-byte command + payload):
+```python
+import socket, struct
+
+def send(cmd, payload=b""):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(("localhost", 5001))
+    s.send(cmd.encode().ljust(4, b" ") + payload.ljust(124, b"\x00"))
+    return s.recv(128)[:4]           # -> b'FNSD' on success
+
+# Set an antenna bearing (azimuth, elevation in degrees)
+send("ORNT", struct.pack("ff", 137.5, 12.0))
+
+# Set per-channel external LNA gain (dB x 10), M = 5 channels
+send("EGAN", struct.pack("I" * 5, *[200, 200, 200, 200, 200]))
+
+# Toggle inline-LNA bias-tee power (0/1 per channel); start autonomous scan-and-peak
+send("BIAS", struct.pack("I" * 5, *[1, 1, 1, 1, 1]))
+send("SCAN")
+```
+
+A ready-to-run client is at `util/orientation_scan_example.py` (also does a client-side scan using the status server's aggregate power).
+
 ### Database Queries
 
 ```python
@@ -564,6 +651,11 @@ python3 -m unittest -v _testing/unit_test/test_daq_db.py
 # Monitoring and federation tests (no sudo required)
 python3 -m unittest -v _testing/unit_test/test_monitoring.py
 python3 -m unittest -v _testing/unit_test/test_federation.py
+
+# RF front-end / orientation tests (no sudo, no hardware)
+python3 -m unittest -v _testing/unit_test/test_gain_budget.py
+python3 -m unittest -v _testing/unit_test/test_orientation_controller.py
+python3 -m unittest -v _testing/unit_test/test_iq_header_v8.py
 
 # Existing pipeline tests (require unit_test_k4 config)
 sudo python3 -W ignore -m unittest -v _testing/unit_test/test_decimator.py
@@ -810,8 +902,12 @@ heimdall_daq_fw/
 │   │   ├── iq_server.c               # TCP IQ data server
 │   │   ├── iq_header.h/c/py          # 1024-byte IQ frame header (C + Python)
 │   │   ├── delay_sync.py             # Delay & IQ synchronizer
-│   │   ├── hw_controller.py          # Hardware control + scheduling
+│   │   ├── hw_controller.py          # Hardware control + scheduling + RF front-end/orientation
 │   │   ├── signal_scheduler.py       # Dynamic frequency scheduler
+│   │   ├── gain_budget.py            # Amplified-receiver link budget (gain/NF/P1dB)
+│   │   ├── antenna_profile.py        # Directional antenna profile (gain/beamwidth/boresight)
+│   │   ├── orientation_controller.py # Antenna orientation state machine + scan-and-peak
+│   │   ├── rotator_controller.py     # Rotator backends (mock/gs232/pwm_servo/i2c_pantilt)
 │   │   ├── shmemIface.py             # Shared memory interface
 │   │   ├── transportIface.py         # Pluggable transport abstraction (Python)
 │   │   ├── transport.c/h             # Transport vtable dispatch (C)

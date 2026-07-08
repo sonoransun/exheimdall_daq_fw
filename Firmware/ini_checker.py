@@ -69,7 +69,10 @@ def get_serials():
 logging.basicConfig(level=logging.ERROR)
 valid_bias_enable_flag = [0, 1]
 valid_gains = [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
-valid_fir_windows = ['boxcar', 'triang', 'blackman', 'hamming', 'hann', 'bartlett', 'flattop', 'parzen' , 'bohman', 'blackmanharris', 'nuttall', 'barthann'] 
+valid_fir_windows = ['boxcar', 'triang', 'blackman', 'hamming', 'hann', 'bartlett', 'flattop', 'parzen' , 'bohman', 'blackmanharris', 'nuttall', 'barthann']
+valid_rotator_backends = ['mock', 'gs232', 'pwm_servo', 'i2c_pantilt']
+valid_polarizations = ['vertical', 'horizontal', 'rhcp', 'lhcp', 'slant45', 'dual']
+valid_bearing_modes = ['manual', 'fixed', 'external', 'scan_peak']
 # See: https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.get_window.html#scipy.signal.get_window
 
 def check_ini(parameters, en_hw_check=True):
@@ -782,8 +785,8 @@ def check_ini(parameters, en_hw_check=True):
             error_list.append("HAT I2C retry_count must be a non-negative integer. Currently it is: '{0}' ".format(retry))
 
     # ---> Federation section check <---
-    if 'federation' in daq_cfg:
-        fed_params = daq_cfg['federation']
+    if 'federation' in parameters:
+        fed_params = parameters['federation']
 
         instance_id = fed_params.get('instance_id', '0')
         if not chk_int(instance_id):
@@ -808,6 +811,105 @@ def check_ini(parameters, en_hw_check=True):
             error_list.append("Federation coordinator_port must be a valid port number. Currently it is: '{0}' ".format(coord_port))
         elif int(coord_port) < 1 or int(coord_port) > 65535:
             error_list.append("Federation coordinator_port must be a valid port number (1-65535). Currently it is: '{0}' ".format(coord_port))
+
+    # Number of receiver channels, used for per-channel list length checks below
+    try:
+        num_ch_val = int(parameters['hw']['num_ch'])
+    except (KeyError, ValueError):
+        num_ch_val = None
+
+    def _chk_float_list(raw, key, section):
+        """Validate a comma-separated float list; check length against num_ch."""
+        items = [x.strip() for x in raw.split(',') if x.strip() != '']
+        for v in items:
+            if not chk_float(v):
+                error_list.append("{0} {1} values must be floats. Currently one is: '{2}' ".format(section, key, v))
+        if num_ch_val is not None and len(items) != num_ch_val:
+            error_list.append("{0} {1} must have one value per channel ({2}). Currently: {3} ".format(section, key, num_ch_val, len(items)))
+
+    # ---> Amplification (external LNA / gain-staging) section check <---
+    if 'amplification' in parameters:
+        amp = parameters['amplification']
+
+        if not chk_int(amp.get('en_amplification', '0')) or int(amp.get('en_amplification', '0')) not in [0, 1]:
+            error_list.append("Amplification en_amplification must be 0 or 1. Currently it is: '{0}' ".format(amp.get('en_amplification')))
+
+        _chk_float_list(amp.get('ext_lna_gains_db', ''), 'ext_lna_gains_db', 'Amplification')
+        _chk_float_list(amp.get('ext_lna_nf_db', ''), 'ext_lna_nf_db', 'Amplification')
+        _chk_float_list(amp.get('ext_lna_p1db_dbm', ''), 'ext_lna_p1db_dbm', 'Amplification')
+
+        for key in ('tuner_nf_db', 'expected_input_dbm', 'p1db_margin_db', 'max_total_gain_db'):
+            val = amp.get(key)
+            if val is not None and not chk_float(val):
+                error_list.append("Amplification {0} must be a float. Currently it is: '{1}' ".format(key, val))
+
+        if not chk_int(amp.get('en_bias_tee_runtime', '0')) or int(amp.get('en_bias_tee_runtime', '0')) not in [0, 1]:
+            error_list.append("Amplification en_bias_tee_runtime must be 0 or 1. Currently it is: '{0}' ".format(amp.get('en_bias_tee_runtime')))
+        bias_state = [x.strip() for x in amp.get('bias_tee_state', '').split(',') if x.strip() != '']
+        for v in bias_state:
+            if not chk_int(v) or int(v) not in valid_bias_enable_flag:
+                error_list.append("Amplification bias_tee_state values must be 0 or 1. Currently one is: '{0}' ".format(v))
+
+    # ---> Antenna profile section check <---
+    if 'antenna' in parameters:
+        ant = parameters['antenna']
+
+        if not chk_int(ant.get('en_antenna_profile', '0')) or int(ant.get('en_antenna_profile', '0')) not in [0, 1]:
+            error_list.append("Antenna en_antenna_profile must be 0 or 1. Currently it is: '{0}' ".format(ant.get('en_antenna_profile')))
+
+        pol = ant.get('polarization', 'vertical')
+        if pol not in valid_polarizations:
+            error_list.append("Antenna polarization must be one of: {0}. Currently it is: '{1}' ".format(valid_polarizations, pol))
+
+        for key in ('element_gain_dbi', 'cable_loss_db', 'connector_loss_db',
+                    'boresight_az_offset_deg', 'boresight_el_offset_deg'):
+            val = ant.get(key)
+            if val is not None and not chk_float(val):
+                error_list.append("Antenna {0} must be a float. Currently it is: '{1}' ".format(key, val))
+
+        for key in ('beamwidth_az_deg', 'beamwidth_el_deg'):
+            val = ant.get(key)
+            if val is not None:
+                if not chk_float(val):
+                    error_list.append("Antenna {0} must be a float. Currently it is: '{1}' ".format(key, val))
+                elif not (0.0 < float(val) <= 360.0):
+                    error_list.append("Antenna {0} must be in (0, 360]. Currently it is: '{1}' ".format(key, val))
+
+    # ---> Orientation (rotator / pan-tilt) section check <---
+    if 'orientation' in parameters:
+        ori = parameters['orientation']
+
+        if not chk_int(ori.get('en_orientation', '0')) or int(ori.get('en_orientation', '0')) not in [0, 1]:
+            error_list.append("Orientation en_orientation must be 0 or 1. Currently it is: '{0}' ".format(ori.get('en_orientation')))
+
+        backend = ori.get('backend', 'mock')
+        if backend not in valid_rotator_backends:
+            error_list.append("Orientation backend must be one of: {0}. Currently it is: '{1}' ".format(valid_rotator_backends, backend))
+
+        mode = ori.get('bearing_mode', 'external')
+        if mode not in valid_bearing_modes:
+            error_list.append("Orientation bearing_mode must be one of: {0}. Currently it is: '{1}' ".format(valid_bearing_modes, mode))
+
+        for lo_key, hi_key in (('az_min_deg', 'az_max_deg'), ('el_min_deg', 'el_max_deg')):
+            lo, hi = ori.get(lo_key), ori.get(hi_key)
+            if lo is not None and hi is not None:
+                if not chk_float(lo) or not chk_float(hi):
+                    error_list.append("Orientation {0}/{1} must be floats. Currently: '{2}'/'{3}' ".format(lo_key, hi_key, lo, hi))
+                elif float(lo) >= float(hi):
+                    error_list.append("Orientation {0} must be less than {1}. Currently: {2} >= {3} ".format(lo_key, hi_key, lo, hi))
+
+        slew = ori.get('slew_rate_dps')
+        if slew is not None and (not chk_float(slew) or float(slew) <= 0.0):
+            error_list.append("Orientation slew_rate_dps must be a positive float. Currently it is: '{0}' ".format(slew))
+
+        for key in ('settle_frames', 'scan_dwell_frames'):
+            val = ori.get(key)
+            if val is not None and (not chk_int(val) or int(val) <= 0):
+                error_list.append("Orientation {0} must be a positive integer. Currently it is: '{1}' ".format(key, val))
+
+        min_ss = ori.get('min_sync_state')
+        if min_ss is not None and (not chk_int(min_ss) or not (0 <= int(min_ss) <= 6)):
+            error_list.append("Orientation min_sync_state must be an integer in 0-6. Currently it is: '{0}' ".format(min_ss))
 
     return error_list
 

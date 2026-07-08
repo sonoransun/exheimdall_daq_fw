@@ -18,6 +18,21 @@ class IQHeader():
     
     SYNC_WORD = 0x2bf7b95a
 
+    # Header layout version. v8 names slots inside the previously-zero reserved[]
+    # region for RF front-end (amplification) + antenna-orientation telemetry.
+    HEADER_VERSION = 8
+
+    # Named uint32 slot indices inside reserved[192] (lockstep with iq_header.h)
+    RSV_EXT_LNA_GAINS = 0      # [0:32]  external LNA gain, dB x10
+    RSV_TOTAL_GAINS = 32       # [32:64] total system gain, dB x10
+    RSV_SYSTEM_NF_MDB = 64     # [64:96] system noise figure, milli-dB
+    RSV_COMPRESSION_FLAGS = 96 # per-channel compression bitmask
+    RSV_BIAS_TEE_STATE = 97    # per-channel bias-tee bitmask
+    RSV_ANTENNA_AZ_CDEG = 98   # antenna azimuth, centi-deg (0..36000)
+    RSV_ANTENNA_EL_CDEG = 99   # antenna elevation, centi-deg (+9000 offset)
+    RSV_ROTATOR_STATE = 100    # orientation controller state enum
+    RSV_AGG_POWER_MDB = 101    # aggregate channel power, milli-dB (scan objective)
+
     def __init__(self):
         
         self.logger = logging.getLogger(__name__)
@@ -75,8 +90,9 @@ class IQHeader():
         self.if_gains             = iq_header_list[17:49]
         self.delay_sync_flag      = iq_header_list[49]
         self.iq_sync_flag         = iq_header_list[50]
-        self.sync_state           = iq_header_list[51]  
+        self.sync_state           = iq_header_list[51]
         self.noise_source_state   = iq_header_list[52]
+        self.reserved             = list(iq_header_list[53:53+self.reserved_bytes])
         self.header_version       = iq_header_list[52+self.reserved_bytes+1]
 
     def encode_header(self):
@@ -98,7 +114,8 @@ class IQHeader():
         iq_header_byte_array+=pack("I", self.noise_source_state)
 
         for m in range(self.reserved_bytes):
-            iq_header_byte_array+=pack("I",0)
+            val = self.reserved[m] if m < len(self.reserved) else 0
+            iq_header_byte_array+=pack("I", int(val) & 0xFFFFFFFF)
 
         iq_header_byte_array+=pack("I", self.header_version)
         return iq_header_byte_array
@@ -132,6 +149,53 @@ class IQHeader():
         self.logger.info("Sync state: {:d}".format(self.sync_state))
         self.logger.info("Noise source state: {:d}".format(self.noise_source_state))
     
+    # ---- v8 reserved-region accessors (RF front-end + orientation telemetry) ----
+    def _set_reserved_block(self, start, values):
+        for i, v in enumerate(values):
+            if start + i < self.reserved_bytes:
+                self.reserved[start + i] = int(v) & 0xFFFFFFFF
+
+    def set_ext_lna_gains(self, gains_tenths):
+        """External LNA gains, tenths of dB, per channel."""
+        self._set_reserved_block(self.RSV_EXT_LNA_GAINS, gains_tenths)
+
+    def set_total_system_gains(self, gains_tenths):
+        """Total system gains, tenths of dB, per channel."""
+        self._set_reserved_block(self.RSV_TOTAL_GAINS, gains_tenths)
+
+    def set_system_nf_mdb(self, nf_mdb):
+        """System noise figure, milli-dB, per channel."""
+        self._set_reserved_block(self.RSV_SYSTEM_NF_MDB, nf_mdb)
+
+    def set_compression_flags(self, flags):
+        self.reserved[self.RSV_COMPRESSION_FLAGS] = int(flags) & 0xFFFFFFFF
+
+    def set_bias_tee_state(self, flags):
+        self.reserved[self.RSV_BIAS_TEE_STATE] = int(flags) & 0xFFFFFFFF
+
+    def set_antenna_bearing(self, az_deg, el_deg):
+        """Store antenna azimuth/elevation as centi-degrees (elevation +90 deg offset)."""
+        self.reserved[self.RSV_ANTENNA_AZ_CDEG] = int(round(az_deg * 100.0)) & 0xFFFFFFFF
+        self.reserved[self.RSV_ANTENNA_EL_CDEG] = int(round((el_deg + 90.0) * 100.0)) & 0xFFFFFFFF
+
+    def get_antenna_bearing(self):
+        """Return (azimuth_deg, elevation_deg) decoded from the reserved slots."""
+        az = self.reserved[self.RSV_ANTENNA_AZ_CDEG] / 100.0
+        el = self.reserved[self.RSV_ANTENNA_EL_CDEG] / 100.0 - 90.0
+        return (az, el)
+
+    def set_rotator_state(self, state):
+        self.reserved[self.RSV_ROTATOR_STATE] = int(state) & 0xFFFFFFFF
+
+    def get_rotator_state(self):
+        return self.reserved[self.RSV_ROTATOR_STATE]
+
+    def set_aggregate_power_mdb(self, mdb):
+        self.reserved[self.RSV_AGG_POWER_MDB] = int(mdb) & 0xFFFFFFFF
+
+    def get_aggregate_power_mdb(self):
+        return self.reserved[self.RSV_AGG_POWER_MDB]
+
     def check_sync_word(self):
         """
             Check the sync word of the header

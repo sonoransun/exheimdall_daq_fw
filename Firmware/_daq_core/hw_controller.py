@@ -103,6 +103,21 @@ class HWC():
         # Offload / transport defaults
         self.transport_type = 'shm'
 
+        # RF front-end (amplified receivers) and antenna profile
+        self.rf_frontend = None
+        self.antenna_profile = None
+        self._en_amplification = False
+        self.ext_lna_gains_db = [0.0]*self.M      # runtime-editable external LNA gain, raw dB
+        self.total_system_gains_db = [0.0]*self.M
+        self.system_nf_db = [0.0]*self.M
+        self.compression_flags = 0
+        self.bias_tee_state = [0]*self.M
+
+        # Antenna orientation controller
+        self.orientation = None
+        self._orientation_state_fname = "_data_control/orientation_state"
+        self._orientation_write_counter = 0
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
         self.iq_header = IQHeader()
@@ -285,6 +300,54 @@ class HWC():
         if parser.has_section('offload'):
             self.transport_type = parser.get('offload', 'delay_sync_transport', fallback='shm')
 
+        # RF front-end (amplification) + antenna profile configuration.
+        # (Re)size per-channel budget arrays now that self.M is final.
+        self.ext_lna_gains_db = [0.0]*self.M
+        self.total_system_gains_db = [0.0]*self.M
+        self.system_nf_db = [0.0]*self.M
+        self.compression_flags = 0
+        self.bias_tee_state = [0]*self.M
+        if parser.has_section('antenna'):
+            try:
+                from antenna_profile import AntennaProfileParser
+                self.antenna_profile = AntennaProfileParser.from_ini_section(parser, 'antenna')
+                if self.antenna_profile is not None:
+                    logging.info("Antenna profile '{:s}' loaded ({:.1f} dBi)".format(
+                        self.antenna_profile.name, self.antenna_profile.element_gain_dbi))
+            except Exception as e:
+                logging.error("Failed to load antenna profile: {:s}".format(str(e)))
+                self.antenna_profile = None
+        if parser.has_section('amplification'):
+            try:
+                from gain_budget import RfFrontendParser
+                self.rf_frontend = RfFrontendParser.from_ini_section(parser, self.M, 'amplification')
+                if self.rf_frontend is not None:
+                    self._en_amplification = True
+                    self.ext_lna_gains_db = list(self.rf_frontend.ext_lna_gains_db)
+                    self.bias_tee_state = list(self.rf_frontend.bias_tee_state)
+                    logging.info("Amplification enabled: external LNA gains {0} dB".format(
+                        self.ext_lna_gains_db))
+            except Exception as e:
+                logging.error("Failed to load RF front-end config: {:s}".format(str(e)))
+                self.rf_frontend = None
+                self._en_amplification = False
+
+        # Antenna orientation controller (owns a rotator hardware backend)
+        if parser.has_section('orientation'):
+            try:
+                from orientation_controller import OrientationController, OrientationParser
+                from rotator_controller import create_rotator_backend
+                ori_cfg = OrientationParser.from_ini_section(parser, 'orientation')
+                if ori_cfg is not None:
+                    backend = create_rotator_backend(ori_cfg)
+                    self.orientation = OrientationController(ori_cfg, backend, self.M,
+                                                             antenna_profile=self.antenna_profile)
+                    logging.info("Antenna orientation controller enabled (backend={:s}, mode={:s})".format(
+                        ori_cfg.backend, ori_cfg.bearing_mode))
+            except Exception as e:
+                logging.error("Failed to initialize orientation controller: {:s}".format(str(e)))
+                self.orientation = None
+
     def init(self):
         """
             Initializes the Hardware Controller module
@@ -303,6 +366,7 @@ class HWC():
         # Open control FIFOs (namespaced by instance_id)
         if self.instance_id != 0:
             self.track_lock_ctr_fname = "_data_control/inst{:d}_iq_track_lock".format(self.instance_id)
+            self._orientation_state_fname = "_data_control/inst{:d}_orientation_state".format(self.instance_id)
         try:
             self.track_lock_ctr_fd = open(self.track_lock_ctr_fname, 'r')
         except OSError as err:
@@ -336,8 +400,30 @@ class HWC():
                     self.iq_mod.set_IQ_value(0.5, 0.5, m)
             except:
                 logging.error("DAC Controller initialization failed")
+
+        # Open the antenna orientation controller (rotator hardware)
+        if self.orientation is not None:
+            try:
+                self.orientation.open()
+                self._write_orientation_state()
+            except Exception as e:
+                logging.error("Orientation controller open failed: {:s}".format(str(e)))
         return 0
-    
+
+    def _write_orientation_state(self):
+        """Relay the current antenna bearing + rotator state to delay_sync via a
+        small control file (throttled), so delay_sync can stamp them into the
+        outbound IQ header reserved region for the downstream DoA app."""
+        if self.orientation is None:
+            return
+        try:
+            with open(self._orientation_state_fname, 'w') as f:
+                f.write("{:.3f} {:.3f} {:d}".format(
+                    self.orientation.cmd_az, self.orientation.cmd_el,
+                    self.orientation.rotator_state_enum()))
+        except OSError:
+            pass
+
     def close(self):
         """
             Close the communication and data interfaces that are opened during the start of the module
@@ -350,6 +436,9 @@ class HWC():
 
         if self.db is not None:
             self.db.close()
+
+        if self.orientation is not None:
+            self.orientation.close()
 
         self.logger.info("Module interfaces are closed")
 
@@ -385,7 +474,9 @@ class HWC():
         msg_byte_array = inter_module_messages.pack_msg_set_gain(self.module_identifier, gains)
         self.rtl_daq_socket.send(msg_byte_array)
         reply = self.rtl_daq_socket.recv()
-        self.logger.debug(f"Received reply: {reply}")        
+        self.logger.debug(f"Received reply: {reply}")
+        # Recompute the external-LNA link budget (advisory; does not change tuner gains)
+        self._update_link_budget(gains)        
     def _tune_gains(self):
         """
             Performs IF gain tuning in order to maximaze the SINR in each channels by
@@ -418,6 +509,45 @@ class HWC():
                     if self.unified_gain_control: # Disable tuning in all chanels
                         self.gain_tune_states = [False]*self.M 
         self._change_gains()
+
+    def _current_tuner_gains_tenths(self):
+        """Return the current per-channel tuner IF gains in tenths of dB."""
+        return [self.valid_gains[self.gains[m]] for m in range(self.M)]
+
+    def _update_link_budget(self, gains_tenths):
+        """Recompute per-channel total system gain, cascaded noise figure, and
+        compression flags from the current tuner gains plus the external LNA
+        chain. Advisory only — it never changes the tuner gains or if_gains.
+
+        :param gains_tenths: current per-channel tuner IF gain, tenths of dB
+        """
+        if not self._en_amplification or self.rf_frontend is None:
+            return
+        # Keep the runtime-editable external gains in sync with the config object
+        self.rf_frontend.ext_lna_gains_db = list(self.ext_lna_gains_db)
+        comp_flags = 0
+        for m in range(self.M):
+            tuner_gain_db = gains_tenths[m] / 10.0
+            budget = self.rf_frontend.channel_budget(
+                m, tuner_gain_db,
+                antenna_profile=self.antenna_profile,
+                freq_hz=self.rf_center_frequency)
+            self.total_system_gains_db[m] = budget["total_gain_db"]
+            self.system_nf_db[m] = budget["system_nf_db"]
+            if budget["compressed"]:
+                comp_flags |= (1 << m)
+                self.logger.warning("Possible external-LNA compression ch {:d} (headroom {:.1f} dB)".format(
+                    m, budget["p1db_headroom_db"]))
+            if budget["over_max_gain"]:
+                self.logger.warning("Ch {:d} total system gain {:.1f} dB exceeds max {:.1f} dB".format(
+                    m, budget["total_gain_db"], self.rf_frontend.max_total_gain_db))
+        prev = self.compression_flags
+        self.compression_flags = comp_flags
+        if comp_flags and comp_flags != prev and self.event_bus is not None:
+            from daq_events import DAQEvent, EVT_COMPRESSION
+            self.event_bus.emit(DAQEvent(severity="warning", module="hw_controller",
+                event_type=EVT_COMPRESSION, payload={"flags": comp_flags,
+                    "total_gains_db": list(self.total_system_gains_db)}))
 
     def _handle_control_reqest(self, command, params):
         """
@@ -500,8 +630,82 @@ class HWC():
             # Skip to next entry
             if self.scheduler is not None:
                 self.scheduler.skip_to_next()
+        elif command == "EGAN":
+            # Set per-channel external LNA gain (received as tenths of dB)
+            try:
+                for m in range(self.M):
+                    self.ext_lna_gains_db[m] = params[m] / 10.0
+                self._update_link_budget(self._current_tuner_gains_tenths())
+                self.logger.info("External LNA gains set: {0} dB".format(self.ext_lna_gains_db))
+                if self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_EXT_GAIN_CHANGE
+                    self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                        event_type=EVT_EXT_GAIN_CHANGE,
+                        payload={"ext_lna_gains_db": list(self.ext_lna_gains_db),
+                                 "total_gains_db": list(self.total_system_gains_db)}))
+            except (IndexError, TypeError):
+                self.logger.error("Improper external gain values: {0}".format(params))
+        elif command == "RFQ ":
+            # Query the current link budget
+            self.logger.info("Link budget: total gains {0} dB, NF {1} dB, compression flags {2}".format(
+                [round(g, 1) for g in self.total_system_gains_db],
+                [round(n, 2) for n in self.system_nf_db], self.compression_flags))
+        elif command == "BIAS":
+            # Runtime inline-LNA bias-tee toggle (requires en_bias_tee_runtime=1)
+            if self.rf_frontend is not None and self.rf_frontend.en_bias_tee_runtime:
+                try:
+                    states = [1 if params[m] else 0 for m in range(self.M)]
+                    self.bias_tee_state = states
+                    msg_byte_array = inter_module_messages.pack_msg_set_bias_tee(self.module_identifier, states)
+                    self.rtl_daq_socket.send(msg_byte_array)
+                    reply = self.rtl_daq_socket.recv()
+                    self.logger.debug(f"Received reply: {reply}")
+                    self.logger.info("Bias-tee state set: {0}".format(states))
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_BIAS_TEE_CHANGE
+                        self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                            event_type=EVT_BIAS_TEE_CHANGE, payload={"bias_tee_state": list(states)}))
+                except (IndexError, TypeError):
+                    self.logger.error("Improper bias-tee states: {0}".format(params))
+            else:
+                self.logger.warning("Bias-tee runtime control disabled (set en_bias_tee_runtime=1)")
+        elif command == "ORNT":
+            # Slew the antenna to a commanded azimuth/elevation
+            if self.orientation is not None:
+                try:
+                    az, el = float(params[0]), float(params[1])
+                    self.orientation.set_bearing(az, el)
+                    self._write_orientation_state()
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_ORIENTATION_SLEW
+                        self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                            event_type=EVT_ORIENTATION_SLEW, payload={"az_deg": az, "el_deg": el}))
+                except (IndexError, ValueError, TypeError):
+                    self.logger.error("Improper orientation bearing: {0}".format(params))
+            else:
+                self.logger.warning("Orientation control disabled (set en_orientation=1)")
+        elif command == "PARK":
+            if self.orientation is not None:
+                self.orientation.park()
+                if self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_ORIENTATION_PARK
+                    self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                        event_type=EVT_ORIENTATION_PARK, payload={}))
+        elif command == "SCAN":
+            if self.orientation is not None:
+                self.orientation.start_scan()
+                if self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_ORIENTATION_SCAN_START
+                    self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                        event_type=EVT_ORIENTATION_SCAN_START, payload={}))
+        elif command == "OSTP":
+            if self.orientation is not None:
+                self.orientation.stop()
+        elif command == "OQRY":
+            if self.orientation is not None:
+                self.logger.info("Orientation status: {0}".format(self.orientation.get_status()))
 
-    
+
     def _control_noise_source(self, noise_source_state):
         """
             Enables or disables the internal noise of the receiver and set the proper gain values.
@@ -746,6 +950,23 @@ class HWC():
                                 if gain_cmd is not None:
                                     self._handle_control_reqest(gain_cmd[0], gain_cmd[1])
 
+                    # --> Antenna orientation tick (slew/settle/scan-and-peak)
+                    if self.orientation is not None:
+                        ori_event = self.orientation.tick(self.iq_header)
+                        # Relay current bearing/state to delay_sync (throttled write)
+                        self._orientation_write_counter += 1
+                        if self._orientation_write_counter >= 5 or ori_event is not None:
+                            self._orientation_write_counter = 0
+                            self._write_orientation_state()
+                        if ori_event is not None and self.event_bus is not None:
+                            from daq_events import (DAQEvent, EVT_ORIENTATION_SETTLED,
+                                                    EVT_ORIENTATION_SCAN_PEAK)
+                            etype = (EVT_ORIENTATION_SCAN_PEAK
+                                     if ori_event[1].get("event") == "scan_peak"
+                                     else EVT_ORIENTATION_SETTLED)
+                            self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
+                                event_type=etype, payload=ori_event[1]))
+
                     # --> External control request handling
                     ctr_request_condition.acquire()
                     if len(ctr_request) !=0 :
@@ -911,6 +1132,40 @@ class CtrIfaceServer(threading.Thread):
 
         elif command == "SCHN":
             self.logger.info("Received schedule next command")
+            ctr_request.clear()
+            ctr_request.append(command)
+
+        elif command == "EGAN":
+            gains = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
+            ctr_request.clear()
+            ctr_request.append(command)
+            for m in range(self.M):
+                self.logger.info("Received external LNA gain - CH{:d}: {:d} dB x 10".format(m, gains[m]))
+                ctr_request.append(gains[m])
+
+        elif command == "RFQ ":
+            self.logger.info("Received link-budget query command")
+            ctr_request.clear()
+            ctr_request.append(command)
+
+        elif command == "BIAS":
+            states = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
+            ctr_request.clear()
+            ctr_request.append(command)
+            for m in range(self.M):
+                self.logger.info("Received bias-tee state - CH{:d}: {:d}".format(m, states[m]))
+                ctr_request.append(states[m])
+
+        elif command == "ORNT":
+            az, el = unpack('ff', msg_bytes[4:12])
+            self.logger.info("Received orientation bearing: az={:.2f} el={:.2f}".format(az, el))
+            ctr_request.clear()
+            ctr_request.append(command)
+            ctr_request.append(az)
+            ctr_request.append(el)
+
+        elif command in ("PARK", "SCAN", "OSTP", "OQRY"):
+            self.logger.info("Received orientation command: {:s}".format(command))
             ctr_request.clear()
             ctr_request.append(command)
 

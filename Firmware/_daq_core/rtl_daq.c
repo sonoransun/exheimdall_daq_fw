@@ -87,6 +87,8 @@ int noise_source_state = 0; // Noise source state is used also to track the cali
 int last_noise_source_state = 0;
 int gain_change_flag;
 int *new_gains;
+int bias_change_flag = 0;
+int *new_bias_states; // Runtime inline-LNA bias-tee state per channel (0/1)
 float *new_fs_corrections;
 int fs_correction_flag, fs_reset_cntr;
 uint32_t new_center_freq;
@@ -305,11 +307,22 @@ void * fifo_read_tf(void* arg)
                 noise_source_state = 1;
             }            
         }
+        /* Runtime inline-LNA bias-tee switch request */
+        else if (msg->command_identifier == 'b')
+        {
+            log_info("Signal 'b': runtime bias-tee switch request");
+            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            for(int i=0;i<ch_no;i++){
+                new_bias_states[i] = parameters[i] ? 1 : 0;
+                log_info("Channel: %d, bias-tee: %d", i, new_bias_states[i]);
+            }
+            bias_change_flag = 1;
+        }
         /* System halt request */
         else if(msg->command_identifier == 'h')
         {
             log_info("Signal 2: FIFO read thread exiting \n");
-            exit_flag = 1;           
+            exit_flag = 1;
         }
         /* Send out dummy frames while the changes takes effect*/
         en_dummy_frame = 1; 
@@ -554,6 +567,7 @@ int main( int argc, char** argv )
     
     new_gains          = calloc(ch_no, sizeof(*new_gains));
     new_fs_corrections = calloc(ch_no, sizeof(*new_fs_corrections));
+    new_bias_states    = calloc(ch_no, sizeof(*new_bias_states));
     
     rtl_receivers = malloc(sizeof(struct rtl_rec_struct)*ch_no);    
     for(int i=0; i<ch_no; i++)
@@ -592,7 +606,7 @@ int main( int argc, char** argv )
     }
     /* Fill up the static fields of the IQ header */    
 	iq_header->sync_word = SYNC_WORD;
-    iq_header->header_version = 7;
+    iq_header->header_version = IQ_HEADER_VERSION;
 	strcpy(iq_header->hardware_id, config.hw_name);
 	iq_header->unit_id=config.hw_unit_id;
 	iq_header->active_ant_chs=ch_no;
@@ -833,6 +847,28 @@ int main( int argc, char** argv )
                     }
                 }
                 gain_change_flag=0;
+            }
+            /* Runtime bias-tee switch request.
+             * Per-channel inline-LNA bias uses GPIO m+1 on the control-channel
+             * device; GPIO 0 is reserved for the noise source, so bias never
+             * collides with it. Defer while a calibration noise burst is active
+             * to avoid toggling the control device mid-burst. */
+            if (bias_change_flag == 1)
+            {
+                if (noise_source_state == 1)
+                {
+                    log_warn("Bias-tee change deferred: noise-source calibration burst active");
+                }
+                else
+                {
+                    rtl_rec = &rtl_receivers[ctr_channel_index];
+                    for (int m = 0; m < ch_no; m++)
+                    {
+                        rtlsdr_set_bias_tee_gpio(rtl_rec->dev, m+1, new_bias_states[m]);
+                        log_info("Bias-tee ch %d (GPIO %d) set to %d", m, m+1, new_bias_states[m]);
+                    }
+                    bias_change_flag = 0;
+                }
             }
             /* Enable AGC request */
             if (agc_change_flag == 1)

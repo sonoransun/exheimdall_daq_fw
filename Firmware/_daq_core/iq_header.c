@@ -36,6 +36,17 @@ void dump_iq_header(struct iq_header_struct* iq_header){
 	fprintf(stderr, "IQ sync flag: %u \n", iq_header->iq_sync_flag);
 	fprintf(stderr, "Sync state: %u \n", iq_header->sync_state);
 	fprintf(stderr, "Noise source state: %u \n", iq_header->noise_source_state);
+	/* RF front-end (amplification) + antenna orientation telemetry (v8) */
+	fprintf(stderr, "Compression flags: 0x%08X \n", iq_header->reserved[IQH_RSV_COMPRESSION_FLAGS]);
+	fprintf(stderr, "Bias-tee state: 0x%08X \n", iq_header->reserved[IQH_RSV_BIAS_TEE_STATE]);
+	fprintf(stderr, "Antenna azimuth: %.2f deg \n", (float) iq_header->reserved[IQH_RSV_ANTENNA_AZ_CDEG]/100);
+	fprintf(stderr, "Antenna elevation: %.2f deg \n", (float) iq_header->reserved[IQH_RSV_ANTENNA_EL_CDEG]/100 - 90);
+	fprintf(stderr, "Rotator state: %u \n", iq_header->reserved[IQH_RSV_ROTATOR_STATE]);
+	for(int m=0;m<32;m++)
+	{
+	    if (iq_header->reserved[IQH_RSV_TOTAL_GAINS+m])
+	        fprintf(stderr, "Ch: %u total system gain: %.1f dB \n", m, (float) iq_header->reserved[IQH_RSV_TOTAL_GAINS+m]/10);
+	}
 }
 
 int check_sync_word(struct iq_header_struct* iq_header)

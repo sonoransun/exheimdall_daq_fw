@@ -216,7 +216,7 @@ no_dummy_frames = 5
 iq_header = IQHeader()
 
 iq_header.sync_word            = IQHeader.SYNC_WORD
-iq_header.header_version       = 7
+iq_header.header_version       = IQHeader.HEADER_VERSION
 iq_header.frame_type           = 0 # 0 - Normal data frame, 3 - calibration frame
 iq_header.hardware_id          = "K"+str(M)
 iq_header.unit_id              = 0              

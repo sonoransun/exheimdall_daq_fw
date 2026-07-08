@@ -43,6 +43,17 @@ EVT_PEER_DOWN = "peer_down"
 EVT_PEER_DEGRADED = "peer_degraded"
 EVT_COORDINATOR_ELECTED = "coordinator_elected"
 EVT_EVENT_QUEUE_FULL = "event_queue_full"
+# Amplified-receiver / RF front-end events
+EVT_EXT_GAIN_CHANGE = "ext_gain_change"
+EVT_COMPRESSION = "compression"
+EVT_BIAS_TEE_CHANGE = "bias_tee_change"
+# Antenna orientation events
+EVT_ORIENTATION_SLEW = "orientation_slew"
+EVT_ORIENTATION_SETTLED = "orientation_settled"
+EVT_ORIENTATION_SCAN_START = "orientation_scan_start"
+EVT_ORIENTATION_SCAN_PEAK = "orientation_scan_peak"
+EVT_ORIENTATION_PARK = "orientation_park"
+EVT_ORIENTATION_LIMIT = "orientation_limit"
 
 # Severity string → logging level
 _SEVERITY_MAP = {
