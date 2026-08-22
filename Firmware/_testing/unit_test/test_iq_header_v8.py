@@ -72,10 +72,49 @@ class TestIQHeaderV8(unittest.TestCase):
         h.set_aggregate_power_mdb(-42000)  # -42.0 dB in milli-dB (stored as uint32 wrap)
         dec = IQHeader()
         dec.decode_header(h.encode_header())
-        # -42000 & 0xFFFFFFFF is what was stored; interpret as signed for the metric
-        raw = dec.get_aggregate_power_mdb()
-        signed = raw - (1 << 32) if raw >= (1 << 31) else raw
-        self.assertEqual(signed, -42000)
+        # The getter sign-extends the two's-complement uint32 slot itself
+        self.assertEqual(dec.get_aggregate_power_mdb(), -42000)
+        # The wire encoding is unchanged: the raw slot still holds the wrap
+        self.assertEqual(dec.reserved[IQHeader.RSV_AGG_POWER_MDB],
+                         -42000 & 0xFFFFFFFF)
+
+    def test_signed_getters_sign_extend(self):
+        # Negative telemetry (net loss, negative NF corrections, negative az)
+        # must round-trip through the uint32 slots via the getters.
+        h = IQHeader()
+        h.set_ext_lna_gains([-50, 200, -1])           # dB x10, ch0 = -5 dB loss
+        h.set_total_system_gains([-120, 350, 0])
+        h.set_system_nf_mdb([-500, 1500, 0])
+        h.set_antenna_bearing(-10.5, -12.25)
+        dec = IQHeader()
+        dec.decode_header(h.encode_header())
+        self.assertEqual(dec.get_ext_lna_gains(3), [-50, 200, -1])
+        self.assertEqual(dec.get_total_system_gains(3), [-120, 350, 0])
+        self.assertEqual(dec.get_system_nf_mdb(3), [-500, 1500, 0])
+        az, el = dec.get_antenna_bearing()
+        self.assertAlmostEqual(az, -10.5, places=2)
+        self.assertAlmostEqual(el, -12.25, places=2)
+
+    def test_unsigned_getters(self):
+        h = IQHeader()
+        h.set_compression_flags(0b1010)
+        h.set_bias_tee_state(0b0110)
+        dec = IQHeader()
+        dec.decode_header(h.encode_header())
+        self.assertEqual(dec.get_compression_flags(), 0b1010)
+        self.assertEqual(dec.get_bias_tee_state(), 0b0110)
+
+    def test_buffer_overrun_cnt_slot(self):
+        # v8 carve extension: slot 102 = cumulative USB ring-buffer overrun
+        # count stamped by rtl_daq (unsigned; 0 = none/unsupported).
+        self.assertEqual(IQHeader.RSV_BUFFER_OVERRUN_CNT, 102)
+        h = IQHeader()
+        self.assertEqual(h.get_buffer_overrun_cnt(), 0)
+        h.set_buffer_overrun_cnt(4000000000)  # > 2^31: stays unsigned
+        dec = IQHeader()
+        dec.decode_header(h.encode_header())
+        self.assertEqual(dec.get_buffer_overrun_cnt(), 4000000000)
+        self.assertEqual(dec.reserved[IQHeader.RSV_BUFFER_OVERRUN_CNT], 4000000000)
 
     def test_existing_fields_preserved(self):
         # Sanity: the carve must not disturb the classic header fields.

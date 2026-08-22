@@ -70,9 +70,15 @@ class FakeStatusServer:
 
 
 class FakeCtlServer:
-    """Minimal TCP server that accepts 128-byte frames and echoes back."""
+    """Minimal TCP server that accepts 128-byte frames and echoes back.
 
-    def __init__(self, port=0):
+    Mirrors hw_controller's CtrIfaceServer framing: 4-byte ASCII verb
+    (short verbs are space-padded, e.g. "AGC ") + 124-byte payload, reply
+    'FNSD' + 124 bytes. Query verbs registered in `json_replies` answer with
+    a NUL-padded UTF-8 JSON payload per the reply contract.
+    """
+
+    def __init__(self, port=0, json_replies=None):
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind(("127.0.0.1", port))
@@ -81,6 +87,7 @@ class FakeCtlServer:
         self._stop = threading.Event()
         self.last_verb = None
         self.last_payload = None
+        self.json_replies = json_replies or {}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -94,9 +101,15 @@ class FakeCtlServer:
             try:
                 data = conn.recv(128)
                 if len(data) == 128:
-                    self.last_verb = data[:4].rstrip(b"\x00").decode()
+                    raw_verb = data[:4].decode()
+                    # Strip both NUL and space padding for assertions
+                    self.last_verb = raw_verb.rstrip("\x00 ")
                     self.last_payload = data[4:]
-                    reply = b"FNSD" + b"\x00" * 124
+                    if raw_verb in self.json_replies:
+                        body = json.dumps(self.json_replies[raw_verb]).encode()
+                        reply = b"FNSD" + body[:124].ljust(124, b"\x00")
+                    else:
+                        reply = b"FNSD" + b"\x00" * 124
                     conn.sendall(reply)
             finally:
                 conn.close()
@@ -198,6 +211,104 @@ class TestCtlClient(unittest.TestCase):
         client.schedule_stop()
         time.sleep(0.1)
         self.assertEqual(self.server.last_verb, "SCHS")
+
+    def test_agc_verb_is_space_padded(self):
+        """hw_controller compares the literal 4-char string 'AGC '."""
+        client = CtlClient("127.0.0.1", self.server.port)
+        client.agc()
+        time.sleep(0.1)
+        self.assertEqual(self.server.last_payload, b"\x00" * 124)
+
+    def test_recal_sends_init(self):
+        """There is no RECL verb server-side; recal re-runs INIT."""
+        client = CtlClient("127.0.0.1", self.server.port)
+        reply = client.recal()
+        self.assertEqual(reply[:4], b"FNSD")
+        time.sleep(0.1)
+        self.assertEqual(self.server.last_verb, "INIT")
+
+    def test_ext_gain(self):
+        client = CtlClient("127.0.0.1", self.server.port)
+        client.ext_gain([145, 145, 145, 145, 145])
+        time.sleep(0.1)
+        self.assertEqual(self.server.last_verb, "EGAN")
+        gains = struct.unpack("<5I", self.server.last_payload[:20])
+        self.assertEqual(gains, (145, 145, 145, 145, 145))
+
+    def test_bias_tee(self):
+        client = CtlClient("127.0.0.1", self.server.port)
+        client.bias_tee([1, 0, 1, 1, 0])
+        time.sleep(0.1)
+        self.assertEqual(self.server.last_verb, "BIAS")
+        states = struct.unpack("<5I", self.server.last_payload[:20])
+        self.assertEqual(states, (1, 0, 1, 1, 0))
+
+    def test_bearing(self):
+        client = CtlClient("127.0.0.1", self.server.port)
+        client.bearing(123.5, 45.25)
+        time.sleep(0.1)
+        self.assertEqual(self.server.last_verb, "ORNT")
+        az, el = struct.unpack("<ff", self.server.last_payload[:8])
+        self.assertAlmostEqual(az, 123.5, places=3)
+        self.assertAlmostEqual(el, 45.25, places=3)
+
+    def test_orientation_verbs(self):
+        client = CtlClient("127.0.0.1", self.server.port)
+        for method, verb in ((client.park, "PARK"), (client.scan_start, "SCAN"),
+                             (client.orientation_stop, "OSTP"),
+                             (client.orientation_query, "OQRY")):
+            method()
+            time.sleep(0.1)
+            self.assertEqual(self.server.last_verb, verb)
+
+    def test_rf_query_verb(self):
+        client = CtlClient("127.0.0.1", self.server.port)
+        client.rf_query()
+        time.sleep(0.1)
+        self.assertEqual(self.server.last_verb, "RFQ")
+
+
+class TestCtlReplyParsing(unittest.TestCase):
+    """Contract: replies are 'FNSD' + NUL-padded UTF-8 JSON for query verbs,
+    all-zeros for plain acks."""
+
+    def test_parse_ack(self):
+        reply = b"FNSD" + b"\x00" * 124
+        parsed = CtlClient.parse_reply(reply)
+        self.assertTrue(parsed["ok"])
+        self.assertIsNone(parsed["data"])
+
+    def test_parse_json_payload(self):
+        body = json.dumps({"state": "SETTLED", "bearing_az_deg": 45.0}).encode()
+        reply = b"FNSD" + body.ljust(124, b"\x00")
+        parsed = CtlClient.parse_reply(reply)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["data"]["state"], "SETTLED")
+        self.assertAlmostEqual(parsed["data"]["bearing_az_deg"], 45.0)
+
+    def test_parse_non_json_payload_falls_back_to_raw(self):
+        reply = b"FNSD" + b"hello world".ljust(124, b"\x00")
+        parsed = CtlClient.parse_reply(reply)
+        self.assertTrue(parsed["ok"])
+        self.assertIsNone(parsed["data"])
+        self.assertEqual(parsed["raw"], "hello world")
+
+    def test_parse_bad_reply(self):
+        parsed = CtlClient.parse_reply(b"NOPE" + b"\x00" * 124)
+        self.assertFalse(parsed["ok"])
+        parsed = CtlClient.parse_reply(b"")
+        self.assertFalse(parsed["ok"])
+
+    def test_query_roundtrip_with_json_reply(self):
+        server = FakeCtlServer(json_replies={
+            "OQRY": {"state": "IDLE", "bearing_az_deg": 0.0}})
+        try:
+            client = CtlClient("127.0.0.1", server.port)
+            parsed = CtlClient.parse_reply(client.orientation_query())
+            self.assertTrue(parsed["ok"])
+            self.assertEqual(parsed["data"]["state"], "IDLE")
+        finally:
+            server.close()
 
 
 class TestEventDropCounter(unittest.TestCase):

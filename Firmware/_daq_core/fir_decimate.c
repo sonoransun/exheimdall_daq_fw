@@ -33,6 +33,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/mman.h>
 #include "log.h"
 #include "ini.h"
 #include "iq_header.h"
@@ -116,8 +118,8 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {strncpy(pconfig->decimator_transport, value, sizeof(pconfig->decimator_transport)-1);}
     else if (MATCH("offload", "fir_engine"))
     {strncpy(pconfig->fir_engine, value, sizeof(pconfig->fir_engine)-1);}
-    else {return 0;  /* unknown section/name, error */}
-    return 0;
+    else {return 1;  /* unknown section/name: accepted, non-fatal */}
+    return 1;
 }
 int main(int argc, char **argv)
 /*
@@ -131,6 +133,7 @@ int main(int argc, char **argv)
     log_set_level(LOG_TRACE);
     install_signal_handlers();
     configuration config;
+    memset(&config, 0, sizeof(config));
     config.instance_id = 0;
     config.port_stride = 100;
     strcpy(config.decimator_transport, "shm");
@@ -147,7 +150,9 @@ int main(int argc, char **argv)
     if (argc == 2){drop_mode = atoi(argv[1]);}
 
     /* Set parameters from the config file*/
-    if (ini_parse(INI_FNAME, handler, &config) < 0) {FATAL_ERR("Configuration could not be loaded, exiting ..")}
+    int ini_status = ini_parse(INI_FNAME, handler, &config);
+    if (ini_status < 0) {FATAL_ERR("Configuration could not be loaded, exiting ..")}
+    if (ini_status > 0) {log_warn("Config file %s has a parse error at line %d", INI_FNAME, ini_status);}
 
     ch_no = config.num_ch;
     dec = config.decimation_ratio;
@@ -160,6 +165,21 @@ int main(int argc, char **argv)
     log_info("Calibration sample size : %d", config.cal_size);
     log_info("Transport: %s, FIR engine: %s", config.decimator_transport, config.fir_engine);
 
+    /* Best effort: lock pages to avoid faults in the real-time data path.
+     * MCL_ONFAULT is required with MCL_FUTURE: the transports below map
+     * worst-case-sized (MAX_IQFRAME_PAYLOAD_SIZE) shm segments, and a plain
+     * MCL_FUTURE would fault-populate and pin every page of them at mmap
+     * time (hundreds of MiB of tmpfs, fatal on small-RAM targets). With
+     * MCL_ONFAULT only pages actually touched get locked. */
+#ifdef MCL_ONFAULT
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0)
+        log_warn("mlockall failed: %s", strerror(errno));
+#else
+    /* No MCL_ONFAULT on this libc: never use bare MCL_FUTURE (it would
+     * pre-fault the worst-case shm segments); lock current pages only. */
+    if (mlockall(MCL_CURRENT) != 0)
+        log_warn("mlockall failed: %s", strerror(errno));
+#endif
 
     /*
     *-------------------------------------
@@ -225,10 +245,16 @@ int main(int argc, char **argv)
     FILE * fir_coeff_fd = fopen(FIR_COEFF, "r");
     if (fir_coeff_fd == NULL) {FATAL_ERR("Failed to open FIR coefficient file")}
     int k=0;
-    while (fscanf(fir_coeff_fd, "%f", &fir_coeffs[k++]) != EOF);
+    while (k < (int)tap_size && fscanf(fir_coeff_fd, "%f", &fir_coeffs[k]) == 1)
+        k++;
+    /* The file must hold exactly tap_size coefficients: after reading them,
+     * one further conversion attempt must find no additional value */
+    float extra_coeff;
+    int extra_status = (k == (int)tap_size) ? fscanf(fir_coeff_fd, "%f", &extra_coeff) : EOF;
     fclose(fir_coeff_fd);
-    if (k-1==(int)tap_size){log_info("FIR filter coefficients initialized, tap size: %d",k-1);}
-    else{FATAL_ERR("FIR filter coefficients initialization failed")}
+    if (k == (int)tap_size && extra_status != 1)
+    {log_info("FIR filter coefficients initialized, tap size: %d",k);}
+    else{FATAL_ERR("FIR filter coefficient file does not match the configured tap size")}
 
     /* Create and initialize FIR offload engine */
     struct fir_engine* fir_eng = fir_engine_create(engine_type);
@@ -305,10 +331,15 @@ int main(int argc, char **argv)
                                 iq_header->cpi_length*dec);
 
                             /* Re-interleave output data */
-                            for(int sample_index=0; sample_index<(int)iq_header->cpi_length; sample_index++)
                             {
-                                output_data_buffer[2*sample_index]   = fir_output_buffer_i[sample_index];
-                                output_data_buffer[2*sample_index+1] = fir_output_buffer_q[sample_index];
+                                float* restrict interleaved = output_data_buffer;
+                                const float* restrict dec_i = fir_output_buffer_i;
+                                const float* restrict dec_q = fir_output_buffer_q;
+                                for(int sample_index=0; sample_index<(int)iq_header->cpi_length; sample_index++)
+                                {
+                                    interleaved[2*sample_index]   = dec_i[sample_index];
+                                    interleaved[2*sample_index+1] = dec_q[sample_index];
+                                }
                             }
 
                             input_data_buffer  += 2*iq_header->cpi_length*dec;

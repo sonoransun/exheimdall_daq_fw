@@ -23,11 +23,12 @@
  *-------------------------------------
  */
 typedef enum {
-    OFFLOAD_CPU_NEON  = 0,
-    OFFLOAD_CPU_KFR   = 1,
-    OFFLOAD_FPGA      = 2,
-    OFFLOAD_GPU       = 3,
-    OFFLOAD_AUTO      = 99,
+    OFFLOAD_CPU_NEON    = 0,
+    OFFLOAD_CPU_KFR     = 1,
+    OFFLOAD_FPGA        = 2,
+    OFFLOAD_GPU         = 3,
+    OFFLOAD_CPU_GENERIC = 4,  /* portable plain-C engine, no external DSP lib */
+    OFFLOAD_AUTO        = 99,
 } offload_engine_t;
 
 /*
@@ -126,14 +127,24 @@ offload_engine_t offload_auto_detect(void);
  *   Engine Registration
  *-------------------------------------
  */
-#ifdef ARM_NEON
+#if defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
 extern struct fir_engine* fir_engine_neon_create(void);
 extern struct convert_engine* convert_engine_neon_create(void);
 #endif
 
-#ifndef ARM_NEON
+#if !defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
 extern struct fir_engine* fir_engine_kfr_create(void);
 extern struct convert_engine* convert_engine_kfr_create(void);
+#endif
+
+/* Portable dependency-free engine (offload_cpu_generic.c).
+ * HAS_GENERIC_OFFLOAD compiles it in as a selectable engine;
+ * OFFLOAD_GENERIC_ONLY additionally makes it the platform default and
+ * drops the KFR/Ne10 engines entirely (dependency-light/CI builds).
+ * Default builds define neither, so behavior is unchanged. */
+#if defined(HAS_GENERIC_OFFLOAD) || defined(OFFLOAD_GENERIC_ONLY)
+extern struct fir_engine* fir_engine_generic_create(void);
+extern struct convert_engine* convert_engine_generic_create(void);
 #endif
 
 #ifdef HAS_FPGA_OFFLOAD

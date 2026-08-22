@@ -1,16 +1,60 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "heimdall-daq-fw"
 version = "0.1.0"
+description = "HeIMDALL DAQ Firmware - coherent multichannel RTL-SDR data acquisition (KrakenSDR). Installing this package provides only the heimdall-ctl control client; the DAQ pipeline itself (Firmware/_daq_core) is not a Python package and runs from the source tree."
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.8"
+authors = [
+    { name = "Tamas Peto" },
+    { name = "Carl Laufer" },
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "pyzmq",
+]
+
+[project.optional-dependencies]
+db = ["berkeleydb"]
+rf = ["scikit-rf"]
+dev = ["pytest"]
+
+[project.scripts]
+heimdall-ctl = "heimdall_ctl.__main__:main"
+
+# Only util/heimdall_ctl is installable. The Firmware/_daq_core modules are
+# intentionally NOT packaged: they have no __init__.py and import each other
+# via sys.path.insert from the source tree (see CLAUDE.md).
+[tool.setuptools]
+packages = ["heimdall_ctl", "heimdall_ctl.client"]
+
+[tool.setuptools.package-dir]
+heimdall_ctl = "util/heimdall_ctl"
+"heimdall_ctl.client" = "util/heimdall_ctl/client"
 
 [tool.pytest.ini_options]
 testpaths = [
     "Firmware/_testing/unit_test",
-    "util/heimdall_ctl/tests",
 ]
 markers = [
     "sudo: requires root privileges",
     "hardware: requires real SDR hardware",
     "gpu: requires OpenCL/GPU",
 ]
-addopts = "-m 'not sudo and not hardware and not gpu'"
+# The pipeline tests below spawn the built C binaries over FIFOs and need
+# sudo + the unit_test_k4 config (see CLAUDE.md); they are excluded here so a
+# bare `pytest` runs only the hardware-free suite. Run them explicitly with
+# `sudo python3 -m unittest ...` per CLAUDE.md, or `./unit_test.sh` lanes.
+addopts = """
+--ignore=Firmware/_testing/unit_test/test_decimator.py \
+--ignore=Firmware/_testing/unit_test/test_rebuffer.py \
+--ignore=Firmware/_testing/unit_test/test_squelch.py \
+--ignore=Firmware/_testing/unit_test/test_delay_sync.py \
+--ignore=Firmware/_testing/unit_test/test_sys.py \
+--ignore=Firmware/_testing/unit_test/test_iq_server.py \
+"""

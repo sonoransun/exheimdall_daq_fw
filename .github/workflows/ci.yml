@@ -1,0 +1,133 @@
+# HeIMDALL DAQ Firmware - CI
+#
+# Lanes:
+#   c-build   : C core on x86_64 + arm64, generic (dependency-light) engine
+#               always, plus a full ENGINE=kfr lane with KFR built from source
+#               (cached - the first run on a cold cache is slow, ~5-15 min).
+#   asan      : compile+link the core with -fsanitize=address,undefined.
+#   python    : hardware-free Python suite via the canonical entry point
+#               `cd Firmware && ./unit_test.sh --ci` on ubuntu and macos.
+#
+# There is intentionally NO FPGA gateware job: `make lint` (verilator) exits
+# non-zero with 92 warnings-as-errors and `make verify` fails on 'Xx'
+# (undefined) values in the top-level sim output, verified in a clean
+# ubuntu 24.04 container with apt iverilog/verilator. Re-add a gateware job
+# once _fpga_gateware lint/verify pass locally.
+#
+# All C-build steps live in ci/build.sh so they are locally reproducible.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KFR_REF: "7.1.0"
+  LIBRTLSDR_REF: "master"
+
+jobs:
+  c-build:
+    name: C core (${{ matrix.lane }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        lane: [generic, kfr]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git libusb-1.0-0-dev libzmq3-dev
+          if [ "${{ matrix.lane }}" = "kfr" ]; then
+            sudo apt-get install -y --no-install-recommends clang
+          fi
+
+      - name: Cache built dependencies (librtlsdr / KFR)
+        uses: actions/cache@v4
+        with:
+          path: .ci-deps
+          key: ci-deps-${{ matrix.os }}-${{ matrix.lane }}-librtlsdr-${{ env.LIBRTLSDR_REF }}-kfr-${{ env.KFR_REF }}-v1
+
+      - name: Build (${{ matrix.lane }} lane)
+        run: ./ci/build.sh ${{ matrix.lane }}
+
+      - name: Show binaries
+        run: ls -la Firmware/_daq_core/*.out
+
+  asan:
+    name: C core (asan compile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git libusb-1.0-0-dev libzmq3-dev
+
+      - name: Cache built dependencies (librtlsdr)
+        uses: actions/cache@v4
+        with:
+          path: .ci-deps
+          key: ci-deps-ubuntu-latest-asan-librtlsdr-${{ env.LIBRTLSDR_REF }}-v1
+
+      - name: Build with AddressSanitizer/UBSan
+        run: ./ci/build.sh asan
+
+  python:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy pyzmq scikit-rf
+
+      - name: Install optional berkeleydb (ubuntu only, best-effort)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libdb-dev || true
+          python -m pip install berkeleydb \
+            || echo "berkeleydb optional install failed - DB tests will skip"
+
+      - name: Config sanity check (ini_checker, no hardware)
+        run: |
+          cd Firmware
+          python3 ini_checker.py no_hw
+
+      - name: Run hardware-free test suite
+        run: |
+          cd Firmware
+          ./unit_test.sh --ci
+
+      - name: Package install + console script smoke test
+        run: |
+          python -m pip install .
+          heimdall-ctl --help

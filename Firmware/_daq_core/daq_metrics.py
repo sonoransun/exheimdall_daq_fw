@@ -58,7 +58,9 @@ class MetricsCollector:
 
     def get_all_stats(self):
         """Return stats dict for every registered metric."""
-        return {name: self.get_stats(name) for name in self._metrics}
+        # Snapshot the key list first: the frame thread may register new
+        # metrics concurrently (dict changed size during iteration).
+        return {name: self.get_stats(name) for name in list(self._metrics.keys())}
 
     def reset(self, name):
         """Clear a single metric."""

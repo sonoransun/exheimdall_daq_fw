@@ -25,6 +25,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "log.h"
 
@@ -72,6 +73,24 @@ void log_set_lock(log_LockFn fn) {
 }
 
 
+/* Built-in pthread-mutex lock so multithreaded processes get consistent
+ * log lines without wiring their own lock function. Call once at startup. */
+static pthread_mutex_t log_default_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_default_lock_fn(void *udata, int lock) {
+  (void)udata;
+  if (lock) {
+    pthread_mutex_lock(&log_default_mutex);
+  } else {
+    pthread_mutex_unlock(&log_default_mutex);
+  }
+}
+
+void log_use_default_lock(void) {
+  log_set_lock(log_default_lock_fn);
+}
+
+
 void log_set_fp(FILE *fp) {
   L.fp = fp;
 }
@@ -95,9 +114,14 @@ void log_log(int level, const char *file, int line, const char *fmt, ...) {
   /* Acquire lock */
   lock();
 
-  /* Get current time */
+  /* Get current time (thread-safe: localtime_r into a stack buffer) */
   time_t t = time(NULL);
-  struct tm *lt = localtime(&t);
+  struct tm lt_buf;
+  struct tm *lt = localtime_r(&t, &lt_buf);
+  if (!lt) {
+    memset(&lt_buf, 0, sizeof(lt_buf));
+    lt = &lt_buf;
+  }
 
   /* Log to stderr */
   if (!L.quiet) {

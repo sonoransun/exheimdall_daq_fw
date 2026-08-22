@@ -22,9 +22,12 @@ echo "Instance ID: ${INSTANCE_ID}"
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Check if DAQ is running
-if ! pgrep -f "rtl_daq.out" > /dev/null; then
-    echo "Error: DAQ not running. Start with ./daq_synthetic_start.sh first."
+# Check if DAQ is running - either with real hardware (rtl_daq.out) or in
+# synthetic mode (test_data_synthesizer.py; daq_synthetic_start.sh never
+# launches rtl_daq.out)
+if ! pgrep -f "rtl_daq.out" > /dev/null && \
+   ! pgrep -f "test_data_synthesizer.py" > /dev/null; then
+    echo "Error: DAQ not running. Start with ./daq_start_sm.sh or ./daq_synthetic_start.sh first."
     exit 1
 fi
 
@@ -78,8 +81,13 @@ else
     stress_cores="0"
 fi
 
-stress-ng --cpu 2 --cpu-load 50 --timeout ${BENCHMARK_DURATION}s --taskset $stress_cores &
-STRESS_PID=$!
+STRESS_PID=""
+if command -v stress-ng > /dev/null 2>&1; then
+    stress-ng --cpu 2 --cpu-load 50 --timeout ${BENCHMARK_DURATION}s --taskset $stress_cores &
+    STRESS_PID=$!
+else
+    echo "Note: stress-ng not installed - skipping CPU stress load"
+fi
 
 # Generate I/O load
 echo "Generating I/O load..."

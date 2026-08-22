@@ -40,21 +40,6 @@
 
 /*
 *-------------------------------------
-*       Batched Control Protocol
-*-------------------------------------
-*/
-// Optimized control structure for reduced syscall overhead
-struct shmem_control_batch {
-    uint32_t sequence;      // Sequence number for ordering
-    uint32_t frame_count;   // Number of frames processed
-    uint64_t timestamp_ns;  // High-precision timestamp
-    uint8_t buffer_mask;    // Bitmask for multiple buffer status (A=0x01, B=0x02)
-    uint8_t priority_flags; // Priority indicators for urgent operations
-    uint16_t payload_size;  // Size of additional payload data
-} __attribute__((packed, aligned(64))); // Cache-line aligned
-
-/*
-*-------------------------------------
 *       Shared memory transfer
 *-------------------------------------
 */
@@ -90,19 +75,9 @@ void send_ctr_buff_ready(struct shmem_transfer_struct*, int);
 void send_ctr_buff_free(struct shmem_transfer_struct*, int);
 void send_ctr_terminate(struct shmem_transfer_struct*);
 
-// Optimized batched control functions
-void send_ctr_batch(struct shmem_transfer_struct*, struct shmem_control_batch*);
-int init_ctr_batch(struct shmem_control_batch*, uint32_t initial_sequence);
-void update_ctr_batch_buffer_ready(struct shmem_control_batch*, int buffer_index);
-void update_ctr_batch_timestamp(struct shmem_control_batch*);
-
-// Backward compatibility wrappers
-void send_ctr_buff_ready_batch(struct shmem_transfer_struct*, int, struct shmem_control_batch*);
-void send_ctr_terminate(struct shmem_transfer_struct*);
-
 int wait_buff_free(struct shmem_transfer_struct*);
 int wait_buff_ready(struct shmem_transfer_struct*);
-int wait_ctr_init_read(struct shmem_transfer_struct*);
+int wait_ctr_init_ready(struct shmem_transfer_struct*);
 
 /*
 *-------------------------------------

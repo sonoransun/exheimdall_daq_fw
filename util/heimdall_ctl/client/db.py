@@ -21,17 +21,21 @@ def _ensure_daq_core_path():
 def open_db(db_dir="_db"):
     _ensure_daq_core_path()
     try:
-        from daq_db import DAQDatabase
+        from daq_db import DAQDatabase, bdb
     except ImportError:
         raise RuntimeError(
             "berkeleydb or daq_db not available. "
             "Install python-berkeleydb and ensure Firmware/_daq_core is accessible.")
-    return DAQDatabase(db_dir=db_dir, enable_write=False)
+    if bdb is None:
+        raise RuntimeError(
+            "berkeleydb Python bindings not available "
+            "(install berkeleydb or bsddb3).")
+    return DAQDatabase(db_dir=db_dir, read_only=True)
 
 
 def cal_history(db, since_ms=None, freq=None, limit=50):
     return db.get_cal_history(
-        start_ts_ms=since_ms, rf_center_freq=freq, limit=limit)
+        start_ts_ms=since_ms or 0, rf_center_freq=freq, limit=limit)
 
 
 def freq_scan_summary(db):

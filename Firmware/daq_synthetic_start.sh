@@ -6,25 +6,32 @@
 #   License : GNU GPL V3
 #   Authors: Tamas Peto, Carl Laufer
 
-# Check config file
-res=$(python3 ini_checker.py no_hw 2>&1)
-if test -z "$res" 
-then
+# Check config file (exit code 0 = valid; errors are printed on stderr)
+if python3 ini_checker.py no_hw; then
       echo -e "\e[92mConfig file check [OK]\e[39m"
 else
       echo -e "\e[91mConfig file check [FAIL]\e[39m"
-      echo $res
-      exit
+      exit 1
 fi
 
-# Read config ini file
-out_data_iface_type=$(awk -F "=" '/out_data_iface_type/ {print $2}' daq_chain_config.ini)
+# Read config ini file (ConfigParser: immune to comments/substring matches)
+out_data_iface_type=$(python3 -c "
+from configparser import ConfigParser
+c = ConfigParser()
+c.read('daq_chain_config.ini')
+print(c.get('data_interface', 'out_data_iface_type', fallback='eth'))
+" 2>/dev/null || echo "eth")
 
 # Read federation instance_id
-instance_id=$(awk -F'=' '/instance_id/ {gsub (" ", "", $0); print $2}' daq_chain_config.ini | head -1)
-if [ -z "$instance_id" ]; then
-    instance_id=0
-fi
+instance_id=$(python3 -c "
+from configparser import ConfigParser
+c = ConfigParser()
+c.read('daq_chain_config.ini')
+print(c.get('federation', 'instance_id', fallback='0'))
+" 2>/dev/null || echo "0")
+case "$instance_id" in
+    ''|*[!0-9]*) instance_id=0 ;;
+esac
 
 # Compute FIFO name prefix based on instance_id
 if [ "$instance_id" -eq 0 ]; then
@@ -61,13 +68,23 @@ mkfifo _data_control/${FIFO_PREFIX}bw_delay_sync_hwc
 # Create database directory
 mkdir -p _db
 
-# Archive old log files instead of deleting
-if ls _logs/*.log 1>/dev/null 2>&1; then
-    archive_dir="_logs/archive/$(date -Iseconds)"
+# Per-instance log directory. Instance 0 keeps the historical flat _logs/
+# paths; instance N logs to _logs/instN/.
+if [ "$instance_id" -eq 0 ]; then
+    LOG_DIR="_logs"
+else
+    LOG_DIR="_logs/inst${instance_id}"
+fi
+mkdir -p "$LOG_DIR"
+
+# Archive old log files instead of deleting - scoped to THIS instance's
+# directory so starting instance N never touches another instance's live logs.
+if ls "$LOG_DIR"/*.log 1>/dev/null 2>&1; then
+    archive_dir="$LOG_DIR/archive/$(date -Iseconds)"
     mkdir -p "$archive_dir"
-    mv _logs/*.log "$archive_dir/" 2>/dev/null
-    # Keep only the last 10 archives
-    ls -1dt _logs/archive/*/ 2>/dev/null | tail -n +11 | xargs rm -rf 2>/dev/null
+    mv "$LOG_DIR"/*.log "$archive_dir/" 2>/dev/null
+    # Keep only the last 10 archives of this instance
+    ls -1dt "$LOG_DIR"/archive/*/ 2>/dev/null | tail -n +11 | xargs rm -rf 2>/dev/null
 fi
 
 # Useful to set this on low power ARM devices 
@@ -125,29 +142,37 @@ fi
 # Create PID directory for this instance
 PID_DIR="_logs/inst${instance_id}/pids"
 mkdir -p "$PID_DIR"
+# Purge stale PID files from previous runs (a crash/reboot leaves them behind
+# with PIDs the kernel may have recycled). Scoped to THIS instance's directory
+# so starting instance N never touches another instance's PID files.
+rm -f "$PID_DIR"/*.pid
 
 # Start main program chain -Thread 0 Normal (non squelch mode)
 echo "Starting DAQ Subsystem with synthetic data source (instance ${instance_id})"
-python3 _testing/test_data_synthesizer.py 2>_logs/synthetic.log | \
-_daq_core/rebuffer.out 0 2> _logs/rebuffer.log &
+python3 _testing/test_data_synthesizer.py 2>"$LOG_DIR/synthetic.log" | \
+_daq_core/rebuffer.out 0 2> "$LOG_DIR/rebuffer.log" &
 echo $! > "$PID_DIR/rebuffer.pid"
+# $! is the LAST process of the pipeline (rebuffer); the pipeline's process
+# group leader is its FIRST process (the synthesizer) - record it too so
+# per-instance daq_stop.sh can signal it.
+jobs -p %+ > "$PID_DIR/synthesizer.pid" 2>/dev/null
 
 # Decimator - Thread 1
-chrt -f 99 _daq_core/decimate.out 2> _logs/decimator.log &
+chrt -f 99 _daq_core/decimate.out 2> "$LOG_DIR/decimator.log" &
 echo $! > "$PID_DIR/decimate.pid"
 
 # Delay synchronizer - Thread 2
-python3 _daq_core/delay_sync.py 2> _logs/delay_sync.log &
+python3 _daq_core/delay_sync.py 2> "$LOG_DIR/delay_sync.log" &
 echo $! > "$PID_DIR/delay_sync.pid"
 
 # Hardware Controller data path - Thread 3
-sudo python3 _daq_core/hw_controller.py 2> _logs/hwc.log &
+sudo python3 _daq_core/hw_controller.py 2> "$LOG_DIR/hwc.log" &
 echo $! > "$PID_DIR/hw_controller.pid"
 # root priviliges are needed to drive the i2c master
 
 if [ $out_data_iface_type = eth ]; then
     echo "Output data interface: IQ ethernet server"
-    _daq_core/iq_server.out 2>_logs/iq_server.log &
+    _daq_core/iq_server.out 2>"$LOG_DIR/iq_server.log" &
     echo $! > "$PID_DIR/iq_server.pid"
 elif [ $out_data_iface_type = shmem ]; then
     echo "Output data interface: Shared memory"
@@ -155,7 +180,7 @@ fi
 
 # IQ Eth sink used for testing
 #sleep 3
-#python3 _daq_core/iq_eth_sink.py 2>_logs/iq_eth_sink.log &
+#python3 _daq_core/iq_eth_sink.py 2>"$LOG_DIR/iq_eth_sink.log" &
 
 echo -e "      )  (     "
 echo -e "      (   ) )  "

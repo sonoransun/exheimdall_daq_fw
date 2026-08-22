@@ -278,6 +278,121 @@ class TestSignalScheduler(unittest.TestCase):
         self.assertIsNone(self.scheduler.get_pending_gain())
 
 
+class TestDwellTimeSeconds(unittest.TestCase):
+    """Time-based dwell uses the scheduler's DAQ timing parameters."""
+
+    def test_frames_for_seconds(self):
+        # frame time = cpi_size * decimation_ratio / sample_rate
+        sched = SignalScheduler(M=5, sample_rate=2400000, cpi_size=1048576,
+                                decimation_ratio=1)
+        frame_time = 1048576 / 2400000.0  # ~0.4369 s
+        self.assertEqual(sched.frames_for_seconds(10 * frame_time), 10)
+        self.assertEqual(sched.frames_for_seconds(0.0), 1)  # at least 1 frame
+
+    def test_dwell_time_sec_converted_on_load(self):
+        sched = SignalScheduler(M=5, sample_rate=2400000, cpi_size=240000,
+                                decimation_ratio=2)
+        # frame time = 240000 * 2 / 2400000 = 0.2 s -> 1 s = 5 frames
+        s = Schedule(name="t", entries=[
+            ScheduleEntry(frequency=100000000, dwell_time_sec=1.0),
+        ])
+        sched.load_schedule(s)
+        self.assertEqual(sched.schedule.entries[0].dwell_frames, 5)
+
+    def test_json_dwell_time_sec(self):
+        s = ScheduleParser.from_json(json.dumps({
+            "entries": [{"frequency": 433000000, "dwell_time_sec": 2.5}]}))
+        self.assertAlmostEqual(s.entries[0].dwell_time_sec, 2.5)
+
+    def test_ini_dwell_time_sec(self):
+        parser = ConfigParser()
+        parser.add_section('schedule')
+        parser.set('schedule', 'frequencies', '100000000, 200000000')
+        parser.set('schedule', 'dwell_time_sec', '1.0')
+        s = ScheduleParser.from_ini_section(parser)
+        self.assertAlmostEqual(s.entries[0].dwell_time_sec, 1.0)
+        self.assertAlmostEqual(s.entries[1].dwell_time_sec, 1.0)  # padded
+
+
+class FakeDB:
+    """In-memory stand-in for DAQDatabase schedule-state persistence."""
+
+    def __init__(self):
+        self.store = {}
+
+    def put_schedule_state(self, key, value):
+        self.store[key] = value
+
+    def get_schedule_state(self, key):
+        return self.store.get(key)
+
+
+class TestSchedulePersistence(unittest.TestCase):
+    """Schedule position survives a scheduler restart via the DB."""
+
+    def _make(self, db):
+        return SignalScheduler(M=5, db=db)
+
+    def _two_entry_schedule(self):
+        return Schedule(name="persist_test", entries=[
+            ScheduleEntry(frequency=100000000, dwell_frames=1, require_cal=False),
+            ScheduleEntry(frequency=200000000, dwell_frames=1, require_cal=False),
+        ])
+
+    def test_state_persisted_on_transition(self):
+        db = FakeDB()
+        sched = self._make(db)
+        sched.load_schedule(self._two_entry_schedule())
+        sched.tick(MockIQHeader())  # enter dwelling
+        sched.tick(MockIQHeader(frame_type=0))  # transition to entry 1
+        state = json.loads(db.get_schedule_state(b"scheduler_state").decode())
+        self.assertEqual(state["name"], "persist_test")
+        self.assertEqual(state["current_index"], 1)
+        self.assertTrue(state["active"])
+
+    def test_restart_resumes_at_persisted_index(self):
+        db = FakeDB()
+        sched = self._make(db)
+        sched.load_schedule(self._two_entry_schedule())
+        sched.tick(MockIQHeader())
+        sched.tick(MockIQHeader(frame_type=0))  # now at entry 1
+        # Simulate a restart: a fresh scheduler loading the same schedule
+        sched2 = self._make(db)
+        sched2.load_schedule(self._two_entry_schedule())
+        self.assertEqual(sched2.schedule.current_index, 1)
+
+    def test_different_schedule_name_starts_at_zero(self):
+        db = FakeDB()
+        sched = self._make(db)
+        sched.load_schedule(self._two_entry_schedule())
+        sched.tick(MockIQHeader())
+        sched.tick(MockIQHeader(frame_type=0))
+        sched2 = self._make(db)
+        other = Schedule(name="other", entries=[
+            ScheduleEntry(frequency=300000000, dwell_frames=1),
+            ScheduleEntry(frequency=400000000, dwell_frames=1),
+        ])
+        sched2.load_schedule(other)
+        self.assertEqual(sched2.schedule.current_index, 0)
+
+    def test_cleared_schedule_not_resumed(self):
+        db = FakeDB()
+        sched = self._make(db)
+        sched.load_schedule(self._two_entry_schedule())
+        sched.skip_to_next()
+        sched.clear_schedule()  # persists inactive state
+        sched2 = self._make(db)
+        sched2.load_schedule(self._two_entry_schedule())
+        self.assertEqual(sched2.schedule.current_index, 0)
+
+    def test_no_db_is_noop(self):
+        sched = SignalScheduler(M=5)  # db=None: identical legacy behavior
+        sched.load_schedule(self._two_entry_schedule())
+        sched.tick(MockIQHeader())
+        result = sched.tick(MockIQHeader(frame_type=0))
+        self.assertEqual(result[0], "FREQ")
+
+
 class TestScheduleParser(unittest.TestCase):
 
     def test_from_ini_section(self):

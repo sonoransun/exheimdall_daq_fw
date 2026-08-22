@@ -180,6 +180,8 @@ class PWMServoBackend:
         self._el_pin = int(getattr(cfg, 'el_pwm_channel', 1))
         self._slew_rate = max(float(getattr(cfg, 'slew_rate_dps', 6.0)), 0.1)
         self._cur = (0.0, 0.0)
+        self._prev = (0.0, 0.0)
+        self._move_started_at = 0.0
         self._move_done_at = 0.0
         try:
             import pigpio  # lazy import
@@ -197,18 +199,23 @@ class PWMServoBackend:
         frac = (_clamp(angle, lo, hi) - lo) / (hi - lo) if hi > lo else 0.0
         return int(500 + frac * 2000)  # 500-2500 us
 
+    def _command_pulses(self, az, el):
+        self._pi.set_servo_pulsewidth(self._az_pin, self._angle_to_pulse(az, self._az_min, self._az_max))
+        self._pi.set_servo_pulsewidth(self._el_pin, self._angle_to_pulse(el, self._el_min, self._el_max))
+
     def move_to(self, az_deg, el_deg):
         prev = self._cur
         self._cur = (_clamp(az_deg, self._az_min, self._az_max),
                      _clamp(el_deg, self._el_min, self._el_max))
         if self._pi is not None:
             try:
-                self._pi.set_servo_pulsewidth(self._az_pin, self._angle_to_pulse(self._cur[0], self._az_min, self._az_max))
-                self._pi.set_servo_pulsewidth(self._el_pin, self._angle_to_pulse(self._cur[1], self._el_min, self._el_max))
+                self._command_pulses(self._cur[0], self._cur[1])
             except Exception as e:
                 logger.error("PWM servo move_to failed: %s", e)
         dist = max(abs(self._cur[0] - prev[0]), abs(self._cur[1] - prev[1]))
-        self._move_done_at = self._time.monotonic() + dist / self._slew_rate
+        self._prev = prev
+        self._move_started_at = self._time.monotonic()
+        self._move_done_at = self._move_started_at + dist / self._slew_rate
 
     def get_position(self):
         return self._cur
@@ -216,7 +223,27 @@ class PWMServoBackend:
     def is_moving(self):
         return self._time.monotonic() < self._move_done_at
 
+    def _estimate_position(self):
+        """Interpolate the physical position along the current slew."""
+        now = self._time.monotonic()
+        if now >= self._move_done_at:
+            return self._cur
+        span = self._move_done_at - self._move_started_at
+        frac = (now - self._move_started_at) / span if span > 0 else 1.0
+        frac = _clamp(frac, 0.0, 1.0)
+        return (self._prev[0] + frac * (self._cur[0] - self._prev[0]),
+                self._prev[1] + frac * (self._cur[1] - self._prev[1]))
+
     def stop(self):
+        # The servo keeps slewing toward the last commanded pulse on its own;
+        # to actually halt, re-command the estimated in-flight position.
+        if self._pi is not None and self.is_moving():
+            est = self._estimate_position()
+            self._cur = est
+            try:
+                self._command_pulses(est[0], est[1])
+            except Exception as e:
+                logger.error("PWM servo stop failed: %s", e)
         self._move_done_at = 0.0
 
     def home(self):
@@ -250,14 +277,24 @@ class I2CPanTiltBackend:
         self._addr = int(getattr(cfg, 'i2c_address', 0x40))
         self._slew_rate = max(float(getattr(cfg, 'slew_rate_dps', 6.0)), 0.1)
         self._cur = (0.0, 0.0)
+        self._prev = (0.0, 0.0)
+        self._move_started_at = 0.0
         self._move_done_at = 0.0
         try:
             from smbus2 import SMBus  # lazy import
             import time
             self._time = time
             self._bus = SMBus(int(getattr(cfg, 'i2c_bus', 1)))
-            # Minimal PCA9685 init: normal mode, ~50 Hz
-            self._bus.write_byte_data(self._addr, self._MODE1, 0x00)
+            # PCA9685 init: program the prescaler for a 50 Hz servo frame.
+            # The chip powers up at prescale 0x1E (~200 Hz); the prescale
+            # register can only be written while the oscillator sleeps.
+            # prescale = round(25 MHz / (4096 * 50 Hz)) - 1 = 121
+            prescale = int(round(25000000.0 / (4096.0 * 50.0))) - 1
+            self._bus.write_byte_data(self._addr, self._MODE1, 0x10)  # SLEEP
+            self._bus.write_byte_data(self._addr, self._PRESCALE, prescale)
+            self._bus.write_byte_data(self._addr, self._MODE1, 0x00)  # wake
+            time.sleep(0.001)  # oscillator startup (>500 us)
+            self._bus.write_byte_data(self._addr, self._MODE1, 0x80)  # RESTART
             self.init_status = True
         except Exception as e:
             logger.error("I2C pan-tilt init failed: %s", e)
@@ -275,18 +312,23 @@ class I2CPanTiltBackend:
         self._bus.write_byte_data(self._addr, base + 2, counts & 0xFF)
         self._bus.write_byte_data(self._addr, base + 3, (counts >> 8) & 0x0F)
 
+    def _command_counts(self, az, el):
+        self._set_channel(self._az_ch, self._angle_to_counts(az, self._az_min, self._az_max))
+        self._set_channel(self._el_ch, self._angle_to_counts(el, self._el_min, self._el_max))
+
     def move_to(self, az_deg, el_deg):
         prev = self._cur
         self._cur = (_clamp(az_deg, self._az_min, self._az_max),
                      _clamp(el_deg, self._el_min, self._el_max))
         if self._bus is not None:
             try:
-                self._set_channel(self._az_ch, self._angle_to_counts(self._cur[0], self._az_min, self._az_max))
-                self._set_channel(self._el_ch, self._angle_to_counts(self._cur[1], self._el_min, self._el_max))
+                self._command_counts(self._cur[0], self._cur[1])
             except Exception as e:
                 logger.error("I2C pan-tilt move_to failed: %s", e)
         dist = max(abs(self._cur[0] - prev[0]), abs(self._cur[1] - prev[1]))
-        self._move_done_at = self._time.monotonic() + dist / self._slew_rate
+        self._prev = prev
+        self._move_started_at = self._time.monotonic()
+        self._move_done_at = self._move_started_at + dist / self._slew_rate
 
     def get_position(self):
         return self._cur
@@ -294,7 +336,27 @@ class I2CPanTiltBackend:
     def is_moving(self):
         return self._time.monotonic() < self._move_done_at
 
+    def _estimate_position(self):
+        """Interpolate the physical position along the current slew."""
+        now = self._time.monotonic()
+        if now >= self._move_done_at:
+            return self._cur
+        span = self._move_done_at - self._move_started_at
+        frac = (now - self._move_started_at) / span if span > 0 else 1.0
+        frac = _clamp(frac, 0.0, 1.0)
+        return (self._prev[0] + frac * (self._cur[0] - self._prev[0]),
+                self._prev[1] + frac * (self._cur[1] - self._prev[1]))
+
     def stop(self):
+        # Servos keep slewing toward the last commanded pulse on their own;
+        # to actually halt, re-command the estimated in-flight position.
+        if self._bus is not None and self.is_moving():
+            est = self._estimate_position()
+            self._cur = est
+            try:
+                self._command_counts(est[0], est[1])
+            except Exception as e:
+                logger.error("I2C pan-tilt stop failed: %s", e)
         self._move_done_at = 0.0
 
     def home(self):

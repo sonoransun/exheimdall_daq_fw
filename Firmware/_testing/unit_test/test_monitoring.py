@@ -26,6 +26,31 @@ from daq_events import (
 from daq_status_server import StatusServer
 
 
+
+def _free_port():
+    """Grab an ephemeral TCP port (the servers under test cannot report a
+    kernel-assigned port back, so reserve one and hand it over)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_listening(port, timeout=5.0):
+    """Deterministically wait until the server accepts connections
+    (replaces fixed post-start sleeps)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.02)
+    return False
+
+
 # ======================================================================
 # MetricsCollector tests
 # ======================================================================
@@ -140,8 +165,7 @@ class TestEventBus(unittest.TestCase):
         bus.register_handler(lambda e: received.append(e))
         bus.emit(DAQEvent(severity="info", module="test",
                           event_type=EVT_HEARTBEAT, payload={"n": 1}))
-        time.sleep(0.3)
-        bus.close()
+        bus.close()  # close() joins the dispatch thread and drains the queue
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].event_type, EVT_HEARTBEAT)
 
@@ -153,8 +177,7 @@ class TestEventBus(unittest.TestCase):
         bus.register_handler(lambda e: r2.append(e))
         bus.emit(DAQEvent(severity="info", module="test",
                           event_type=EVT_HEARTBEAT))
-        time.sleep(0.3)
-        bus.close()
+        bus.close()  # deterministic drain
         self.assertEqual(len(r1), 1)
         self.assertEqual(len(r2), 1)
 
@@ -168,8 +191,7 @@ class TestEventBus(unittest.TestCase):
             bus.emit(DAQEvent(severity="info", module="test",
                               event_type=EVT_HEARTBEAT, payload={"i": i}))
         block.set()
-        time.sleep(0.3)
-        bus.close()
+        bus.close()  # deterministic drain
         # Some events were dropped — just verify no exception and some were processed
 
     def test_disabled_noop(self):
@@ -190,8 +212,7 @@ class TestEventBus(unittest.TestCase):
         for i in range(10):
             bus.emit(DAQEvent(severity="info", module="test",
                               event_type=EVT_HEARTBEAT, payload={"i": i}))
-        time.sleep(0.5)
-        bus.close()
+        bus.close()  # deterministic drain
         recent = bus.get_recent_events(5)
         # Should have at most 5 events, the most recent ones
         self.assertLessEqual(len(recent), 5)
@@ -257,11 +278,11 @@ class TestStatusServer(unittest.TestCase):
         self.metrics = MetricsCollector(window_size=100)
         self.bus = EventBus(enabled=True, ring_size=50)
         # Use a random high port to avoid conflicts
-        self.port = 15002
+        self.port = _free_port()
         self.server = StatusServer(port=self.port, metrics=self.metrics,
                                    event_bus=self.bus)
         self.server.start()
-        time.sleep(0.2)
+        assert _wait_listening(self.port), "StatusServer did not come up"
 
     def tearDown(self):
         self.server.close()
@@ -273,7 +294,9 @@ class TestStatusServer(unittest.TestCase):
         s.connect(("127.0.0.1", self.port))
         s.sendall((cmd + "\n").encode())
         data = b""
-        while True:
+        # Replies are one JSON object terminated by '\n' — stop there
+        # instead of waiting out the 2 s socket timeout on every query
+        while b"\n" not in data:
             try:
                 chunk = s.recv(4096)
                 if not chunk:
@@ -311,6 +334,178 @@ class TestStatusServer(unittest.TestCase):
         resp = self._query("METRICS")
         self.assertIn("test_metric", resp)
         self.assertAlmostEqual(resp["test_metric"]["last"], 42.0)
+
+    def test_db_commands_without_db(self):
+        """DB proxy commands report 'database not enabled' when no db is wired."""
+        for cmd in ("DB_STATS", "SCAN_SUMMARY", "CAL_HISTORY"):
+            resp = self._query(cmd)
+            self.assertIn("error", resp)
+
+    def test_concurrent_clients(self):
+        """A slow client must not block other status consumers (threaded
+        accept loop)."""
+        self.server.update_status({"sync_state": 6, "counters": {}})
+        # Open a connection and leave it idle (would stall a serial loop for
+        # its full 5 s recv timeout)
+        stalled = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        stalled.connect(("127.0.0.1", self.port))
+        try:
+            t0 = time.time()
+            resp = self._query("PING")
+            elapsed = time.time() - t0
+            self.assertTrue(resp["ok"])
+            self.assertLess(elapsed, 3.0)
+        finally:
+            stalled.close()
+
+
+class TestStatusServerHealthWindow(unittest.TestCase):
+    """Health derivation must use windowed drop deltas, not the cumulative
+    totals (a single historical drop must not pin health at 'degraded')."""
+
+    def setUp(self):
+        self.port = _free_port()
+        self.server = StatusServer(port=self.port, drop_window_sec=0.3)
+        self.server.start()
+        assert _wait_listening(self.port), "StatusServer did not come up"
+
+    def tearDown(self):
+        self.server.close()
+
+    def _query_status(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("127.0.0.1", self.port))
+        s.sendall(b"STATUS\n")
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return json.loads(data.decode())
+
+    def _snapshot(self, drops_iq):
+        return {
+            "sync_state": 6,
+            "counters": {"dropped_frames_iq": drops_iq, "dropped_frames_hwc": 0},
+        }
+
+    def test_recent_drop_degrades_health(self):
+        self.server.update_status(self._snapshot(0))
+        self.server.update_status(self._snapshot(3))  # 3 new drops
+        resp = self._query_status()
+        self.assertEqual(resp["pipeline_health"], "degraded")
+        self.assertEqual(resp["recent_drops"], 3)
+        # Cumulative totals stay visible for operators
+        self.assertEqual(resp["counters"]["dropped_frames_iq"], 3)
+
+    def test_health_recovers_after_window(self):
+        self.server.update_status(self._snapshot(0))
+        self.server.update_status(self._snapshot(3))
+        time.sleep(0.4)  # window (0.3 s) elapses
+        self.server.update_status(self._snapshot(3))  # no NEW drops
+        resp = self._query_status()
+        self.assertEqual(resp["pipeline_health"], "ok")
+        self.assertEqual(resp["recent_drops"], 0)
+        self.assertEqual(resp["counters"]["dropped_frames_iq"], 3)
+
+    def test_first_snapshot_total_not_counted_as_recent(self):
+        # Counters carry a historical total at the first heartbeat
+        self.server.update_status(self._snapshot(42))
+        resp = self._query_status()
+        self.assertEqual(resp["recent_drops"], 0)
+        self.assertEqual(resp["pipeline_health"], "ok")
+
+
+class TestStatusServerInstanceId(unittest.TestCase):
+
+    def test_instance_id_injected(self):
+        port = _free_port()
+        server = StatusServer(port=port, instance_id=3)
+        server.start()
+        assert _wait_listening(port), "StatusServer did not come up"
+        try:
+            server.update_status({"sync_state": 6, "counters": {}})
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"STATUS\n")
+            data = b""
+            while b"\n" not in data:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            resp = json.loads(data.decode())
+            self.assertEqual(resp["instance_id"], 3)
+        finally:
+            server.close()
+
+
+class TestStatusServerDBProxy(unittest.TestCase):
+    """The DB read API is reachable through the status server when a db
+    object is wired in."""
+
+    class FakeDB:
+        def get_db_stats(self):
+            return {"frame_metrics.db": {"size_bytes": 123}, "read_errors": 0}
+
+        def get_freq_scan_summary(self, freq=None):
+            class R:
+                pass
+            r = R()
+            r.rf_center_freq = freq if freq else 433000000
+            r.total_frames = 10
+            return [r]
+
+        def get_cal_history(self, rf_center_freq=None, limit=100):
+            return []
+
+    def setUp(self):
+        self.port = _free_port()
+        self.server = StatusServer(port=self.port, db=self.FakeDB())
+        self.server.start()
+        assert _wait_listening(self.port), "StatusServer did not come up"
+
+    def tearDown(self):
+        self.server.close()
+
+    def _query(self, cmd):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("127.0.0.1", self.port))
+        s.sendall((cmd + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return json.loads(data.decode())
+
+    def test_db_stats(self):
+        resp = self._query("DB_STATS")
+        self.assertIn("frame_metrics.db", resp)
+
+    def test_scan_summary(self):
+        resp = self._query("SCAN_SUMMARY")
+        self.assertEqual(resp["freq_scan"][0]["total_frames"], 10)
+
+    def test_scan_summary_with_freq(self):
+        resp = self._query("SCAN_SUMMARY 868000000")
+        self.assertEqual(resp["freq_scan"][0]["rf_center_freq"], 868000000)
+
+    def test_cal_history(self):
+        resp = self._query("CAL_HISTORY")
+        self.assertEqual(resp["cal_history"], [])
+
+    def test_scan_summary_bad_arg(self):
+        resp = self._query("SCAN_SUMMARY notanumber")
+        self.assertIn("error", resp)
 
 
 if __name__ == "__main__":

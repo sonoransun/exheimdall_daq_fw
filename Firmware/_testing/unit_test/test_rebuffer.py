@@ -24,8 +24,11 @@
 """
 import unittest
 from os.path import join, dirname, realpath
+import os
+import shutil
 import sys
 import subprocess
+import tempfile
 import logging
 import numpy as np
 from struct import pack
@@ -35,12 +38,11 @@ from configparser import ConfigParser
 current_path      = dirname(realpath(__file__))
 root_path         = dirname(dirname(current_path))
 daq_core_path     = join(root_path, "_daq_core")
-data_control_path = join(root_path, "_data_control")
 log_path          = join(root_path, "_logs")
 unit_test_path    = join(root_path, "_testing", "unit_test")
 test_logs_path    = join(root_path, "_testing", "test_logs")
 
-config_filename=join(root_path,'daq_chain_config.ini')
+live_config_filename = join(root_path, 'daq_chain_config.ini')
 
 # Import IQ header module
 sys.path.insert(0, daq_core_path)
@@ -50,53 +52,54 @@ from capture_shmem_stream import IQFrameRecorder
 
 class TesterRebufferModule(unittest.TestCase):
 
+    """
+        Runs inside a per-test temporary working directory holding a private
+        COPY of daq_chain_config.ini plus the _data_control FIFOs, so the
+        live developer config is never modified (rebuffer.out and the Python
+        shmem interfaces resolve both relative to the cwd).
+    """
 
     @classmethod
     def setUpClass(cls):
         logging.basicConfig(filename=join(test_logs_path,'unit_test.log'),
-                             level=logging.INFO)   
+                             level=logging.INFO)
         logging.info("--> Starting Rebuffer unit test <--")
 
-        try:
-            proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_in")], stderr=subprocess.DEVNULL)
-            proc.wait()
-            proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_in")], stderr=subprocess.DEVNULL)
-            proc.wait()
-        except (IOError, OSError):
-            pass
-  
-    def setUp(self):        
+    def setUp(self):
+        # Isolated working directory with a private copy of the config
+        self.workdir = tempfile.mkdtemp(prefix="rebuffer_test_")
+        self.prev_cwd = os.getcwd()
+        self.config_filename = join(self.workdir, 'daq_chain_config.ini')
+        shutil.copyfile(live_config_filename, self.config_filename)
+        data_control_path = join(self.workdir, "_data_control")
+        os.makedirs(data_control_path)
+        os.chdir(self.workdir)
+
         # Open log files
         self.fd_log_gen_err  = open(join(log_path,"gen.log"),  "w")
         self.fd_log_rebuffer_err = open(join(log_path,"rebuffer.log"), "w")
-        
-        # Set-up control FIFOs   
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"fw_decimator_in")])
-        proc.wait()
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"bw_decimator_in")])
-        proc.wait()
 
-                
-        # Save default config file parameters
+        # Set-up control FIFOs
+        os.mkfifo(join(data_control_path,"fw_decimator_in"))
+        os.mkfifo(join(data_control_path,"bw_decimator_in"))
+
+        # Default config file parameters (from the private copy)
         self.N, self. R, self.N_daq, self.N_cal = self._read_config_file()
-        
+
     def tearDown(self):
         # Close log files
         self.fd_log_gen_err.close()
-        self.fd_log_rebuffer_err.close()        
-        
-        # Close control FIFOs        
-        proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_in")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_in")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        
+        self.fd_log_rebuffer_err.close()
+
         # Remove test output file
-        proc = subprocess.Popen(["rm",join(unit_test_path,'rebuffer_test_0.dat')], stderr=subprocess.DEVNULL)
-        proc.wait()
-        
-        # Write back default config file parameters
-        self._write_config_file(self.N, self.R, self.N_daq, self.N_cal)
+        try:
+            os.remove(join(unit_test_path,'rebuffer_test_0.dat'))
+        except OSError:
+            pass
+
+        # Drop the isolated working directory (config copy + FIFOs)
+        os.chdir(self.prev_cwd)
+        shutil.rmtree(self.workdir, ignore_errors=True)
 
     #############################################
     #               TEST FUNCTIONS              #  
@@ -401,10 +404,11 @@ class TesterRebufferModule(unittest.TestCase):
 
         """
         parser = ConfigParser()
-        found = parser.read([config_filename])
-        if not found:            
-            return 0,0,0
-        N = parser.getint('pre_processing', 'cpi_size')        
+        found = parser.read([self.config_filename])
+        if not found:
+            # Callers unpack four values - keep the arity right
+            return 0, 0, 0, 0
+        N = parser.getint('pre_processing', 'cpi_size')
         R = parser.getint('pre_processing', 'decimation_ratio')
         N_daq  = parser.getint('daq','daq_buffer_size')
         N_cal  = parser.getint('calibration', 'corr_size')
@@ -416,14 +420,14 @@ class TesterRebufferModule(unittest.TestCase):
         
         """
         parser = ConfigParser()
-        found = parser.read([config_filename])
-        if not found:            
+        found = parser.read([self.config_filename])
+        if not found:
             return -1
-        
+
         parser['pre_processing']['cpi_size'] = str(N)
-        parser['pre_processing']['decimation_ratio'] = str(R)       
+        parser['pre_processing']['decimation_ratio'] = str(R)
         parser['daq']['daq_buffer_size'] = str(N_daq)
         parser['calibration']['corr_size'] = str(N_cal)
-        with open(config_filename, 'w') as configfile:
+        with open(self.config_filename, 'w') as configfile:
             parser.write(configfile)
         return 0

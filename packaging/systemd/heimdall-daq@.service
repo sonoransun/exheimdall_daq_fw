@@ -1,0 +1,32 @@
+# HeIMDALL DAQ chain - per-federation-instance template unit (optional).
+#
+#   systemctl start heimdall-daq@1     # starts the instance in
+#                                      # /opt/heimdall/instances/1/Firmware
+#
+# IMPORTANT: daq_start_sm.sh reads the instance id from daq_chain_config.ini
+# ([federation] instance_id), NOT from the command line. Each instance
+# therefore needs its own working copy (or at minimum its own Firmware/
+# directory with its own daq_chain_config.ini where instance_id = %i).
+# See packaging/systemd/README.md for the expected layout.
+#
+# Stopping uses the per-instance PID files: daq_stop.sh %i.
+
+[Unit]
+Description=HeIMDALL DAQ coherent acquisition chain (instance %i)
+After=network.target
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/heimdall/instances/%i/Firmware
+ExecStart=/opt/heimdall/instances/%i/Firmware/daq_start_sm.sh
+ExecStop=/opt/heimdall/instances/%i/Firmware/daq_stop.sh %i
+User=root
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

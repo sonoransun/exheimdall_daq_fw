@@ -14,14 +14,20 @@ import threading
 import time
 import struct
 
+from iq_header import IQHeader
+
 IQ_HEADER_LENGTH = 1024
 SYNC_WORD = 0x2bf7b95a
+
+# Byte offset of the unit_id field in the IQ header (native alignment:
+# sync_word[4] + frame_type[4] + hardware_id[16] = 24)
+_UNIT_ID_OFFSET = 24
 
 
 class FederationIQRouter:
     """Aggregates IQ streams from multiple DAQ instances."""
 
-    def __init__(self, instance_configs, output_port=7000):
+    def __init__(self, instance_configs, output_port=7000, listen_address="0.0.0.0"):
         """
         Parameters
         ----------
@@ -29,10 +35,13 @@ class FederationIQRouter:
             Each dict: {"host": str, "instance_id": int, "iq_port": int}
         output_port : int
             TCP port for the unified output stream.
+        listen_address : str
+            Local address the unified output server binds to.
         """
         self.logger = logging.getLogger(__name__)
         self.instance_configs = instance_configs
         self.output_port = output_port
+        self.listen_address = listen_address
         self._stop_event = threading.Event()
         self._output_clients = []
         self._output_lock = threading.Lock()
@@ -74,7 +83,7 @@ class FederationIQRouter:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.settimeout(1.0)
         try:
-            server_sock.bind(("", self.output_port))
+            server_sock.bind((self.listen_address, self.output_port))
             server_sock.listen(5)
         except socket.error as e:
             self.logger.error("Failed to bind IQ router output on port %d: %s",
@@ -99,33 +108,48 @@ class FederationIQRouter:
         port = cfg["iq_port"]
         iid = cfg["instance_id"]
 
+        iq_hdr = IQHeader()
+
         while not self._stop_event.is_set():
             try:
                 sock = socket.create_connection((host, port), timeout=5.0)
-                # Send streaming command (iq_server expects this)
+                # Send streaming command (iq_server expects this); the server
+                # then sends the first frame and waits for an "IQDownload"
+                # request before each subsequent frame (stop-and-wait).
                 sock.sendall(b"streaming")
                 with self._stats_lock:
                     self._stats[iid]["connected"] = True
                 self.logger.info("IQ Router: connected to instance %d at %s:%d", iid, host, port)
 
+                first_frame = True
                 while not self._stop_event.is_set():
-                    # Read IQ header
+                    if not first_frame:
+                        sock.sendall(b"IQDownload")
+                    first_frame = False
+
+                    # Read and decode the IQ header (single source of truth
+                    # for field offsets: iq_header.py)
                     header = self._recv_exact(sock, IQ_HEADER_LENGTH)
                     if header is None:
                         break
 
-                    # Validate sync word (first 4 bytes, little-endian)
-                    sync = struct.unpack_from("<I", header, 0)[0]
-                    if sync != SYNC_WORD:
+                    try:
+                        iq_hdr.decode_header(header)
+                    except struct.error:
+                        self.logger.warning("IQ Router: undecodable header from instance %d", iid)
+                        break
+                    if iq_hdr.check_sync_word() != 0:
                         self.logger.warning("IQ Router: bad sync word from instance %d", iid)
                         break
 
-                    # Read payload size from header
-                    # cpi_length is at offset 36 (uint32), active_ant_chs at offset 20 (uint32)
-                    # payload = cpi_length * active_ant_chs * 2 (I+Q) * 4 (float32)
-                    active_chs = struct.unpack_from("<I", header, 20)[0]
-                    cpi_length = struct.unpack_from("<I", header, 36)[0]
-                    payload_size = active_chs * cpi_length * 2 * 4  # float32 I/Q
+                    # Payload size: cpi_length * channels * 2 (I+Q) * bytes/sample,
+                    # derived from sample_bit_depth (32 = cf32 decimated DATA,
+                    # 8 = raw uint8). Fall back to 32 bit for malformed depth.
+                    bit_depth = iq_hdr.sample_bit_depth
+                    if bit_depth not in (8, 16, 32, 64):
+                        bit_depth = 32
+                    payload_size = (iq_hdr.active_ant_chs * iq_hdr.cpi_length *
+                                    2 * bit_depth) // 8
 
                     payload = b""
                     if payload_size > 0:
@@ -133,7 +157,12 @@ class FederationIQRouter:
                         if payload is None:
                             break
 
-                    frame = header + payload
+                    # Tag the frame with the source instance via the header's
+                    # unit_id field before forwarding
+                    frame = (header[:_UNIT_ID_OFFSET] +
+                             struct.pack("<I", iid) +
+                             header[_UNIT_ID_OFFSET + 4:] +
+                             payload)
 
                     # Update stats
                     with self._stats_lock:

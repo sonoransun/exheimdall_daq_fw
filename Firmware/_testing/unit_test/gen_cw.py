@@ -41,8 +41,10 @@ import logging
 currentPath = os.path.dirname(os.path.realpath(__file__))
 rootPath = os.path.dirname(os.path.dirname(currentPath))
 sys.path.insert(0, os.path.join(rootPath, "_daq_core"))
+sys.path.insert(0, currentPath)
 from iq_header import IQHeader
 from shmemIface import outShmemIface
+from gen_utils import wait_consumer_done
 
 ####################################
 #           PARAMETERS 
@@ -173,9 +175,9 @@ try:
         signal_out[0::2] = signal_iqcf.real
         signal_out[1::2] = signal_iqcf.imag      
         
-        # Assembling payload
-        for m in range(M):                
-            payload_byte_array += pack('B'*N_daq*2, *signal_out)
+        # Assembling payload (tobytes() == pack('B'*N, *arr), much faster)
+        for m in range(M):
+            payload_byte_array += signal_out.tobytes()
         
         # Fill up header            
         iq_header.daq_block_index = b
@@ -193,11 +195,17 @@ try:
         if shmem_name != "":
             active_buffer_index = out_shmem_iface.wait_buff_free()
             logging.info("Buffer free: {:d}".format(active_buffer_index))
-            # Get the shared memory buffer
-            iq_frame_buffer_out = (out_shmem_iface.buffers[active_buffer_index]).view(dtype=np.uint8)
-            # Get the IQ sample array from the buffer
-            iq_samples_out = iq_frame_buffer_out[1024:1024+iq_header.cpi_length*2*iq_header.active_ant_chs].reshape(iq_header.active_ant_chs, iq_header.cpi_length*2)
-            if active_buffer_index !=3:
+            if active_buffer_index == -1:
+                logging.error("Consumer disappeared, stopping generator")
+                break
+            # Only dereference the buffer for a REAL index (the old code
+            # indexed buffers[] before the guard: a drop/terminate signal
+            # aliased buffers[-1] or raised IndexError)
+            if active_buffer_index in (0, 1):
+                # Get the shared memory buffer
+                iq_frame_buffer_out = (out_shmem_iface.buffers[active_buffer_index]).view(dtype=np.uint8)
+                # Get the IQ sample array from the buffer
+                iq_samples_out = iq_frame_buffer_out[1024:1024+iq_header.cpi_length*2*iq_header.active_ant_chs].reshape(iq_header.active_ant_chs, iq_header.cpi_length*2)
                 (out_shmem_iface.buffers[active_buffer_index])[0:1024] = np.frombuffer(iq_header.encode_header(), dtype=np.uint8)
                 for m in range(M):
                     iq_samples_out[m,0::2] = signal_iqcf[:].real
@@ -207,11 +215,11 @@ try:
             sys.stdout.buffer.write(iq_header.encode_header()) # Write the IQ header
             if (frame_type == IQHeader.FRAME_TYPE_DATA)  | (frame_type == IQHeader.FRAME_TYPE_CAL):
                 sys.stdout.buffer.write(payload_byte_array) # Write IQ data
-except:
-    logging.error("Unexpected error: {:s}".format(sys.exc_info()[0]))
+except Exception:
+    logging.exception("Unexpected error during frame generation")
 if shmem_name != "":
     out_shmem_iface.send_ctr_terminate()
-    time.sleep(2)
+    wait_consumer_done(out_shmem_iface)
     out_shmem_iface.destory_sm_buffer()
     logging.info("Total dropped frames: {:d}".format(out_shmem_iface.dropped_frame_cntr))
 logging.info("Standard frame generator exited")

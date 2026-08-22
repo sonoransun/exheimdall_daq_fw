@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import logging
+import socket
 import subprocess
 import sys
 from configparser import ConfigParser
-import numpy as np
 
 """
 	Checks the values in config ini file
@@ -26,7 +26,11 @@ def read_config_file(config_filename):
                     None: If internal error occured during the read of the configuration file
     """
     parser = ConfigParser()
-    found = parser.read([config_filename])
+    try:
+        found = parser.read([config_filename])
+    except Exception as e:
+        logging.error("Failed to parse configuration file: {0}".format(e))
+        return None
     if not found:
         logging.error("DAQ core configuration file not found.")
         return None
@@ -47,7 +51,11 @@ def chk_float(s):
         return False
 
 def count_receivers():
-    lsusb_cmd = subprocess.run(["lsusb"], capture_output=True, text=True)
+    try:
+        lsusb_cmd = subprocess.run(["lsusb"], capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        logging.warning("lsusb not available - cannot count receivers")
+        return 0
     lsusb_str = lsusb_cmd.stdout
     device_count = 0
     for line in lsusb_str.splitlines():
@@ -57,7 +65,11 @@ def count_receivers():
 def get_serials():
     serial_nos = []
     for ch_ind in range(5):
-        rtl_eeprom_cmd = subprocess.run(["rtl_eeprom", "-d", str(ch_ind)], capture_output=True, text=True)
+        try:
+            rtl_eeprom_cmd = subprocess.run(["rtl_eeprom", "-d", str(ch_ind)], capture_output=True, text=True)
+        except (FileNotFoundError, OSError):
+            logging.warning("rtl_eeprom not available - cannot read serial numbers")
+            return serial_nos
         response    = rtl_eeprom_cmd.stderr
         response_l  = response.split('\n')
         for line in response_l:
@@ -76,7 +88,9 @@ valid_bearing_modes = ['manual', 'fixed', 'external', 'scan_peak']
 # See: https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.get_window.html#scipy.signal.get_window
 
 def check_ini(parameters, en_hw_check=True):
-    device_count = count_receivers()
+    # ALL hardware probing (lsusb / rtl_eeprom) is gated on en_hw_check so that
+    # the 'no_hw' mode runs on systems without USB tooling or SDR hardware.
+    device_count = count_receivers() if en_hw_check else 0
     serials = get_serials() if en_hw_check else []
 
     error_list = []
@@ -169,6 +183,15 @@ def check_ini(parameters, en_hw_check=True):
         if en_hw_check and not int(daq_params['ctr_channel_serial_no']) in serials:
             error_list.append("Invalid control channel serial number. Available serial numbers: {0}, Currrently set:{1}".format(serials, daq_params['ctr_channel_serial_no']))
 
+    # Optional [daq] listen_address (bind address for the TCP/ZMQ listeners;
+    # absent means 0.0.0.0 - previous behavior)
+    listen_address = daq_params.get('listen_address')
+    if listen_address is not None:
+        try:
+            socket.inet_aton(listen_address.strip())
+        except (OSError, ValueError):
+            error_list.append("DAQ listen_address must be a valid IPv4 address (e.g. 0.0.0.0 or 127.0.0.1). Currently it is: '{0}' ".format(listen_address))
+
     """
     --------------------------------------
         | PRE PROCESSING | Parameter group
@@ -185,7 +208,7 @@ def check_ini(parameters, en_hw_check=True):
         if cpi_size <1:
             error_list.append("CPI size must be a positive integer. Currently it is: '{0}' ".format(preproc_params['cpi_size']))
     
-    decimation_raito = -1
+    decimation_ratio = -1
     if not chk_int(preproc_params['decimation_ratio']):
         error_list.append("Decimation ratio must be an integer. Currently it is: '{0}' ".format(preproc_params['decimation_ratio']))
     else:
@@ -214,7 +237,7 @@ def check_ini(parameters, en_hw_check=True):
         if not int(preproc_params['en_filter_reset']) in [0,1]:
             error_list.append("Filter reset enable must be 0 or 1. Currently it is: '{0}' ".format(preproc_params['en_filter_reset']))
 
-    if chk_int(preproc_params['fir_tap_size']) and chk_int(preproc_params['fir_tap_size']):
+    if chk_int(preproc_params['fir_tap_size']) and chk_int(preproc_params['decimation_ratio']):
         if int(preproc_params['fir_tap_size']) <= int(preproc_params['decimation_ratio']) and int(preproc_params['decimation_ratio']) !=1 :
             error_list.append("FIR tap size must be higher than the decimation ratio. Please consider increasing the tap size")
 
@@ -579,7 +602,7 @@ def check_ini(parameters, en_hw_check=True):
     if 'offload' in parameters:
         offload_params = parameters['offload']
         valid_transports = ['shm', 'spi', 'pcie', 'usb3', 'net']
-        valid_engines = ['auto', 'cpu_neon', 'cpu_kfr', 'fpga', 'gpu']
+        valid_engines = ['auto', 'cpu_neon', 'neon', 'cpu_kfr', 'kfr', 'cpu_generic', 'generic', 'fpga', 'gpu']
 
         for tkey in ['rebuffer_transport', 'decimator_transport', 'delay_sync_transport']:
             tval = offload_params.get(tkey, 'shm')
@@ -913,13 +936,28 @@ def check_ini(parameters, en_hw_check=True):
 
     return error_list
 
-if __name__ == "__main__":    
-    parameters = read_config_file('daq_chain_config.ini')
-    en_hw_check=True
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "no_hw":
-            en_hw_check=False
-    error_list = check_ini(parameters, en_hw_check)
+if __name__ == "__main__":
+    # CLI contract: python3 ini_checker.py [config_path] [no_hw]
+    #   exit 0 -> config valid, exit 1 -> errors found (or config unreadable)
+    #   'no_hw' skips ALL hardware probing (no lsusb / rtl_eeprom)
+    config_path = 'daq_chain_config.ini'
+    en_hw_check = True
+    for arg in sys.argv[1:]:
+        if arg == "no_hw":
+            en_hw_check = False
+        else:
+            config_path = arg
+    parameters = read_config_file(config_path)
+    if parameters is None:
+        logging.error("Unable to read configuration file: '{0}'".format(config_path))
+        sys.exit(1)
+    try:
+        error_list = check_ini(parameters, en_hw_check)
+    except KeyError as e:
+        logging.error("Mandatory configuration section/key missing: {0}".format(e))
+        sys.exit(1)
     if len(error_list):
         for e in error_list:
             logging.error(e)
+        sys.exit(1)
+    sys.exit(0)

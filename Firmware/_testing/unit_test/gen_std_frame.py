@@ -42,8 +42,10 @@ import threading
 currentPath = os.path.dirname(os.path.realpath(__file__))
 rootPath = os.path.dirname(os.path.dirname(currentPath))
 sys.path.insert(0, os.path.join(rootPath, "_daq_core"))
+sys.path.insert(0, currentPath)
 from iq_header import IQHeader
 from shmemIface import outShmemIface
+from gen_utils import wait_consumer_done
 
 class stdFrameGenator(threading.Thread):
 
@@ -93,21 +95,22 @@ class stdFrameGenator(threading.Thread):
    
 		# Uninitialzed header fields are all zero!
 
-	def run(self):		
+	def run(self):
 		if self.shmem_name != "":
 			self.out_shmem_iface = outShmemIface(self.shmem_name,
 										int(1024+self.N_daq*2*self.M*(self.iq_header.sample_bit_depth/8)),
 										drop_mode = False)
 			if not self.out_shmem_iface.init_ok:
 				self.logger.critical("Shared memory initialization failed, exiting..")
-				self.out_shmem_iface.destory_sm_buffer()				
+				self.out_shmem_iface.destory_sm_buffer()
+				return
 			else:
 				self.logger.info("Shared memory interface succesfully initialized")
-		
+
 		####################################
 		#            Simulation
 		####################################
-		
+
 		self.logger.info("Starting test frame generation")
 		# Allocation
 		if self.data_type == "CINT8":
@@ -115,36 +118,46 @@ class stdFrameGenator(threading.Thread):
 		elif self.data_type == "CF32":
 				signal = np.zeros((self.N_daq*2), dtype=np.float32) # This array stores the samples that are written to output
 
+		# ndarray.tobytes() is byte-identical to the historic
+		# pack('B'*N, *signal) but avoids a 500k-argument call per channel
 		payload_byte_array = bytearray()
 		for m in range(self.M):
-			if self.data_type == "CINT8":
-				payload_byte_array += pack('B'*self.N_daq*2, *signal)
-			elif self.data_type == "CF32":
-				payload_byte_array += pack('f'*self.N_daq*2, *signal)
+			payload_byte_array += signal.tobytes()
+		payload_np = np.frombuffer(bytes(payload_byte_array), dtype=np.uint8)
+		has_payload = (self.frame_type == IQHeader.FRAME_TYPE_DATA) or \
+					  (self.frame_type == IQHeader.FRAME_TYPE_CAL)
 		try:
-			for b in range(self.blocks):               
-				self.logger.info("Writing block: {:d}".format(b))        
+			for b in range(self.blocks):
+				self.logger.info("Writing block: {:d}".format(b))
 				self.iq_header.daq_block_index = b
 				self.iq_header.cpi_index = b
 				#######################################
 				#           SEND DATA FRAME
-				#######################################        
+				#######################################
 				if self.shmem_name != "":
 					active_buffer_index = self.out_shmem_iface.wait_buff_free()
 					self.logger.info("Buffer free: {:d}".format(active_buffer_index))
-					if active_buffer_index !=3:
-						(self.out_shmem_iface.buffers[active_buffer_index])[0:1024] = np.frombuffer(self.iq_header.encode_header(), dtype=np.uint8)
+					if active_buffer_index in (0, 1):
+						buffer = self.out_shmem_iface.buffers[active_buffer_index]
+						buffer[0:1024] = np.frombuffer(self.iq_header.encode_header(), dtype=np.uint8)
+						if has_payload:
+							# Deterministic payload so downstream payload
+							# assertions are possible (was: never written)
+							buffer[1024:1024+len(payload_np)] = payload_np
 						self.out_shmem_iface.send_ctr_buff_ready(active_buffer_index)
+					elif active_buffer_index == -1:
+						self.logger.error("Consumer disappeared, stopping generator")
+						break
 				else:
 					sys.stdout.buffer.write(self.iq_header.encode_header()) # Write the IQ header
-					if (self.frame_type == IQHeader.FRAME_TYPE_DATA)  | (self.frame_type == IQHeader.FRAME_TYPE_CAL):
+					if has_payload:
 						sys.stdout.buffer.write(payload_byte_array) # Write IQ data
-		except:
-			self.logger.error("Unexpected error: {:s}".format(sys.exc_info()[0]))
+		except Exception:
+			self.logger.exception("Unexpected error during frame generation")
 
 		if self.shmem_name != "":
 			self.out_shmem_iface.send_ctr_terminate()
-			time.sleep(2)
+			wait_consumer_done(self.out_shmem_iface)
 			self.out_shmem_iface.destory_sm_buffer()
 			self.logger.info("Total dropped frames: {:d}".format(self.out_shmem_iface.dropped_frame_cntr))
 		self.logger.info("Standard frame generator exited")

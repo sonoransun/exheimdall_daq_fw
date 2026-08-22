@@ -142,14 +142,16 @@ class SysLogEventHandler:
 class ZMQPubHandler:
     """Publishes events on a ZMQ PUB socket for external subscribers."""
 
-    def __init__(self, port=5003):
+    def __init__(self, port=5003, listen_address="*"):
         self._socket = None
         try:
             import zmq
             ctx = zmq.Context.instance()
             self._socket = ctx.socket(zmq.PUB)
-            self._socket.bind(f"tcp://*:{port}")
+            self._socket.bind(f"tcp://{listen_address}:{port}")
         except Exception:
+            logging.getLogger("heimdall.events").warning(
+                "ZMQ PUB handler unavailable", exc_info=True)
             self._socket = None
 
     def __call__(self, event):

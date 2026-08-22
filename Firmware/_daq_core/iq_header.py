@@ -1,4 +1,4 @@
-from struct import pack,unpack
+from struct import Struct, pack, unpack
 import logging
 import sys
 """
@@ -8,6 +8,21 @@ import sys
     Project: HeIMDALL DAQ Firmware
     Author: Tamás Pető
 """
+
+# Precompiled header codec (module level, built once - this runs per frame in
+# the delay_sync and hw_controller hot loops).
+# NOTE: The format uses NATIVE alignment on purpose: the C struct in
+# iq_header.h relies on implicit padding around the uint64 fields
+# (the explicit little-endian '<' variant would be 1016 bytes). Do not
+# add a byte-order prefix without adding explicit padding.
+HEADER_FORMAT = "II16sIIIQQQIQIIQIII" + "I"*32 + "IIII" + "I"*192 + "I"
+HEADER_STRUCT = Struct(HEADER_FORMAT)
+# Fail fast on exotic ABIs where native alignment diverges from the wire format
+assert HEADER_STRUCT.size == 1024, \
+    "IQ header ABI mismatch: native struct size is {:d}, expected 1024. " \
+    "This platform's alignment rules are incompatible with iq_header.h".format(HEADER_STRUCT.size)
+
+
 class IQHeader():
 
     FRAME_TYPE_DATA  = 0
@@ -32,12 +47,18 @@ class IQHeader():
     RSV_ANTENNA_EL_CDEG = 99   # antenna elevation, centi-deg (+9000 offset)
     RSV_ROTATOR_STATE = 100    # orientation controller state enum
     RSV_AGG_POWER_MDB = 101    # aggregate channel power, milli-dB (scan objective)
+    RSV_BUFFER_OVERRUN_CNT = 102 # cumulative USB ring-buffer overrun events since start
+                                 # (stamped by rtl_daq; 0 = none/unsupported)
 
     def __init__(self):
-        
+
         self.logger = logging.getLogger(__name__)
         self.header_size = 1024 # size in bytes
-        self.reserved_bytes = 192        
+        # Number of 32-bit reserved WORDS (192 words = 768 bytes). The historic
+        # attribute name 'reserved_bytes' is misleading but preserved for
+        # backward compatibility; 'reserved_words' is the accurate alias.
+        self.reserved_bytes = 192
+        self.reserved_words = 192
 
         self.sync_word=self.SYNC_WORD        # uint32_t        
         self.frame_type=0                    # uint32_t 
@@ -68,8 +89,8 @@ class IQHeader():
         """
             Unpack,decode and store the content of the iq header
         """
-        iq_header_list = unpack("II16sIIIQQQIQIIQIII"+"I"*32+"IIII"+"I"*self.reserved_bytes+"I", iq_header_byte_array)
-        
+        iq_header_list = HEADER_STRUCT.unpack(iq_header_byte_array)
+
         self.sync_word            = iq_header_list[0]
         self.frame_type           = iq_header_list[1]
         self.hardware_id          = iq_header_list[2].decode()
@@ -98,27 +119,19 @@ class IQHeader():
     def encode_header(self):
         """
             Pack the iq header information into a byte array
+            (single precompiled struct pack - runs once per frame)
         """
-        iq_header_byte_array=pack("II", self.sync_word, self.frame_type)
-        iq_header_byte_array+=self.hardware_id.encode()+bytearray(16-len(self.hardware_id.encode()))
-        iq_header_byte_array+=pack("IIIQQQIQIIQIII",
-                                self.unit_id, self.active_ant_chs, self.ioo_type, self.rf_center_freq, self.adc_sampling_freq,
-                                self.sampling_freq, self.cpi_length, self.time_stamp, self.daq_block_index, self.cpi_index, 
-                                self.ext_integration_cntr, self.data_type, self.sample_bit_depth, self.adc_overdrive_flags)
-        for m in range(32):
-            iq_header_byte_array+=pack("I", self.if_gains[m])
-
-        iq_header_byte_array+=pack("I", self.delay_sync_flag)
-        iq_header_byte_array+=pack("I", self.iq_sync_flag)
-        iq_header_byte_array+=pack("I", self.sync_state)
-        iq_header_byte_array+=pack("I", self.noise_source_state)
-
-        for m in range(self.reserved_bytes):
-            val = self.reserved[m] if m < len(self.reserved) else 0
-            iq_header_byte_array+=pack("I", int(val) & 0xFFFFFFFF)
-
-        iq_header_byte_array+=pack("I", self.header_version)
-        return iq_header_byte_array
+        fields = [self.sync_word, self.frame_type,
+                  self.hardware_id.encode(),  # '16s' zero-pads/truncates to 16 bytes
+                  self.unit_id, self.active_ant_chs, self.ioo_type, self.rf_center_freq, self.adc_sampling_freq,
+                  self.sampling_freq, self.cpi_length, self.time_stamp, self.daq_block_index, self.cpi_index,
+                  self.ext_integration_cntr, self.data_type, self.sample_bit_depth, self.adc_overdrive_flags]
+        fields += [self.if_gains[m] for m in range(32)]
+        fields += [self.delay_sync_flag, self.iq_sync_flag, self.sync_state, self.noise_source_state]
+        fields += [(int(self.reserved[m]) & 0xFFFFFFFF) if m < len(self.reserved) else 0
+                   for m in range(self.reserved_words)]
+        fields.append(self.header_version)
+        return HEADER_STRUCT.pack(*fields)
 
     def dump_header(self):
         """
@@ -150,28 +163,63 @@ class IQHeader():
         self.logger.info("Noise source state: {:d}".format(self.noise_source_state))
     
     # ---- v8 reserved-region accessors (RF front-end + orientation telemetry) ----
+    # Wire encoding: every slot is a uint32. Signed quantities (gains, NF,
+    # power, bearing) are stored two's-complement; the getters sign-extend so
+    # consumers see the original signed value. Setters are unchanged (mask).
+    @staticmethod
+    def _sx32(value):
+        """Sign-extend a uint32 reserved-slot value to a Python int."""
+        value = int(value) & 0xFFFFFFFF
+        return value - (1 << 32) if value >= (1 << 31) else value
+
     def _set_reserved_block(self, start, values):
         for i, v in enumerate(values):
-            if start + i < self.reserved_bytes:
+            if start + i < self.reserved_words:
                 self.reserved[start + i] = int(v) & 0xFFFFFFFF
+
+    def _get_reserved_block(self, start, count, signed=True):
+        vals = self.reserved[start:start + count]
+        if signed:
+            return [self._sx32(v) for v in vals]
+        return [int(v) & 0xFFFFFFFF for v in vals]
 
     def set_ext_lna_gains(self, gains_tenths):
         """External LNA gains, tenths of dB, per channel."""
         self._set_reserved_block(self.RSV_EXT_LNA_GAINS, gains_tenths)
 
+    def get_ext_lna_gains(self, num_ch=32):
+        """External LNA gains, tenths of dB (signed), per channel."""
+        return self._get_reserved_block(self.RSV_EXT_LNA_GAINS, num_ch)
+
     def set_total_system_gains(self, gains_tenths):
         """Total system gains, tenths of dB, per channel."""
         self._set_reserved_block(self.RSV_TOTAL_GAINS, gains_tenths)
+
+    def get_total_system_gains(self, num_ch=32):
+        """Total system gains, tenths of dB (signed), per channel."""
+        return self._get_reserved_block(self.RSV_TOTAL_GAINS, num_ch)
 
     def set_system_nf_mdb(self, nf_mdb):
         """System noise figure, milli-dB, per channel."""
         self._set_reserved_block(self.RSV_SYSTEM_NF_MDB, nf_mdb)
 
+    def get_system_nf_mdb(self, num_ch=32):
+        """System noise figure, milli-dB (signed), per channel."""
+        return self._get_reserved_block(self.RSV_SYSTEM_NF_MDB, num_ch)
+
     def set_compression_flags(self, flags):
         self.reserved[self.RSV_COMPRESSION_FLAGS] = int(flags) & 0xFFFFFFFF
 
+    def get_compression_flags(self):
+        """Per-channel compression bitmask (unsigned)."""
+        return int(self.reserved[self.RSV_COMPRESSION_FLAGS]) & 0xFFFFFFFF
+
     def set_bias_tee_state(self, flags):
         self.reserved[self.RSV_BIAS_TEE_STATE] = int(flags) & 0xFFFFFFFF
+
+    def get_bias_tee_state(self):
+        """Per-channel bias-tee bitmask (unsigned)."""
+        return int(self.reserved[self.RSV_BIAS_TEE_STATE]) & 0xFFFFFFFF
 
     def set_antenna_bearing(self, az_deg, el_deg):
         """Store antenna azimuth/elevation as centi-degrees (elevation +90 deg offset)."""
@@ -180,21 +228,30 @@ class IQHeader():
 
     def get_antenna_bearing(self):
         """Return (azimuth_deg, elevation_deg) decoded from the reserved slots."""
-        az = self.reserved[self.RSV_ANTENNA_AZ_CDEG] / 100.0
-        el = self.reserved[self.RSV_ANTENNA_EL_CDEG] / 100.0 - 90.0
+        az = self._sx32(self.reserved[self.RSV_ANTENNA_AZ_CDEG]) / 100.0
+        el = self._sx32(self.reserved[self.RSV_ANTENNA_EL_CDEG]) / 100.0 - 90.0
         return (az, el)
 
     def set_rotator_state(self, state):
         self.reserved[self.RSV_ROTATOR_STATE] = int(state) & 0xFFFFFFFF
 
     def get_rotator_state(self):
-        return self.reserved[self.RSV_ROTATOR_STATE]
+        return int(self.reserved[self.RSV_ROTATOR_STATE]) & 0xFFFFFFFF
 
     def set_aggregate_power_mdb(self, mdb):
         self.reserved[self.RSV_AGG_POWER_MDB] = int(mdb) & 0xFFFFFFFF
 
     def get_aggregate_power_mdb(self):
-        return self.reserved[self.RSV_AGG_POWER_MDB]
+        """Aggregate channel power, milli-dB (signed)."""
+        return self._sx32(self.reserved[self.RSV_AGG_POWER_MDB])
+
+    def set_buffer_overrun_cnt(self, count):
+        """Cumulative USB ring-buffer overrun events since start (stamped by rtl_daq)."""
+        self.reserved[self.RSV_BUFFER_OVERRUN_CNT] = int(count) & 0xFFFFFFFF
+
+    def get_buffer_overrun_cnt(self):
+        """Cumulative USB ring-buffer overrun count (unsigned; 0 = none/unsupported)."""
+        return int(self.reserved[self.RSV_BUFFER_OVERRUN_CNT]) & 0xFFFFFFFF
 
     def check_sync_word(self):
         """

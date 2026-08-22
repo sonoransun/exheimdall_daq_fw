@@ -26,10 +26,27 @@ from multiprocessing import shared_memory
 import numpy as np
 import os
 
+"""
+    Double-buffer ownership protocol (lockstep with the C side, sh_mem_util.c):
+
+    Two shared-memory segments per stream, named '<name>_A' / '<name>_B'.
+    Signaling runs over two named pipes in _data_control/:
+        fw_<name> : producer -> consumer (INIT_READY once at init, then
+                    A_BUFF_READY / B_BUFF_READY per filled buffer,
+                    TERMINATE on shutdown)
+        bw_<name> : consumer -> producer (A_BUFF_READY / B_BUFF_READY to
+                    hand a consumed buffer back)
+    Each signal is a single raw byte with the values below (wire protocol,
+    must not change). In drop mode the producer opens the backward FIFO
+    O_NONBLOCK and outShmemIface.wait_buff_free() returns the sentinel
+    BUFFER_DROPPED (3) when no buffer is free instead of blocking.
+"""
 A_BUFF_READY =   1
 B_BUFF_READY =   2
 INIT_READY   =  10
 TERMINATE    = 255
+
+BUFFER_DROPPED = 3  # wait_buff_free() sentinel: frame dropped (drop mode only)
 
 class outShmemIface():
 
@@ -95,21 +112,31 @@ class outShmemIface():
             self.init_ok = False
 
         if self.init_ok:
-            os.write(self.fw_ctr_fifo, pack('B', INIT_READY))
+            try:
+                os.write(self.fw_ctr_fifo, pack('B', INIT_READY))
+            except OSError as err:
+                self.logger.critical("Failed to send INIT_READY (peer dead?): %s", err)
+                self.init_ok = False
 
         atexit.register(self.destory_sm_buffer)
 
     def send_ctr_buff_ready(self, active_buffer_index):
-        if active_buffer_index == 0:
-            os.write(self.fw_ctr_fifo, pack('B', A_BUFF_READY))
-        elif active_buffer_index == 1:
-            os.write(self.fw_ctr_fifo, pack('B', B_BUFF_READY))
+        try:
+            if active_buffer_index == 0:
+                os.write(self.fw_ctr_fifo, pack('B', A_BUFF_READY))
+            elif active_buffer_index == 1:
+                os.write(self.fw_ctr_fifo, pack('B', B_BUFF_READY))
+        except OSError as err:  # incl. BrokenPipeError: consumer has exited
+            self.logger.warning("Buffer-ready signal failed (peer dead?): %s", err)
 
         self.buffer_free[active_buffer_index] = False
 
     def send_ctr_terminate(self):
-        os.write(self.fw_ctr_fifo, pack('B', TERMINATE))
-        self.logger.info("Terminate signal sent")
+        try:
+            os.write(self.fw_ctr_fifo, pack('B', TERMINATE))
+            self.logger.info("Terminate signal sent")
+        except OSError as err:  # consumer already gone - not an error at shutdown
+            self.logger.info("Terminate signal not sent (peer already exited): %s", err)
 
     def destory_sm_buffer(self):
         if self._destroyed:
@@ -136,6 +163,9 @@ class outShmemIface():
         else:
             try:
                 buffer = os.read(self.bw_ctr_fifo, 1)
+                if not buffer:  # EOF: consumer closed its end
+                    self.logger.warning("Backward FIFO EOF (consumer exited)")
+                    return -1
                 signal = unpack('B', buffer)[0]
 
                 if signal == A_BUFF_READY:
@@ -150,8 +180,10 @@ class outShmemIface():
                     self.logger.warning(
                         "Dropping frame.. Total: [%d]",
                         self.dropped_frame_cntr)
-            return 3
-        return -1
+            except OSError as err:
+                self.logger.warning("Backward FIFO read failed: %s", err)
+                return -1
+            return BUFFER_DROPPED
 
 
 class inShmemIface():
@@ -191,7 +223,15 @@ class inShmemIface():
             self.init_ok = False
 
         if self.fw_ctr_fifo is not None:
-            if unpack('B', os.read(self.fw_ctr_fifo, 1))[0] == INIT_READY:
+            try:
+                init_byte = os.read(self.fw_ctr_fifo, 1)
+            except OSError as err:
+                self.logger.critical("Forward FIFO read failed during init: %s", err)
+                init_byte = b''
+            if len(init_byte) != 1:  # EOF: producer exited before init
+                self.logger.critical("Producer closed the forward FIFO before INIT_READY")
+                self.init_ok = False
+            elif unpack('B', init_byte)[0] == INIT_READY:
                 self.memories.append(
                     shared_memory.SharedMemory(name=shmem_name + '_A'))
                 self.memories.append(
@@ -208,10 +248,13 @@ class inShmemIface():
         atexit.register(self.destory_sm_buffer)
 
     def send_ctr_buff_ready(self, active_buffer_index):
-        if active_buffer_index == 0:
-            os.write(self.bw_ctr_fifo, pack('B', A_BUFF_READY))
-        elif active_buffer_index == 1:
-            os.write(self.bw_ctr_fifo, pack('B', B_BUFF_READY))
+        try:
+            if active_buffer_index == 0:
+                os.write(self.bw_ctr_fifo, pack('B', A_BUFF_READY))
+            elif active_buffer_index == 1:
+                os.write(self.bw_ctr_fifo, pack('B', B_BUFF_READY))
+        except OSError as err:  # incl. BrokenPipeError: producer has exited
+            self.logger.warning("Buffer-free signal failed (peer dead?): %s", err)
 
     def destory_sm_buffer(self):
         if self._destroyed:
@@ -234,7 +277,15 @@ class inShmemIface():
                 self.logger.warning("SHM read timeout (%d ms)", self._read_timeout_ms)
                 return -2
 
-        signal = unpack('B', os.read(self.fw_ctr_fifo, 1))[0]
+        try:
+            signal_byte = os.read(self.fw_ctr_fifo, 1)
+        except OSError as err:
+            self.logger.warning("Forward FIFO read failed: %s", err)
+            return -1
+        if not signal_byte:  # EOF: producer closed without TERMINATE
+            self.logger.warning("Forward FIFO EOF (producer exited)")
+            return -1
+        signal = unpack('B', signal_byte)[0]
         if signal == A_BUFF_READY:
             return 0
         elif signal == B_BUFF_READY:

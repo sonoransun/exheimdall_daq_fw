@@ -55,19 +55,54 @@ def cmd_status(args):
 def _print_status(data, color_mode):
     health = data.get("pipeline_health", "unknown")
     hc = {"ok": "green", "degraded": "yellow", "error": "red"}.get(health, "reset")
+    # The status server publishes 'current_frequency_hz'; accept the legacy
+    # 'rf_center_freq' key too so older/newer combinations keep working.
+    freq = data.get("current_frequency_hz", data.get("rf_center_freq", 0))
     print(f"Pipeline: {colorize(health, hc, color_mode)}  "
           f"Sync: {data.get('sync_state', '?')}  "
-          f"Freq: {format_freq(data.get('rf_center_freq', 0))}  "
+          f"Freq: {format_freq(freq)}  "
           f"Uptime: {data.get('uptime_sec', 0):.0f}s")
+    cal = data.get("calibration_status")
+    if cal:
+        print(f"Calibration: {cal}  "
+              f"Aggregate power: {data.get('aggregate_power_db', 0):.1f} dB")
     lat = data.get("latency")
     if lat:
         print(f"Latency: avg={lat['avg_ms']:.1f}ms  p95={lat['p95_ms']:.1f}ms  max={lat['max_ms']:.1f}ms")
     tp = data.get("throughput")
     if tp:
         print(f"Throughput: avg={tp['avg_fps']:.1f}fps  max={tp['max_fps']:.1f}fps")
+    counters = data.get("counters")
+    if counters:
+        drops = (counters.get("dropped_frames_iq", 0) +
+                 counters.get("dropped_frames_hwc", 0))
+        recent = data.get("recent_drops")
+        line = f"Dropped frames (total): {drops}"
+        if recent is not None:
+            line += f"  (recent: {recent})"
+        print(line)
     gains = data.get("if_gains")
     if gains:
         print(f"Gains: {gains}")
+
+
+def _print_ctl_reply(reply, json_mode, ok_message="OK"):
+    """Render a parsed 128-byte control reply (contract: 'FNSD' + optional
+    NUL-padded JSON payload)."""
+    parsed = CtlClient.parse_reply(reply)
+    if json_mode:
+        print_json(parsed)
+        return
+    if not parsed.get("ok"):
+        print(f"Error: {parsed.get('error', 'bad reply')}")
+        return
+    data = parsed.get("data")
+    if data is not None:
+        print_json(data)
+    elif parsed.get("raw"):
+        print(parsed["raw"])
+    else:
+        print(ok_message)
 
 
 def cmd_tune(args):
@@ -98,6 +133,86 @@ def cmd_recal(args):
     ctl, _, _, _, _ = _make_clients(args)
     ctl.recal()
     print("Recalibration requested")
+
+
+def _parse_per_channel(parser, values_str, num_ch, scale=1.0, unified=None):
+    """Parse a comma-separated per-channel list, or fan out a unified value.
+
+    Errors out (argparse usage error) when the value count does not match the
+    channel count — the server unpacks a fixed num_ch values from the
+    NUL-padded payload, so missing channels would silently be set to 0 — or
+    when any value is negative (the wire format is unsigned uint32)."""
+    if unified is not None:
+        if float(unified) < 0:
+            parser.error("value must be >= 0 (wire format is unsigned): {}".format(unified))
+        return [int(round(float(unified) * scale))] * num_ch
+    values = [float(v) for v in values_str.split(",")]
+    if len(values) != num_ch:
+        parser.error("expected {:d} per-channel values, got {:d}: {}".format(
+            num_ch, len(values), values_str))
+    if any(v < 0 for v in values):
+        parser.error("values must be >= 0 (wire format is unsigned): {}".format(values_str))
+    return [int(round(v * scale)) for v in values]
+
+
+def cmd_lna_gain(args):
+    ctl, _, _, _, num_ch = _make_clients(args)
+    gains_tenths = _parse_per_channel(args._parser, args.values, num_ch, scale=10.0,
+                                      unified=args.unified)
+    reply = ctl.ext_gain(gains_tenths)
+    _print_ctl_reply(reply, args.json,
+                     "External LNA gains set: {} (dB x10)".format(gains_tenths))
+
+
+def cmd_bias_tee(args):
+    ctl, _, _, _, num_ch = _make_clients(args)
+    if args.all is not None:
+        states = [1 if args.all == "on" else 0] * num_ch
+    else:
+        states = [int(v) for v in args.values.split(",")]
+        if len(states) != num_ch:
+            args._parser.error("expected {:d} per-channel states, got {:d}: {}".format(
+                num_ch, len(states), args.values))
+        if any(s < 0 for s in states):
+            args._parser.error("states must be >= 0 (wire format is unsigned): {}".format(
+                args.values))
+    reply = ctl.bias_tee(states)
+    _print_ctl_reply(reply, args.json, "Bias-tee states set: {}".format(states))
+
+
+def cmd_bearing(args):
+    ctl, _, _, _, _ = _make_clients(args)
+    reply = ctl.bearing(args.azimuth, args.elevation)
+    _print_ctl_reply(reply, args.json,
+                     f"Bearing commanded: az={args.azimuth:.2f} el={args.elevation:.2f}")
+
+
+def cmd_park(args):
+    ctl, _, _, _, _ = _make_clients(args)
+    reply = ctl.park()
+    _print_ctl_reply(reply, args.json, "Antenna parked")
+
+
+def cmd_scan(args):
+    ctl, _, _, _, _ = _make_clients(args)
+    if args.action == "start":
+        reply = ctl.scan_start()
+        _print_ctl_reply(reply, args.json, "Scan-and-peak started")
+    else:
+        reply = ctl.orientation_stop()
+        _print_ctl_reply(reply, args.json, "Rotator motion stopped")
+
+
+def cmd_orientation(args):
+    ctl, _, _, _, _ = _make_clients(args)
+    reply = ctl.orientation_query()
+    _print_ctl_reply(reply, args.json, "(no orientation data)")
+
+
+def cmd_rf_budget(args):
+    ctl, _, _, _, _ = _make_clients(args)
+    reply = ctl.rf_query()
+    _print_ctl_reply(reply, args.json, "(no link-budget data)")
 
 
 def cmd_metrics(args):
@@ -195,7 +310,7 @@ def cmd_schedule(args):
         print("Schedule stopped")
     elif action == "query":
         reply = ctl.schedule_query()
-        print(reply)
+        _print_ctl_reply(reply, args.json, "(no schedule data)")
     elif action == "next":
         ctl.schedule_next()
         print("Skipped to next entry")
@@ -275,6 +390,39 @@ def main():
     p.add_argument("file", nargs="?", help="JSON schedule file (for load)")
     p.set_defaults(func=cmd_schedule)
 
+    p = sub.add_parser("lna-gain", help="Set external LNA gains (dB)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("values", nargs="?",
+                   help="Comma-separated per-channel gains in dB (e.g. 14.5,14.5,14.5,14.5,14.5)")
+    g.add_argument("--unified", type=float, help="Same gain (dB) for all channels")
+    p.set_defaults(func=cmd_lna_gain)
+
+    p = sub.add_parser("bias-tee", help="Set per-channel inline-LNA bias tees")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("values", nargs="?",
+                   help="Comma-separated per-channel states (e.g. 1,0,1,1,1)")
+    g.add_argument("--all", choices=["on", "off"], help="Same state for all channels")
+    p.set_defaults(func=cmd_bias_tee)
+
+    p = sub.add_parser("bearing", help="Slew the antenna to azimuth/elevation")
+    p.add_argument("azimuth", type=float, help="Azimuth in degrees")
+    p.add_argument("elevation", type=float, nargs="?", default=0.0,
+                   help="Elevation in degrees (default 0)")
+    p.set_defaults(func=cmd_bearing)
+
+    p = sub.add_parser("park", help="Park the antenna at its configured bearing")
+    p.set_defaults(func=cmd_park)
+
+    p = sub.add_parser("scan", help="Autonomous scan-and-peak control")
+    p.add_argument("action", choices=["start", "stop"])
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("orientation", help="Query rotator/orientation state")
+    p.set_defaults(func=cmd_orientation)
+
+    p = sub.add_parser("rf-budget", help="Query the RF link budget")
+    p.set_defaults(func=cmd_rf_budget)
+
     p = sub.add_parser("config-show", help="Display resolved configuration")
     p.set_defaults(func=cmd_config_show)
 
@@ -282,6 +430,7 @@ def main():
     if not args.command:
         parser.print_help()
         return
+    args._parser = parser  # for usage errors raised inside command handlers
     args.func(args)
 
 

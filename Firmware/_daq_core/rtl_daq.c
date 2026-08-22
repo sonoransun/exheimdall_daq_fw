@@ -31,6 +31,8 @@
  *  Eg: When the buffer_size has a value of 2**18, then 2**17 IQ sample is actually downloaded per channel
  */
 
+#define _GNU_SOURCE /* F_SETPIPE_SZ */
+
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -43,8 +45,10 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/time.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <zmq.h>
 
 #include "ini.h"
@@ -52,6 +56,7 @@
 #include "rtl-sdr.h"
 #include "rtl_daq.h"
 #include "iq_header.h"
+#include "sh_mem_util.h" /* compute_port() - NOTE: sh_mem_util.o must be on the rtl_daq link line */
 
 #ifdef USEPIGPIO
 #include <pigpio.h>
@@ -160,9 +165,10 @@ static int handler(void* conf_struct, const char* section, const char* name,
         {pconfig->instance_id = atoi(value);}
     else if (MATCH("federation", "port_stride"))
         {pconfig->port_stride = atoi(value);}
-    else
-        {return 0;}  /* unknown section/name, error */
-    return 0;
+    /* Unknown sections/keys are accepted (non-fatal): always return 1 so
+     * ini_parse() reports 0 on success and callers can treat a positive
+     * return value (malformed line) as a warning only. */
+    return 1;
 }
 
 static void shutdown_handler(int sig)
@@ -235,20 +241,76 @@ void * fifo_read_tf(void* arg)
         log_info("IM Request from: %d",msg->source_module_identifier);
         log_info("Command id: %c",msg->command_identifier);
         
-        pthread_mutex_lock(&buff_ind_mutex);   // New command is received, acquiring the mutex 
-        
-        /* Tuner reconfiguration request */
+        /* Log the request BEFORE taking buff_ind_mutex: log_log() performs
+         * blocking file-backed I/O (stderr is redirected to a log file by the
+         * start script) and every SCHED_FIFO USB completion callback contends
+         * on this mutex, so no I/O may run while it is held. msg is private
+         * to this thread, so it is safe to inspect outside the mutex. */
         if( msg->command_identifier == 'r')
         {
-            log_info("Signal 'r': Reconfiguring the tuner");            
             uint32_t * parameters = (uint32_t * ) msg->parameters;
-            
+            log_info("Signal 'r': Reconfiguring the tuner");
             log_info("Center freq: %u MHz", ((unsigned int) parameters[0]/1000000));
             log_info("Sample rate: %u MSps", ((unsigned int) parameters[1]/1000000));
             log_info("Gain: %d dB",(parameters[2]/10));
-            
+        }
+        else if (msg->command_identifier == 'c')
+        {
+            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            log_info("Signal 'c': Center frequency tuning request");
+            log_info("New center frequency: %u MHz", ((unsigned int) parameters[0]/1000000));
+        }
+        else if( msg->command_identifier == 'g')
+        {
+            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            log_info("Signal 'g': Gain tuning request");
+            for(int i=0;i<ch_no;i++){
+                log_info("Channel: %d, Gain: %f dB",i, (float) parameters[i]/10);
+            }
+        }
+        else if( msg->command_identifier == 'a')
+        {
+            log_info("Signal 'a': enable AGC request");
+        }
+        else if( msg->command_identifier == 's')
+        {
+            float * parameters = (float * ) msg->parameters;
+            log_info("Signal 's': Sampling frequency correction");
+            for(int i=0;i<ch_no;i++){
+                log_info("Channel: %d, fs ppm offset: %.8f",i, parameters[i]);
+            }
+        }
+        else if (msg->command_identifier == 'n')
+        {
+            //log_warn("Control noise source feature is implemented only for KerberosSDR/KrakenSDR");
+            if(msg->parameters[0] == 0)
+                {log_info("Turn off noise source");}
+            else
+                {log_info("Turn on noise source");}
+        }
+        else if (msg->command_identifier == 'b')
+        {
+            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            log_info("Signal 'b': runtime bias-tee switch request");
+            for(int i=0;i<ch_no;i++){
+                log_info("Channel: %d, bias-tee: %d", i, parameters[i] ? 1 : 0);
+            }
+        }
+        else if(msg->command_identifier == 'h')
+        {
+            log_info("Signal 2: FIFO read thread exiting \n");
+        }
+
+        /* Publish the request to the main thread. This critical section is
+         * kept free of any blocking I/O (no logging, no zmq_send). */
+        pthread_mutex_lock(&buff_ind_mutex);
+
+        /* Tuner reconfiguration request */
+        if( msg->command_identifier == 'r')
+        {
+            uint32_t * parameters = (uint32_t * ) msg->parameters;
             for(int i=0; i<ch_no; i++)
-            {              
+            {
               rtl_receivers[i].gain = (int) parameters[2];
               rtl_receivers[i].center_freq = parameters[0];
               rtl_receivers[i].sample_rate = parameters[1];
@@ -258,37 +320,30 @@ void * fifo_read_tf(void* arg)
         /* Center Frequency Tuning */
         else if (msg->command_identifier == 'c')
         {
-            log_info("Signal 'c': Center frequency tuning request");            
-            uint32_t * parameters = (uint32_t * ) msg->parameters;            
+            uint32_t * parameters = (uint32_t * ) msg->parameters;
             new_center_freq = parameters[0];
             center_freq_change_flag = 1;
-            log_info("New center frequency: %u MHz", ((unsigned int) parameters[0]/1000000));
         }
         /* Gain tuning*/
         else if( msg->command_identifier == 'g')
         {
-            log_info("Signal 'g': Gain tuning request");
             uint32_t * parameters = (uint32_t * ) msg->parameters;
             for(int i=0;i<ch_no;i++){
                 new_gains[i] = (int) parameters[i];
-                log_info("Channel: %d, Gain: %f dB",i, (float) parameters[i]/10);
             }
             gain_change_flag=1;
         }
         /* Enable AGC */
         else if( msg->command_identifier == 'a')
         {
-            log_info("Signal 'a': enable AGC request");
             agc_change_flag = 1;
         }
         /* Sampling Freq Correction - Used for sampling clock delay tuning*/
         else if( msg->command_identifier == 's')
         {
-            log_info("Signal 's': Sampling frequency correction");
             float * parameters = (float * ) msg->parameters;
             for(int i=0;i<ch_no;i++){
                 new_fs_corrections[i] = parameters[i];
-                log_info("Channel: %d, fs ppm offset: %.8f",i, parameters[i]);
             }
             fs_reset_cntr = 0;
             fs_correction_flag=1;
@@ -296,41 +351,34 @@ void * fifo_read_tf(void* arg)
         /* Noise source switch requests */
         else if (msg->command_identifier == 'n')
         {
-            //log_warn("Control noise source feature is implemented only for KerberosSDR/KrakenSDR");
-            if(msg->parameters[0] == 0)
-            {
-                log_info("Turn off noise source");
-                noise_source_state = 0;          
-            }
-            else{
-                log_info("Turn on noise source");
-                noise_source_state = 1;
-            }            
+            noise_source_state = (msg->parameters[0] == 0) ? 0 : 1;
         }
         /* Runtime inline-LNA bias-tee switch request */
         else if (msg->command_identifier == 'b')
         {
-            log_info("Signal 'b': runtime bias-tee switch request");
             uint32_t * parameters = (uint32_t * ) msg->parameters;
             for(int i=0;i<ch_no;i++){
                 new_bias_states[i] = parameters[i] ? 1 : 0;
-                log_info("Channel: %d, bias-tee: %d", i, new_bias_states[i]);
             }
             bias_change_flag = 1;
         }
         /* System halt request */
         else if(msg->command_identifier == 'h')
         {
-            log_info("Signal 2: FIFO read thread exiting \n");
             exit_flag = 1;
         }
         /* Send out dummy frames while the changes takes effect*/
-        en_dummy_frame = 1; 
+        en_dummy_frame = 1;
         dummy_frame_cntr = 0;
-        zmq_send (responder, "ok", 2, 0);
 
         pthread_cond_signal(&buff_ind_cond);
         pthread_mutex_unlock(&buff_ind_mutex);
+
+        /* Reply after releasing the mutex: the REQ/REP pair is in lockstep on
+         * this thread (recv follows this send), so replying after the signal
+         * cannot reorder commands, and a blocking zmq_send no longer stalls
+         * the USB callbacks contending on buff_ind_mutex. */
+        zmq_send (responder, "ok", 2, 0);
     }
     free(msg);
     zmq_close(responder);
@@ -357,17 +405,82 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx)
  * 
  *       
  */
-{     
+{
     struct rtl_rec_struct *rtl_rec = (struct rtl_rec_struct *) ctx;// Set the receiver's structure
-  
-    int wr_buff_ind = rtl_rec->buff_ind % NUM_BUFF; // Calculate current buffer index in the circular buffer 
-    memcpy(rtl_rec->buffer + buffer_size * wr_buff_ind, buf, len);    
-    
-    log_debug("Read at device:%d, buff index:%llu, write index:%d",rtl_rec->dev_ind, rtl_rec->buff_ind, wr_buff_ind);
-    rtl_rec->buff_ind++;
 
-    /* Signal to the main thread that new data is ready */
+    int wr_buff_ind = (int)(rtl_rec->buff_ind % NUM_BUFF); // Calculate current buffer index in the circular buffer
+
+    /* Guard against short (or oversized) USB transfers: publishing a partially
+     * filled slot would silently break multichannel coherence. Copy what
+     * arrived, zero-fill the stale tail and warn. */
+    if (len != buffer_size)
+    {
+        uint32_t copy_len = (len < buffer_size) ? len : buffer_size;
+        memcpy(rtl_rec->buffer + (size_t)buffer_size * wr_buff_ind, buf, copy_len);
+        if (copy_len < buffer_size)
+            memset(rtl_rec->buffer + (size_t)buffer_size * wr_buff_ind + copy_len, 0, buffer_size - copy_len);
+        log_warn("Unexpected USB transfer length on device %d: %u bytes instead of %u, tail zero-filled",
+                 rtl_rec->dev_ind, len, buffer_size);
+    }
+    else
+    {
+        memcpy(rtl_rec->buffer + (size_t)buffer_size * wr_buff_ind, buf, buffer_size);
+    }
+
+#ifndef NDEBUG
+    log_debug("Read at device:%d, buff index:%llu, write index:%d",rtl_rec->dev_ind, rtl_rec->buff_ind, wr_buff_ind);
+#endif
+
+    /* Publish the buffer and signal the main thread that new data is ready.
+     * The mutex makes the 64-bit index update visible/atomic for the main
+     * thread and guarantees the wakeup is not lost; keep this section short. */
+    pthread_mutex_lock(&buff_ind_mutex);
+    rtl_rec->buff_ind++;
     pthread_cond_signal(&buff_ind_cond);
+    pthread_mutex_unlock(&buff_ind_mutex);
+}
+
+static int write_full_iov(int fd, struct iovec *iov, int iovcnt)
+/*
+ * Writes all bytes described by the iovec array to fd, handling partial
+ * writes and EINTR (signal handlers are installed without SA_RESTART).
+ * The iovec array is modified in place. Returns 0 on success, -1 on error
+ * or when exit_flag is raised while interrupted.
+ */
+{
+    size_t remaining = 0;
+    for (int k = 0; k < iovcnt; k++)
+        remaining += iov[k].iov_len;
+    while (remaining > 0)
+    {
+        ssize_t written = writev(fd, iov, iovcnt);
+        if (written < 0)
+        {
+            if (errno == EINTR)
+            {
+                if (exit_flag) {return -1;}
+                continue;
+            }
+            return -1;
+        }
+        remaining -= (size_t)written;
+        while (written > 0 && iovcnt > 0)
+        {
+            if ((size_t)written >= iov[0].iov_len)
+            {
+                written -= (ssize_t)iov[0].iov_len;
+                iov++;
+                iovcnt--;
+            }
+            else
+            {
+                iov[0].iov_base = (char*)iov[0].iov_base + written;
+                iov[0].iov_len -= (size_t)written;
+                written = 0;
+            }
+        }
+    }
+    return 0;
 }
 
 void *read_thread_entry(void *arg)
@@ -496,6 +609,7 @@ int init_rt_memory(void) {
 int main( int argc, char** argv )
 {
     log_set_level(LOG_TRACE);
+    log_use_default_lock(); /* rtl_daq logs from the USB reader threads, the ZMQ thread and main */
     install_signal_handlers();
 
     // Initialize real-time memory management
@@ -504,7 +618,7 @@ int main( int argc, char** argv )
     }
 
     configuration config;
-    config.instance_id = 0;
+    memset(&config, 0, sizeof(config));
     config.port_stride = 100;
 
     #ifdef USEPIGPIO
@@ -522,26 +636,59 @@ int main( int argc, char** argv )
     #endif
 
     /* Set parameters from the config file*/
-    if (ini_parse(INI_FNAME, handler, &config) < 0) 
+    int ini_status = ini_parse(INI_FNAME, handler, &config);
+    if (ini_status < 0)
     {
         log_fatal("Configuration could not be loaded, exiting ..");
         return -1;
-    }   
+    }
+    else if (ini_status > 0)
+    {
+        log_warn("Config file %s has a parse error at line %d, continuing with parsed values", INI_FNAME, ini_status);
+    }
+    if (config.num_ch < 1 || config.num_ch > 32)
+    {
+        log_fatal("Invalid or missing channel number in configuration: %d", config.num_ch);
+        return -1;
+    }
+    if (config.daq_buffer_size < 1)
+    {
+        log_fatal("Invalid or missing daq_buffer_size in configuration: %d", config.daq_buffer_size);
+        return -1;
+    }
     buffer_size = config.daq_buffer_size*2;
     ch_no = config.num_ch;
     rtl_daq_zmq_port = compute_port(1130, config.instance_id, config.port_stride);
-    
+
     log_set_level(config.log_level);
-    /* -> Parse bias tree config */
-    int en_bias_tee[ch_no];
-    char * en_bias_ch_i_str = strtok(config.en_bias_tee_str, ",");    
-    int i = 0;    
-    while( en_bias_ch_i_str != NULL ) 
+
+#ifdef F_SETPIPE_SZ
+    /* Best effort: enlarge the stdout pipe towards the rebuffer module so a
+     * whole IQ frame fits without extra wakeups. Non-fatal on failure. */
     {
-      en_bias_tee[i] = atoi(en_bias_ch_i_str);      
-      en_bias_ch_i_str = strtok(NULL, ",");
-      i++;      
-    }    
+        long desired_pipe_size = (long)buffer_size * ch_no + IQ_HEADER_LENGTH;
+        if (fcntl(STDOUT_FILENO, F_SETPIPE_SZ, (int)desired_pipe_size) < 0 &&
+            fcntl(STDOUT_FILENO, F_SETPIPE_SZ, 1048576) < 0)
+        {
+            log_warn("Could not enlarge stdout pipe: %s - continuing with default pipe size", strerror(errno));
+        }
+    }
+#endif
+
+    /* -> Parse bias tee config (missing/short lists default to disabled) */
+    int en_bias_tee[ch_no];
+    memset(en_bias_tee, 0, sizeof(en_bias_tee));
+    if (config.en_bias_tee_str != NULL)
+    {
+        char * en_bias_ch_i_str = strtok(config.en_bias_tee_str, ",");
+        int i = 0;
+        while( en_bias_ch_i_str != NULL && i < ch_no )
+        {
+            en_bias_tee[i] = atoi(en_bias_ch_i_str);
+            en_bias_ch_i_str = strtok(NULL, ",");
+            i++;
+        }
+    }
     log_info("Config succesfully loaded from %s",INI_FNAME);
     log_info("Channel number: %d", ch_no);
     log_info("Number of IQ samples per channel: %d", buffer_size/2);    
@@ -607,7 +754,10 @@ int main( int argc, char** argv )
     /* Fill up the static fields of the IQ header */    
 	iq_header->sync_word = SYNC_WORD;
     iq_header->header_version = IQ_HEADER_VERSION;
-	strcpy(iq_header->hardware_id, config.hw_name);
+	/* hardware_id is a 16-byte wire-ABI field: truncate and keep it NUL-padded
+	 * (the header was calloc'd and strncpy pads the remainder with NULs) */
+	strncpy(iq_header->hardware_id, config.hw_name ? config.hw_name : "",
+	        sizeof(iq_header->hardware_id)-1);
 	iq_header->unit_id=config.hw_unit_id;
 	iq_header->active_ant_chs=ch_no;
 	iq_header->ioo_type=config.ioo_type;
@@ -672,20 +822,26 @@ int main( int argc, char** argv )
 
     unsigned long long read_buff_ind = 0;
     int data_ready = 1;
-    int rd_buff_ind = 1;
+    int rd_buff_ind = 0;
     uint8_t overdrive_flags=0;
+    uint32_t overrun_cntr = 0; /* Cumulative USB ring-buffer overrun events, stamped into reserved[IQH_RSV_BUFFER_OVERRUN_CNT] */
     struct rtl_rec_struct *rtl_rec;
     /*
      *
      * ---> Main data acquistion loop <---
      *
+     * buff_ind_mutex is held while evaluating the per-channel buffer indexes
+     * (they are written by the USB reader threads under the same mutex) and is
+     * released for the frame emission / tuner control work. The condvar wait
+     * keeps the 250 ms timeout purely as a safety net against missed wakeups.
      */
+    pthread_mutex_lock(&buff_ind_mutex);
     while( !exit_flag )
-    {   
+    {
         /* We are checking here the current buffer indexes of the reader threads.
          * All the reader threads should reach the same index before we could send out the data,
          * and we could coninue the acquisition.
-        */        
+        */
         {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -695,24 +851,58 @@ int main( int argc, char** argv )
         }
         if (exit_flag) break;
         data_ready = 1;
+        int overrun_detected = 0;
+        int race_detected = 0;
+        unsigned long long race_buff_ind = 0;
         for(int i=0; i<ch_no; i++)
         {
             rtl_rec = &rtl_receivers[i];
             if (rtl_rec->buff_ind <= read_buff_ind)
-            {data_ready = 0; break;}      
-        
+            {data_ready = 0; break;}
+
             if((rtl_rec->buff_ind - read_buff_ind) >= NUM_BUFF)
-            {log_warn("Circular buffer may overrun. Consider increasing the number of buffers. RTL Buff index: %d, read_buff_ind: %d", rtl_rec->buff_ind, read_buff_ind);}
-            if(rtl_rec->buff_ind % NUM_BUFF == read_buff_ind % NUM_BUFF) 
-            { 
-                log_warn("Likely race condition. Skipping data aquicision. RTL Buff index: %d, read_buff_ind: %d", rtl_rec->buff_ind, read_buff_ind);           
+            {overrun_detected = 1;}
+            if(rtl_rec->buff_ind % NUM_BUFF == read_buff_ind % NUM_BUFF)
+            {
+                /* Record the fact only; logging is blocking file I/O and must
+                 * not run under buff_ind_mutex (every SCHED_FIFO USB callback
+                 * contends on it). */
+                race_detected = 1;
+                race_buff_ind = rtl_rec->buff_ind;
                 data_ready = 0;
                 break;
             }
         }
-                         
+        if (race_detected)
+        {
+            /* Log outside the critical section. The reader indexes only grow
+             * and are re-evaluated on every iteration, so a wakeup signalled
+             * during the unlocked window is at worst deferred to the 250 ms
+             * condvar timeout - the same bound as during frame emission. */
+            pthread_mutex_unlock(&buff_ind_mutex);
+            log_warn("Likely race condition. Skipping data aquicision. RTL Buff index: %llu, read_buff_ind: %llu", race_buff_ind, read_buff_ind);
+            pthread_mutex_lock(&buff_ind_mutex);
+        }
+
         if (data_ready == 1)
         {
+            pthread_mutex_unlock(&buff_ind_mutex);
+            if (overrun_detected)
+            {
+                /* The reader threads lapped the main loop in the NUM_BUFF-slot
+                 * ring: unread transfers were overwritten, so channel data in
+                 * this frame may come from different USB epochs (coherence not
+                 * guaranteed). Detection only - the frame is still emitted with
+                 * its regular daq_block_index; downstream can key off the
+                 * header counter. Counted once per EMITTED frame while lagged,
+                 * not per condvar wakeup, so the header delta reflects the
+                 * number of frames actually affected. */
+                overrun_cntr++;
+                if (overrun_cntr <= 5 || (overrun_cntr % 100) == 0)
+                    log_warn("USB ring-buffer overrun (affected frame #%u): reader lag reached %d transfers."
+                             " Channel coherence is not guaranteed. Consider increasing the number of buffers.",
+                             overrun_cntr, NUM_BUFF);
+            }
             /*
              *---------------------
              *  Complete IQ header 
@@ -725,20 +915,20 @@ int main( int argc, char** argv )
             log_debug("Timestamp: %llu", time_stamp_ms);
             iq_header->time_stamp = time_stamp_ms;
             iq_header->daq_block_index = (uint32_t) read_buff_ind;
+            iq_header->reserved[IQH_RSV_BUFFER_OVERRUN_CNT] = overrun_cntr;
+            /* Buffer slot of the frame that is being sent out in this iteration */
+            rd_buff_ind = (int)(read_buff_ind % NUM_BUFF);
             for(int i=0; i<ch_no; i++)
             {
-                rtl_rec = &rtl_receivers[i];                
+                rtl_rec = &rtl_receivers[i];
                 // Set center frequncy value
-                iq_header->rf_center_freq = (uint64_t) rtl_rec->center_freq;                
-                // Set gain value                
-                iq_header->if_gains[i] = (uint32_t) rtl_rec->gain;                
-                // Check overdrive
-                for(int n=0; n<buffer_size; n++)
-                {
-                    if( *(rtl_rec->buffer+buffer_size*rd_buff_ind + n) == 255)
-                        overdrive_flags |= 1<<i;
-                }
-            }             
+                iq_header->rf_center_freq = (uint64_t) rtl_rec->center_freq;
+                // Set gain value
+                iq_header->if_gains[i] = (uint32_t) rtl_rec->gain;
+                // Check overdrive (memchr stops at the first saturated sample)
+                if (memchr(rtl_rec->buffer + (size_t)buffer_size * rd_buff_ind, 255, buffer_size) != NULL)
+                    overdrive_flags |= 1<<i;
+            }
             iq_header->adc_overdrive_flags = (uint32_t) overdrive_flags;
             iq_header->noise_source_state = (uint32_t) noise_source_state;
             // Set frame type in the header
@@ -761,29 +951,39 @@ int main( int argc, char** argv )
                     iq_header->frame_type=FRAME_TYPE_DATA;                    
                 }
             }
-            /* Sending IQ header */
-            fwrite(iq_header, sizeof(struct iq_header_struct), 1, stdout);   
-            
             /*
-            *-------------------
-            *  Complete IQ data
-            *-------------------
+            *----------------------------------------------------
+            *  Send IQ header + payload in a single coalesced write
+            *----------------------------------------------------
             */
-
-            /* Sending out the so far acquired data */            
-            if(en_dummy_frame == 0) // DATA or CAL frame
-            {            
-                for(int i=0; i<ch_no; i++)
-                {                
-                    rtl_rec = &rtl_receivers[i];
-                    rd_buff_ind = read_buff_ind % NUM_BUFF;                                              
-                    fwrite(rtl_rec->buffer + buffer_size * rd_buff_ind, 1, buffer_size, stdout);                
+            {
+                struct iovec frame_iov[33]; /* 1 header + max 32 channels (ch_no validated <= 32) */
+                int iovcnt = 0;
+                frame_iov[iovcnt].iov_base = iq_header;
+                frame_iov[iovcnt].iov_len  = sizeof(struct iq_header_struct);
+                iovcnt++;
+                if(en_dummy_frame == 0) // DATA or CAL frame
+                {
+                    for(int i=0; i<ch_no; i++)
+                    {
+                        rtl_rec = &rtl_receivers[i];
+                        frame_iov[iovcnt].iov_base = rtl_rec->buffer + (size_t)buffer_size * rd_buff_ind;
+                        frame_iov[iovcnt].iov_len  = buffer_size;
+                        iovcnt++;
+                    }
+                }
+                if (write_full_iov(STDOUT_FILENO, frame_iov, iovcnt) != 0)
+                {
+                    if (!exit_flag)
+                    {
+                        log_fatal("IQ frame write failed: %s", strerror(errno));
+                        exit_flag = 1;
+                    }
                 }
             }
             if(overdrive_flags !=0)
                 log_warn("Overdrive detected, flags: 0x%02X", overdrive_flags);
 
-            fflush(stdout);
             overdrive_flags=0;
             read_buff_ind ++;
             if (en_dummy_frame)
@@ -972,35 +1172,36 @@ int main( int argc, char** argv )
                 */
             }
             last_noise_source_state = noise_source_state;
+            pthread_mutex_lock(&buff_ind_mutex);
         }
-    } 
-    log_info("Exiting..");  
+    }
+    /* Release the mutex before joining the reader threads - in-flight USB
+     * callbacks block on it and would deadlock the joins otherwise. */
+    pthread_mutex_unlock(&buff_ind_mutex);
+    log_info("Exiting..");
     for(int i=0; i<ch_no; i++)
-    {     
+    {
         struct rtl_rec_struct *rtl_rec = &rtl_receivers[i];
         if(rtlsdr_cancel_async(rtl_rec->dev) != 0)
         {
             log_fatal("Async read stop failed: %s", strerror(errno));
             return -1;
-        }        
+        }
         pthread_join(rtl_rec->async_read_thread, NULL);
         free(rtl_rec->buffer);
-
-        /* This does not work currently, TODO: Close the devices properly
         if(rtlsdr_close(rtl_rec->dev) != 0)
-        {
-            fprintf(stderr, "[ ERROR ]  Device close failed: %s\n", strerror(errno));
-            exit(1);
-        }
-        fprintf(stderr, "[ INFO ] Device closed with id:%d\n",i);
-        */
+            {log_warn("Device close failed, channel: %d: %s", i, strerror(errno));}
+        else
+            {log_info("Device closed, channel: %d", i);}
     }
-    pthread_mutex_unlock(&buff_ind_mutex);
     pthread_join(fifo_read_thread, NULL);
     free(iq_header);
     free(new_gains);
     free(new_fs_corrections);
+    free(new_bias_states);
     free(rtl_receivers);
+    free((char*)config.hw_name);
+    free(config.en_bias_tee_str);
     pthread_mutex_destroy(&buff_ind_mutex);
     pthread_cond_destroy(&buff_ind_cond);
     log_info("All the resources are free now");

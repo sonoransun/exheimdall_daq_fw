@@ -1,5 +1,17 @@
-/var/log/heimdall/*.log
-/opt/heimdall/Firmware/_logs/*.log {
+# Logrotate policy for the HeIMDALL DAQ firmware.
+#
+# The DAQ processes append to Firmware/_logs/*.log (instance 0) and
+# Firmware/_logs/instN/*.log (federation instances N>0) via stderr
+# redirection, so copytruncate is required - the processes keep their file
+# descriptors open for the lifetime of the chain.
+#
+# Install (assumes the firmware is deployed at /opt/heimdall, see
+# packaging/systemd/README.md):
+#   sudo cp packaging/logrotate/heimdall /etc/logrotate.d/heimdall
+# If the firmware lives elsewhere, adjust the paths below.
+
+/opt/heimdall/Firmware/_logs/*.log
+/opt/heimdall/Firmware/_logs/inst*/*.log {
     size 50M
     rotate 7
     copytruncate

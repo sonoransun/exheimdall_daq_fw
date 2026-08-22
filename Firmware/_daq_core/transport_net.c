@@ -5,6 +5,8 @@
  * Implements the transport_ops interface over TCP sockets.
  * Producer operates as a TCP server; consumer connects as a client.
  * Frame protocol: [LEN_32][IQ_HEADER_1024][PAYLOAD]
+ * LEN_32 is a uint32 in little-endian (host) byte order covering the
+ * header and payload; a zero-length frame signals TERMINATE.
  *
  * Project : HeIMDALL DAQ Firmware
  * License : GNU GPL V3
@@ -45,6 +47,8 @@
 
 #include "log.h"
 #include "transport.h"
+#include "iq_header.h"
+#include "sh_mem_util.h"
 
 /*
  *-------------------------------------
@@ -348,6 +352,24 @@ int net_get_write_buf(struct transport_handle *th, void **buf_ptr)
     return idx;
 }
 
+static uint32_t net_frame_length(const struct transport_handle *th, const void *frame)
+{
+    /* Every frame on every transport is [1024B IQ header][payload], so the
+     * populated length can be derived from the header instead of always
+     * transmitting the worst-case buffer_size. Frames without a valid sync
+     * word fall back to the full buffer. */
+    const struct iq_header_struct *hdr = (const struct iq_header_struct *)frame;
+    if (th->buffer_size < IQ_HEADER_LENGTH || hdr->sync_word != SYNC_WORD)
+        return (uint32_t)th->buffer_size;
+
+    uint64_t payload_bytes = (uint64_t)hdr->cpi_length * hdr->active_ant_chs *
+                             2u * (hdr->sample_bit_depth / 8u);
+    uint64_t total = (uint64_t)IQ_HEADER_LENGTH + payload_bytes;
+    if (total > th->buffer_size)
+        return (uint32_t)th->buffer_size;
+    return (uint32_t)total;
+}
+
 int net_submit_write(struct transport_handle *th, int buf_index)
 {
     struct net_transport_priv *priv = (struct net_transport_priv *)th->priv;
@@ -355,9 +377,9 @@ int net_submit_write(struct transport_handle *th, int buf_index)
         return -1;
 
     int fd = priv->is_server ? priv->clientfd : priv->sockfd;
-    uint32_t len = (uint32_t)th->buffer_size;
+    uint32_t len = net_frame_length(th, priv->buf[buf_index]);
 
-    /* Send frame: [LEN_32][PAYLOAD] */
+    /* Send frame: [LEN_32][PAYLOAD]; len is never 0 here (0 = terminate) */
     if (send_all(fd, &len, sizeof(len)) != 0) {
         log_error("NET send length failed");
         return -1;
@@ -369,7 +391,7 @@ int net_submit_write(struct transport_handle *th, int buf_index)
 
     priv->active_buf = buf_index;
     th->total_bytes += len;
-    th->total_frames++;
+    /* total_frames is counted by the transport_submit_write dispatch wrapper */
     return 0;
 }
 
@@ -387,6 +409,13 @@ int net_get_read_buf(struct transport_handle *th, void **buf_ptr)
     if (recv_all(fd, &len, sizeof(len)) != 0) {
         log_error("NET recv length failed");
         return -1;
+    }
+
+    /* A zero-length frame is the producer's terminate signal */
+    if (len == 0) {
+        log_info("NET terminate frame received");
+        priv->terminated = true;
+        return TERMINATE;
     }
 
     if (len > th->buffer_size) {

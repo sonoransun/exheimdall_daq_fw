@@ -1,0 +1,32 @@
+# HeIMDALL DAQ chain - single-instance (instance 0) systemd unit.
+#
+# Install notes: see packaging/systemd/README.md
+#
+# The start script itself applies the tiered SCHED_FIFO priorities and CPU
+# affinity (chrt/taskset in daq_start_sm.sh) - the unit only has to permit
+# them (LimitRTPRIO/LimitMEMLOCK) and must not tamper with CPUAffinity.
+
+[Unit]
+Description=HeIMDALL DAQ coherent acquisition chain
+After=network.target
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/heimdall/Firmware
+ExecStart=/opt/heimdall/Firmware/daq_start_sm.sh
+ExecStop=/opt/heimdall/Firmware/daq_stop.sh
+# The start/stop scripts use sudo internally; run the unit as root.
+User=root
+# Allow SCHED_FIFO up to the tiers daq_start_sm.sh requests (99 max)
+LimitRTPRIO=99
+# rtl_daq/rebuffer/decimate/iq_server call mlockall(MCL_CURRENT|MCL_FUTURE)
+LimitMEMLOCK=infinity
+# Give the stop script time for its SIGTERM + 2 s grace + SIGKILL sweep
+TimeoutStopSec=30
+# After ExecStop, systemd cleans up any process left in the cgroup
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

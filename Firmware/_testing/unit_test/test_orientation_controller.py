@@ -170,6 +170,107 @@ class TestOrientationController(unittest.TestCase):
         self.assertIsNotNone(peak)
         self.assertEqual(peak[1]["az_deg"], 10.0)
 
+    def test_scan_averages_per_point_rejects_spike(self):
+        """A single impulsive-noise frame must not win the scan: points are
+        compared on their dwell-average objective. (Under the old per-frame
+        max, the spike below would have selected az=20.)"""
+        grid = ScanGrid(az_start=0, az_stop=20, az_step=10,
+                        el_start=0, el_stop=0, el_step=10, dwell_frames=4)
+        ctrl, _ = make_controller(slew_rate_dps=90.0, settle_frames=1)
+        ctrl.start_scan(grid)
+        n20 = 0  # DATA frames seen while dwelling at az=20
+        peak_event = None
+        for _ in range(120):
+            # Sustained power peaks at az = 10 (0 dB); elsewhere -100
+            power = -abs(ctrl.cmd_az - 10.0) * 10.0
+            if (ctrl.cmd_az == 20.0 and
+                    ctrl.state == OrientationController.STATE_SCANNING and
+                    not ctrl.backend.is_moving()):
+                n20 += 1
+                if n20 == 2:  # frame 1 is settle-discarded; spike a sampled one
+                    power = 100.0  # outlier above the true peak
+            ev = ctrl.tick(MockIQHeader(frame_type=0, sync_state=6),
+                           power_metric=power)
+            if ev and ev[1]["event"] == "scan_peak":
+                peak_event = ev
+                break
+        self.assertIsNotNone(peak_event)
+        self.assertEqual(peak_event[1]["az_deg"], 10.0)
+
+    def test_scan_discards_settle_frames(self):
+        """The first settle_frames DATA frames at each grid point must not be
+        sampled (mast oscillation)."""
+        grid = ScanGrid(az_start=0, az_stop=10, az_step=10,
+                        el_start=0, el_stop=0, el_step=10, dwell_frames=2)
+        ctrl, _ = make_controller(slew_rate_dps=90.0, settle_frames=2)
+        ctrl.start_scan(grid)
+        frame_seq = {0.0: 0, 10.0: 0}  # per-point DATA frame counter
+        peak_event = None
+        for _ in range(60):
+            if ctrl.state != OrientationController.STATE_SCANNING or \
+                    ctrl.backend.is_moving():
+                ev = ctrl.tick(MockIQHeader(frame_type=0, sync_state=6),
+                               power_metric=0.0)
+            else:
+                az = ctrl.cmd_az
+                frame_seq[az] = frame_seq.get(az, 0) + 1
+                # Poison the settle window at az=0 with a huge value: it must
+                # be discarded, so az=10 (steady 50) still wins.
+                if az == 0.0 and frame_seq[az] <= 2:
+                    power = 10000.0
+                elif az == 0.0:
+                    power = 1.0
+                else:
+                    power = 50.0
+                ev = ctrl.tick(MockIQHeader(frame_type=0, sync_state=6),
+                               power_metric=power)
+            if ev and ev[1]["event"] == "scan_peak":
+                peak_event = ev
+                break
+        self.assertIsNotNone(peak_event)
+        self.assertEqual(peak_event[1]["az_deg"], 10.0)
+
+    def test_home_transitions_through_slewing(self):
+        """home() is a physical slew: it must not report SETTLED instantly."""
+        ctrl, _ = make_controller(slew_rate_dps=90.0, settle_frames=2)
+        ctrl.home()
+        self.assertEqual(ctrl.state, OrientationController.STATE_SLEWING)
+        for _ in range(5):
+            ctrl.tick(MockIQHeader(frame_type=0, sync_state=6))
+        self.assertEqual(ctrl.state, OrientationController.STATE_SETTLED)
+
+    def test_en_scan_autostarts_once_when_sync_allows(self):
+        """[orientation] en_scan=1 must start a scan autonomously as soon as
+        motion is permitted, exactly once."""
+        grid = ScanGrid(az_start=0, az_stop=10, az_step=10,
+                        el_start=0, el_stop=0, el_step=10, dwell_frames=1)
+        ctrl, _ = make_controller(slew_rate_dps=90.0, settle_frames=1,
+                                  en_scan=True, scan=grid)
+        # Sync not yet locked: no scan may start
+        ctrl.tick(MockIQHeader(frame_type=0, sync_state=2))
+        self.assertEqual(ctrl.state, OrientationController.STATE_IDLE)
+        # Sync locks -> scan auto-starts
+        ctrl.tick(MockIQHeader(frame_type=0, sync_state=6))
+        self.assertEqual(ctrl.state, OrientationController.STATE_SCANNING)
+        # Run the scan to completion
+        for _ in range(40):
+            ev = ctrl.tick(MockIQHeader(frame_type=0, sync_state=6),
+                           power_metric=1.0)
+            if ev and ev[1]["event"] == "scan_peak":
+                break
+        for _ in range(10):
+            ctrl.tick(MockIQHeader(frame_type=0, sync_state=6))
+        self.assertEqual(ctrl.state, OrientationController.STATE_SETTLED)
+        # It must not restart by itself
+        ctrl.tick(MockIQHeader(frame_type=0, sync_state=6))
+        self.assertEqual(ctrl.state, OrientationController.STATE_SETTLED)
+
+    def test_en_scan_disabled_stays_idle(self):
+        ctrl, _ = make_controller(slew_rate_dps=90.0)
+        for _ in range(5):
+            ctrl.tick(MockIQHeader(frame_type=0, sync_state=6))
+        self.assertEqual(ctrl.state, OrientationController.STATE_IDLE)
+
     def test_get_status_fields(self):
         ctrl, _ = make_controller()
         st = ctrl.get_status()

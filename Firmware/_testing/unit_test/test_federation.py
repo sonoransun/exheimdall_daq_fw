@@ -9,11 +9,73 @@ import os
 import json
 import time
 import socket
+import struct
 import threading
 import unittest
 
 # Add _daq_core to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '_daq_core'))
+
+
+
+def _free_port():
+    """Grab an ephemeral TCP port for servers that cannot report a
+    kernel-assigned port back (fixed ports EADDRINUSE-flake under parallel
+    or repeated CI runs)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_listening(port, timeout=5.0):
+    """Deterministically wait until a server accepts connections."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.02)
+    return False
+
+
+class FakeHWCServer:
+    """Minimal stand-in for hw_controller's CtrIfaceServer: accepts one
+    128-byte frame per connection and replies 'FNSD' + 124 zero bytes."""
+
+    def __init__(self, port=0):
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", port))
+        self.srv.listen(5)
+        self.port = self.srv.getsockname()[1]
+        self._stop = threading.Event()
+        self.frames = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        self.srv.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.srv.accept()
+            except socket.timeout:
+                continue
+            try:
+                data = conn.recv(128)
+                if len(data) == 128:
+                    self.frames.append(data)
+                    conn.sendall(b"FNSD" + b"\x00" * 124)
+            finally:
+                conn.close()
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.srv.close()
 
 
 class TestFederationHealth(unittest.TestCase):
@@ -60,17 +122,82 @@ class TestFederationHealth(unittest.TestCase):
         fh.close()
         # Should not raise
 
+    def test_canonical_peer_form_derives_instance_id_and_port(self):
+        """'host:instance_id' entries carry the peer's instance_id and derive
+        the status port via base + id * stride."""
+        from federation_health import FederationHealth
+        fh = FederationHealth(instance_id=0,
+                              peer_addresses=["localhost:1", "10.0.0.2:3"])
+        table = fh.get_peer_table()
+        self.assertEqual(table["localhost:1"]["instance_id"], 1)
+        self.assertEqual(table["10.0.0.2:3"]["instance_id"], 3)
+        self.assertEqual(fh._peer_endpoints["localhost:1"], ("localhost", 5102))
+        self.assertEqual(fh._peer_endpoints["10.0.0.2:3"], ("10.0.0.2", 5302))
+        fh.close()
+
+    def test_legacy_port_form_derives_instance_id(self):
+        """'host:status_port' entries still poll the given port; the
+        instance_id is recovered from the port formula when it fits."""
+        from federation_health import FederationHealth
+        fh = FederationHealth(instance_id=0,
+                              peer_addresses=["localhost:5102", "localhost:19999"])
+        table = fh.get_peer_table()
+        self.assertEqual(table["localhost:5102"]["instance_id"], 1)
+        self.assertEqual(table["localhost:19999"]["instance_id"], -1)
+        self.assertEqual(fh._peer_endpoints["localhost:5102"], ("localhost", 5102))
+        self.assertEqual(fh._peer_endpoints["localhost:19999"], ("localhost", 19999))
+        fh.close()
+
+    def test_election_uses_config_derived_instance_ids(self):
+        """A live peer with a lower config-derived instance_id wins the
+        election even when its STATUS snapshot lacks instance_id."""
+        from federation_health import FederationHealth
+        fh = FederationHealth(instance_id=2, peer_addresses=["localhost:0"])
+        with fh._lock:
+            fh._peer_table["localhost:0"].update(
+                {"alive": True, "health": "ok", "last_seen": time.time()})
+        fh._check_coordinator()
+        self.assertEqual(fh.get_coordinator_id(), 0)
+        fh.close()
+
+    def test_election_with_status_server(self):
+        """End-to-end: poll a real StatusServer whose snapshot includes
+        instance_id, then elect the lowest id."""
+        from federation_health import FederationHealth
+        from daq_status_server import StatusServer
+        # Port chosen so it does NOT fit the base + id * stride formula:
+        # the instance_id must come from the peer's STATUS snapshot.
+        port = _free_port()
+        server = StatusServer(port=port, instance_id=0)
+        server.start()
+        self.assertTrue(_wait_listening(port), "StatusServer did not come up")
+        server.update_status({"sync_state": 6, "counters": {}})
+        try:
+            fh = FederationHealth(instance_id=4, peer_addresses=[
+                "localhost:{:d}".format(port)])
+            fh._poll_peer("localhost:{:d}".format(port))
+            table = fh.get_peer_table()
+            entry = table["localhost:{:d}".format(port)]
+            self.assertTrue(entry["alive"])
+            self.assertEqual(entry["instance_id"], 0)
+            fh._check_coordinator()
+            self.assertEqual(fh.get_coordinator_id(), 0)
+            fh.close()
+        finally:
+            server.close()
+
 
 class TestFederationCoordinator(unittest.TestCase):
     """Tests for federation_coordinator.py"""
 
     def test_coordinator_ping(self):
         from federation_coordinator import FederationCoordinator
-        coord = FederationCoordinator(port=16000, instances=[])
+        port = _free_port()
+        coord = FederationCoordinator(port=port, instances=[])
         coord.start()
-        time.sleep(0.2)
+        self.assertTrue(_wait_listening(port), "coordinator did not come up")
         try:
-            with socket.create_connection(("localhost", 16000), timeout=2) as sock:
+            with socket.create_connection(("localhost", port), timeout=2) as sock:
                 sock.sendall(b"PING\n")
                 data = sock.recv(4096)
                 response = json.loads(data.decode())
@@ -81,11 +208,12 @@ class TestFederationCoordinator(unittest.TestCase):
 
     def test_coordinator_status_no_instances(self):
         from federation_coordinator import FederationCoordinator
-        coord = FederationCoordinator(port=16001, instances=[])
+        port = _free_port()
+        coord = FederationCoordinator(port=port, instances=[])
         coord.start()
-        time.sleep(0.2)
+        self.assertTrue(_wait_listening(port), "coordinator did not come up")
         try:
-            with socket.create_connection(("localhost", 16001), timeout=2) as sock:
+            with socket.create_connection(("localhost", port), timeout=2) as sock:
                 sock.sendall(b"STATUS\n")
                 data = sock.recv(4096)
                 response = json.loads(data.decode())
@@ -96,11 +224,12 @@ class TestFederationCoordinator(unittest.TestCase):
 
     def test_coordinator_unknown_command(self):
         from federation_coordinator import FederationCoordinator
-        coord = FederationCoordinator(port=16002, instances=[])
+        port = _free_port()
+        coord = FederationCoordinator(port=port, instances=[])
         coord.start()
-        time.sleep(0.2)
+        self.assertTrue(_wait_listening(port), "coordinator did not come up")
         try:
-            with socket.create_connection(("localhost", 16002), timeout=2) as sock:
+            with socket.create_connection(("localhost", port), timeout=2) as sock:
                 sock.sendall(b"FOOBAR\n")
                 data = sock.recv(4096)
                 response = json.loads(data.decode())
@@ -117,6 +246,66 @@ class TestFederationCoordinator(unittest.TestCase):
         self.assertEqual(result[1]["host"], "192.168.1.10")
         self.assertEqual(result[1]["instance_id"], 1)
 
+    def test_encode_hwc_command_wire_format(self):
+        """Commands must be encoded as the real 128-byte HWC frames:
+        binary little-endian payloads, not ASCII text."""
+        from federation_coordinator import FederationCoordinator
+        enc = FederationCoordinator._encode_hwc_command
+
+        verb, payload = enc("FREQ 433000000")
+        self.assertEqual(verb, "FREQ")
+        self.assertEqual(struct.unpack("<Q", payload)[0], 433000000)
+
+        verb, payload = enc("GAIN 100,200,300,400,500")
+        self.assertEqual(verb, "GAIN")
+        self.assertEqual(struct.unpack("<5I", payload), (100, 200, 300, 400, 500))
+
+        verb, payload = enc("EGAN 145 145 145 145 145")
+        self.assertEqual(verb, "EGAN")
+        self.assertEqual(struct.unpack("<5I", payload), (145,) * 5)
+
+        verb, payload = enc("ORNT 123.5 45.0")
+        self.assertEqual(verb, "ORNT")
+        az, el = struct.unpack("<ff", payload)
+        self.assertAlmostEqual(az, 123.5, places=3)
+        self.assertAlmostEqual(el, 45.0, places=3)
+
+        # Short verbs carry the trailing space hw_controller compares against
+        self.assertEqual(enc("AGC"), ("AGC ", b""))
+        self.assertEqual(enc("RFQ"), ("RFQ ", b""))
+        self.assertEqual(enc("SCHS"), ("SCHS", b""))
+
+        verb, payload = enc('SCHD {"entries":[{"frequency":433000000}]}')
+        self.assertEqual(verb, "SCHD")
+        self.assertEqual(json.loads(payload.decode())["entries"][0]["frequency"],
+                         433000000)
+
+        with self.assertRaises(ValueError):
+            enc("BOGUS 1")
+        with self.assertRaises(ValueError):
+            enc("FREQ notanumber")
+
+    def test_fan_out_sends_real_frames(self):
+        """A FREQ fan-out arrives as a decodable 128-byte binary frame."""
+        from federation_coordinator import FederationCoordinator
+        hwc = FakeHWCServer()
+        try:
+            coord = FederationCoordinator(port=_free_port(), instances=[
+                {"host": "127.0.0.1", "instance_id": 0, "port_stride": 100}])
+            # Redirect the computed HWC port at the fake server
+            coord._compute_instance_ports = lambda inst: {
+                "hwc_port": hwc.port, "status_port": 0, "iq_port": 0}
+            result = coord._fan_out_command("FREQ", "433000000")
+            self.assertEqual(result["results"]["0"], {"ok": True})
+            time.sleep(0.1)
+            self.assertEqual(len(hwc.frames), 1)
+            frame = hwc.frames[0]
+            self.assertEqual(len(frame), 128)
+            self.assertEqual(frame[:4], b"FREQ")
+            self.assertEqual(struct.unpack("<Q", frame[4:12])[0], 433000000)
+        finally:
+            hwc.close()
+
 
 class TestFederationScheduler(unittest.TestCase):
     """Tests for federation_scheduler.py"""
@@ -126,7 +315,7 @@ class TestFederationScheduler(unittest.TestCase):
         fs = FederationScheduler()
         fs.set_master_schedule(
             frequencies=[433000000, 868000000, 915000000, 1090000000],
-            gains=[40, 40, 40, 40],
+            gains=[[40] * 5, [40] * 5, [40] * 5, [40] * 5],
             dwell_frames=[100, 100, 100, 100],
             strategy="round_robin"
         )
@@ -142,7 +331,7 @@ class TestFederationScheduler(unittest.TestCase):
         fs = FederationScheduler()
         fs.set_master_schedule(
             frequencies=[100, 200, 300, 400],
-            gains=[1, 2, 3, 4],
+            gains=[[1] * 5, [2] * 5, [3] * 5, [4] * 5],
             dwell_frames=[10, 20, 30, 40],
             strategy="range"
         )
@@ -156,7 +345,7 @@ class TestFederationScheduler(unittest.TestCase):
         fs = FederationScheduler()
         fs.set_master_schedule(
             frequencies=[433000000, 868000000],
-            gains=[40, 40],
+            gains=[[40] * 5, [40] * 5],
             dwell_frames=[100, 100]
         )
         assignments = fs.partition_schedule(instance_ids=[0])
@@ -171,10 +360,69 @@ class TestFederationScheduler(unittest.TestCase):
     def test_get_assignments(self):
         from federation_scheduler import FederationScheduler
         fs = FederationScheduler()
-        fs.set_master_schedule([100, 200], [1, 2], [10, 20])
+        fs.set_master_schedule([100, 200], [[1] * 5, [2] * 5], [10, 20])
         fs.partition_schedule(instance_ids=[0])
         assignments = fs.get_assignments()
         self.assertIn(0, assignments)
+
+    def test_distribute_sends_schd_json(self):
+        """Distribution must use the SCHD verb with JSON that
+        ScheduleParser.from_json can load — not an invented SCHEDULE verb."""
+        from federation_scheduler import FederationScheduler
+        sent = []
+
+        class FakeCoordinator:
+            def _send_to_instance(self, iid, cmd_str):
+                sent.append((iid, cmd_str))
+                return {"ok": True}
+
+        fs = FederationScheduler(coordinator=FakeCoordinator())
+        fs.set_master_schedule(
+            frequencies=[433000000, 868000000],
+            gains=[None, None],
+            dwell_frames=[100, 200])
+        fs.partition_schedule(instance_ids=[0, 1])
+        results = fs.distribute()
+        self.assertEqual(results[0], {"ok": True})
+        self.assertEqual(len(sent), 2)
+        for iid, cmd_str in sent:
+            self.assertTrue(cmd_str.startswith("SCHD "))
+            payload = cmd_str[5:]
+            self.assertLessEqual(len(payload.encode()), 124)
+            # Round-trip through the real schedule parser
+            from signal_scheduler import ScheduleParser
+            sched = ScheduleParser.from_json(payload)
+            self.assertEqual(len(sched.entries), 1)
+        # Round-robin: instance 0 got the first frequency
+        sched0 = json.loads(sent[0][1][5:])
+        self.assertEqual(sched0["entries"][0]["frequency"], 433000000)
+        self.assertEqual(sched0["entries"][0]["dwell_frames"], 100)
+
+    def test_distribute_large_schedule_falls_back_to_file(self):
+        """Schedules too large for the 124-byte inline payload are handed
+        over as a JSON file path."""
+        from federation_scheduler import FederationScheduler
+        sent = []
+
+        class FakeCoordinator:
+            def _send_to_instance(self, iid, cmd_str):
+                sent.append((iid, cmd_str))
+                return {"ok": True}
+
+        fs = FederationScheduler(coordinator=FakeCoordinator())
+        freqs = [400000000 + i * 1000000 for i in range(10)]
+        fs.set_master_schedule(freqs, [None] * 10, [100] * 10)
+        fs.partition_schedule(instance_ids=[0])
+        fs.distribute()
+        self.assertEqual(len(sent), 1)
+        payload = sent[0][1][5:]
+        self.assertFalse(payload.startswith("{"))  # a path, not inline JSON
+        try:
+            with open(payload) as f:
+                sched = json.load(f)
+            self.assertEqual(len(sched["entries"]), 10)
+        finally:
+            os.unlink(payload)
 
 
 class TestFederationIQRouter(unittest.TestCase):
@@ -187,7 +435,7 @@ class TestFederationIQRouter(unittest.TestCase):
                 {"host": "localhost", "instance_id": 0, "iq_port": 5000},
                 {"host": "localhost", "instance_id": 1, "iq_port": 5100},
             ],
-            output_port=17000
+            output_port=_free_port()
         )
         stats = router.get_stream_stats()
         self.assertEqual(len(stats), 2)
@@ -198,60 +446,39 @@ class TestFederationIQRouter(unittest.TestCase):
         from federation_iq_router import FederationIQRouter
         router = FederationIQRouter(
             instance_configs=[],
-            output_port=17001
+            output_port=_free_port()
         )
         router.start()
-        time.sleep(0.3)
+        time.sleep(0.3)  # router has no readiness hook; brief spin-up only
         router.close()
 
 
 class TestInstanceNaming(unittest.TestCase):
-    """Test the Python-side instance naming logic in shmemIface."""
+    """Instance naming/port rules asserted against the REAL production code
+    (the old version re-implemented the rules inline and asserted on its own
+    local variables, so it passed regardless of the production behavior).
 
-    def test_outShmemIface_name_instance0(self):
-        """Instance 0 should produce original names."""
-        # We can't fully init shmemIface without FIFOs, but we can test name logic
-        # by checking the naming convention
-        iid = 0
-        shmem_name = "decimator_out"
-        if iid != 0:
-            result = f"inst{iid}_{shmem_name}"
-        else:
-            result = shmem_name
-        self.assertEqual(result, "decimator_out")
+    The full FIFO/shared-memory loopback coverage — including instN_
+    prefixing exercised end-to-end through outShmemIface/inShmemIface —
+    lives in test_shmem_iface.py.
+    """
 
-    def test_outShmemIface_name_instance1(self):
-        """Instance 1 should produce prefixed names."""
-        iid = 1
-        shmem_name = "decimator_out"
-        if iid != 0:
-            result = f"inst{iid}_{shmem_name}"
-        else:
-            result = shmem_name
-        self.assertEqual(result, "inst1_decimator_out")
-
-    def test_fifo_path_instance0(self):
-        """Instance 0: original path."""
-        iid = 0
-        prefix = '_data_control/'
-        if iid != 0:
-            prefix += f'inst{iid}_'
-        self.assertEqual(prefix + 'fw_decimator_in', '_data_control/fw_decimator_in')
-
-    def test_fifo_path_instance1(self):
-        """Instance 1: prefixed path."""
-        iid = 1
-        prefix = '_data_control/'
-        if iid != 0:
-            prefix += f'inst{iid}_'
-        self.assertEqual(prefix + 'fw_decimator_in', '_data_control/inst1_fw_decimator_in')
-
-    def test_port_compute(self):
-        """Port computation: base + instance_id * stride."""
-        self.assertEqual(5000 + 0 * 100, 5000)
-        self.assertEqual(5000 + 1 * 100, 5100)
-        self.assertEqual(5001 + 2 * 100, 5201)
-        self.assertEqual(1130 + 3 * 100, 1430)
+    def test_compute_port_formula(self):
+        """sh_mem_util.c's compute_port mirror: base + instance_id * stride
+        is what every Python-side consumer implements."""
+        from daq_status_server import StatusServer  # noqa: F401 (import check)
+        # federation_health derives peer status ports with the same formula
+        from federation_health import FederationHealth
+        fh = FederationHealth(instance_id=0,
+                              peer_addresses=["localhost:1", "localhost:3"],
+                              status_base_port=5002, port_stride=100)
+        try:
+            self.assertEqual(fh._peer_endpoints["localhost:1"],
+                             ("localhost", 5102))
+            self.assertEqual(fh._peer_endpoints["localhost:3"],
+                             ("localhost", 5302))
+        finally:
+            fh.close()
 
 
 if __name__ == "__main__":

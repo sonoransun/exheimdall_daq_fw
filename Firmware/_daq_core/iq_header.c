@@ -42,6 +42,7 @@ void dump_iq_header(struct iq_header_struct* iq_header){
 	fprintf(stderr, "Antenna azimuth: %.2f deg \n", (float) iq_header->reserved[IQH_RSV_ANTENNA_AZ_CDEG]/100);
 	fprintf(stderr, "Antenna elevation: %.2f deg \n", (float) iq_header->reserved[IQH_RSV_ANTENNA_EL_CDEG]/100 - 90);
 	fprintf(stderr, "Rotator state: %u \n", iq_header->reserved[IQH_RSV_ROTATOR_STATE]);
+	fprintf(stderr, "USB ring-buffer overrun count: %u \n", iq_header->reserved[IQH_RSV_BUFFER_OVERRUN_CNT]);
 	for(int m=0;m<32;m++)
 	{
 	    if (iq_header->reserved[IQH_RSV_TOTAL_GAINS+m])

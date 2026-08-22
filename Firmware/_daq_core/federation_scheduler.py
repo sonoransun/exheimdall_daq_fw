@@ -8,8 +8,10 @@
     instances. Partitions a master frequency schedule among healthy instances
     using configurable strategies (round_robin, range, capability).
 """
+import json
 import logging
-import time
+import os
+import tempfile
 
 
 class FederationScheduler:
@@ -38,13 +40,21 @@ class FederationScheduler:
         ----------
         frequencies : list of int
             RF center frequencies in Hz.
-        gains : list of int
-            Gain values for each frequency.
+        gains : list of (list of int or None)
+            Per-channel gain values (R820T tenths of dB) for each frequency,
+            or None for no gain change on that entry. Scalars are rejected:
+            the channel count is not known here, so a scalar cannot be
+            expanded to the per-channel list the SCHD consumers require.
         dwell_frames : list of int
             Number of frames to dwell on each frequency.
         strategy : str
             Partition strategy: "round_robin", "range", or "capability".
         """
+        for i, g in enumerate(gains):
+            if g is not None and not isinstance(g, (list, tuple)):
+                raise ValueError(
+                    "gains[{:d}] is a scalar ({!r}): per-frequency gains must be "
+                    "a per-channel list (R820T tenths of dB) or None".format(i, g))
         self._master_schedule = {
             "frequencies": list(frequencies),
             "gains": list(gains),
@@ -142,9 +152,29 @@ class FederationScheduler:
                 assignments[iid]["dwell_frames"].append(dwells[idx])
         return assignments
 
+    @staticmethod
+    def _build_schedule_json(sched, name="federation"):
+        """Build the compact JSON document ScheduleParser.from_json accepts."""
+        entries = []
+        for f, g, d in zip(sched["frequencies"], sched["gains"],
+                           sched["dwell_frames"]):
+            entry = {"frequency": int(f), "dwell_frames": int(d)}
+            if isinstance(g, (list, tuple)):
+                entry["gains"] = [int(v) for v in g]
+            entries.append(entry)
+        return json.dumps({"name": name, "entries": entries},
+                          separators=(",", ":"))
+
     def distribute(self):
         """
         Send partitioned schedules to each instance via the coordinator.
+
+        Schedules travel as 'SCHD' control frames (4-byte verb + 124-byte
+        payload). Compact JSON is sent inline when it fits; larger schedules
+        are written to a JSON file and the file path is sent instead, which
+        the HW controller's SCHD handler also accepts (this requires the
+        instance to share a filesystem with the coordinator, e.g. localhost
+        federation).
 
         Returns
         -------
@@ -161,15 +191,23 @@ class FederationScheduler:
 
         results = {}
         for iid, sched in self._current_assignments.items():
-            freq_str = ",".join(str(f) for f in sched["frequencies"])
-            gain_str = ",".join(str(g) for g in sched["gains"])
-            dwell_str = ",".join(str(d) for d in sched["dwell_frames"])
-            # Use coordinator to send schedule to this instance
             try:
+                sched_json = self._build_schedule_json(
+                    sched, name="federation_inst{:d}".format(iid))
+                if len(sched_json.encode("utf-8")) <= 124:
+                    payload = sched_json
+                else:
+                    # Too long for an inline frame: hand over via a file path
+                    fd, path = tempfile.mkstemp(prefix="fed_sched_inst{:d}_".format(iid),
+                                                suffix=".json")
+                    with os.fdopen(fd, "w") as f:
+                        f.write(sched_json)
+                    self.logger.info(
+                        "Schedule for instance %d exceeds the inline frame size, "
+                        "sending file path %s (requires shared filesystem)", iid, path)
+                    payload = path
                 result = self.coordinator._send_to_instance(
-                    iid,
-                    "SCHEDULE {} {} {}".format(freq_str, gain_str, dwell_str)
-                )
+                    iid, "SCHD {}".format(payload))
                 results[iid] = result
             except Exception as e:
                 results[iid] = {"error": str(e)}

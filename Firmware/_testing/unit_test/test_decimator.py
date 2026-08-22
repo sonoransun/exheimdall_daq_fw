@@ -24,8 +24,11 @@
 """
 import unittest
 from os.path import join, dirname, realpath
+import os
+import shutil
 import sys
 import subprocess
+import tempfile
 import logging
 import numpy as np
 import warnings
@@ -37,12 +40,11 @@ from scipy import signal
 current_path      = dirname(realpath(__file__))
 root_path         = dirname(dirname(current_path))
 daq_core_path     = join(root_path, "_daq_core")
-data_control_path = join(root_path, "_data_control")
 log_path          = join(root_path, "_logs")
 unit_test_path    = join(root_path, "_testing", "unit_test")
 test_logs_path    = join(root_path, "_testing", "test_logs")
 
-config_filename=join(root_path,'daq_chain_config.ini')
+live_config_filename = join(root_path, 'daq_chain_config.ini')
 
 # Import HeIMDALL modules
 sys.path.insert(0, daq_core_path)
@@ -52,80 +54,90 @@ from capture_shmem_stream import IQFrameRecorder
 from gen_ramp import rampFrameGenator
 from gen_std_frame import stdFrameGenator
 
-import plotly.graph_objects as go 
+# plotly is only needed by the (development-skipped) transfer/phase report
+# checkers - do not make the whole suite depend on it. Without plotly the
+# checkers still run, they just skip the HTML report.
+try:
+    import plotly.graph_objects as go
+except ImportError:
+    class _NullFigure:
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    class _NullPlotly:
+        @staticmethod
+        def Figure(*args, **kwargs):
+            return _NullFigure()
+
+        @staticmethod
+        def Scatter(*args, **kwargs):
+            return None
+
+    go = _NullPlotly()
 
 class TesterDecimatorModule(unittest.TestCase):
 
+    """
+        The whole test chain (config file, FIFOs, fir_coeffs.txt) runs
+        inside a per-test temporary working directory: the live
+        Firmware/daq_chain_config.ini is copied there and only the COPY is
+        modified, so an aborted run can never corrupt the developer config.
+        decimate.out and the Python shmem interfaces resolve
+        daq_chain_config.ini and _data_control/ relative to the cwd.
+    """
 
     @classmethod
-    def setUpClass(cls):        
+    def setUpClass(cls):
         logging.basicConfig(filename=join(test_logs_path,'unit_test.log'),
-                             level=logging.INFO)   
+                             level=logging.INFO)
         logging.info("--> Starting Decimator unit test <--")
-        logging.warning("Divide by zero warnings are ignored from numpy")                
+        logging.warning("Divide by zero warnings are ignored from numpy")
         warnings.filterwarnings("ignore", message="numpy.dtype size changed")
         warnings.filterwarnings("ignore", message="numpy.ufunc size changed")
-        np.seterr(divide = 'ignore') 
-                
-        try:
-            proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_in")], stderr=subprocess.DEVNULL)
-            proc.wait()
-            proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_in")], stderr=subprocess.DEVNULL)
-            proc.wait()
+        np.seterr(divide = 'ignore')
 
-            proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_out")], stderr=subprocess.DEVNULL)
-            proc.wait()
-            proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_out")], stderr=subprocess.DEVNULL)
-            proc.wait()
-        except (IOError, OSError):
-            pass
-        
-    def setUp(self):        
-                        
-        # Open log files        
-        self.fd_log_decimator_err = open(join(log_path,"decimator.log"), "w")        
+    def setUp(self):
+        # Isolated working directory with a private copy of the config
+        self.workdir = tempfile.mkdtemp(prefix="decimator_test_")
+        self.prev_cwd = os.getcwd()
+        self.config_filename = join(self.workdir, 'daq_chain_config.ini')
+        shutil.copyfile(live_config_filename, self.config_filename)
+        data_control_path = join(self.workdir, "_data_control")
+        os.makedirs(data_control_path)
+        os.makedirs(join(self.workdir, "_logs"))
+        os.chdir(self.workdir)
+
+        # Open log files
+        self.fd_log_decimator_err = open(join(log_path,"decimator.log"), "w")
         self.fd_log_gen_err  = open(join(log_path,"gen.log"),  "w")
 
         # Create fake gate control file
         self.fd_gate_ctr  = open(join(data_control_path,"m_gate_control_fifo"),  "w")
         self.fd_gate_ctr.close()
-        
-        # Set-up control FIFOs   
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"fw_decimator_in")])
-        proc.wait()
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"bw_decimator_in")])
-        proc.wait()
 
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"fw_decimator_out")])
-        proc.wait()
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"bw_decimator_out")])
-        proc.wait()
-                                        
-        # Save default config file parameters
+        # Set-up control FIFOs
+        os.mkfifo(join(data_control_path,"fw_decimator_in"))
+        os.mkfifo(join(data_control_path,"bw_decimator_in"))
+        os.mkfifo(join(data_control_path,"fw_decimator_out"))
+        os.mkfifo(join(data_control_path,"bw_decimator_out"))
+
+        # Default config file parameters (from the private copy)
         self.N, self. R, self.N_daq, self.N_cal, self.fir_bw, self.K, self.win, self.reset = self._read_config_file()
-        
-    def tearDown(self):
-        # Close log files        
-        self.fd_log_decimator_err.close()       
-        self.fd_log_gen_err.close()
-                        
-        # Close control FIFOs        
-        proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_in")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_in")], stderr=subprocess.DEVNULL)
-        proc.wait()
 
-        proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_out")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_out")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        
+    def tearDown(self):
+        # Close log files
+        self.fd_log_decimator_err.close()
+        self.fd_log_gen_err.close()
+
         # Remove test data file
-        proc = subprocess.Popen(["rm", join(unit_test_path,'decimator_test_0.dat')], stderr=subprocess.DEVNULL)
-        proc.wait()        
-                
-        # Write back default config file parameters
-        self._write_config_file(self.N, self. R, self.N_daq, self.N_cal, self.fir_bw, self.K, self.win, self.reset)
+        try:
+            os.remove(join(unit_test_path,'decimator_test_0.dat'))
+        except OSError:
+            pass
+
+        # Drop the isolated working directory (config copy, FIFOs, coeffs)
+        os.chdir(self.prev_cwd)
+        shutil.rmtree(self.workdir, ignore_errors=True)
     
     #############################################
     #               TEST FUNCTIONS              #
@@ -139,7 +151,7 @@ class TesterDecimatorModule(unittest.TestCase):
         self._write_config_file(N=2**18, R=1, N_daq=2**18, N_cal=2**10, fir_bw=1.0, K=1, win='hann', reset=0) 
         output_frame_count = frame_count   
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_std_frame_test(frame_count, frame_type)               
         # -> Assert <-        
@@ -153,7 +165,7 @@ class TesterDecimatorModule(unittest.TestCase):
         self._write_config_file(N=2**18, R=1, N_daq=2**18, N_cal=2**10, fir_bw=1.0, K=1, win='hann', reset=0)
         output_frame_count = frame_count
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_std_frame_test(frame_count, frame_type)               
         # -> Assert <-        
@@ -164,10 +176,14 @@ class TesterDecimatorModule(unittest.TestCase):
         # -> Assume <-
         frame_count = 10
         frame_type  = IQHeader.FRAME_TYPE_CAL
-        self._write_config_file(N=2**18, R=3, N_daq=2**10, N_cal=2**18, fir_bw=1.0, K=1, win='hann', reset=0)
+        # K must exceed R or fir_filter_designer refuses to run (the old
+        # K=1 setting only worked against a STALE fir_coeffs.txt left in the
+        # repo _data_control by earlier tests; the isolated temp cwd exposed
+        # it). CAL frames bypass the FIR, so K does not affect the output.
+        self._write_config_file(N=2**18, R=3, N_daq=2**10, N_cal=2**18, fir_bw=1.0, K=4, win='hann', reset=0)
         output_frame_count = frame_count   
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_std_frame_test(frame_count, frame_type)               
         # -> Assert <-        
@@ -178,10 +194,12 @@ class TesterDecimatorModule(unittest.TestCase):
         # -> Assume <-
         frame_count = 10
         frame_type  = IQHeader.FRAME_TYPE_TRIGW
-        self._write_config_file(N=2**18, R=7, N_daq=2**14, N_cal=2**10, fir_bw=1.0, K=1, win='hann', reset=0)
+        # K > R required by fir_filter_designer (see test_case_5_2 note);
+        # TRIGW frames carry no payload, so K does not affect the output.
+        self._write_config_file(N=2**18, R=7, N_daq=2**14, N_cal=2**10, fir_bw=1.0, K=8, win='hann', reset=0)
         output_frame_count = frame_count   
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_std_frame_test(frame_count, frame_type)     
         # -> Assert <-        
@@ -201,7 +219,7 @@ class TesterDecimatorModule(unittest.TestCase):
                                 fir_bw=1.0, K=2*decimation_ratio, win='hann', reset=0)
         output_frame_count = frame_count
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_std_frame_test(frame_count, frame_type, frame_size)
         # -> Assert <-
@@ -218,7 +236,7 @@ class TesterDecimatorModule(unittest.TestCase):
         win='hann'
         self._write_config_file(N=N, R=decimation_ratio, N_daq=N, N_cal=N_cal, fir_bw=fir_bw, K=K, win=win, reset=0)
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_swept_cw_test(decimation_ratio, sample_size=N)
         # -> Assert <-        
@@ -235,7 +253,7 @@ class TesterDecimatorModule(unittest.TestCase):
         N_cal = 2**7
         self._write_config_file(N=N, R=decimation_ratio, N_daq=N, N_cal=N_cal, fir_bw=1.0, K=2*decimation_ratio, win='hann', reset=0)
         # -> Action <-
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         self._run_swept_cw_test(decimation_ratio, source_type="cw", sample_size=N)
         # -> Assert <-      
@@ -250,7 +268,7 @@ class TesterDecimatorModule(unittest.TestCase):
         N = 2**18
         N_cal = 2**10
         self._write_config_file(N=N, R=1, N_daq=N, N_cal=N_cal, fir_bw=1.0, K=1, win='hann', reset=0)
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         # -> Action
         # Start the frame generator
@@ -281,8 +299,10 @@ class TesterDecimatorModule(unittest.TestCase):
         N_cpi = 7919 # Prime number, should be irrelevent in this test
         N_daq = 2**10
         N_cal = 2**10
-        self._write_config_file(N=N_cpi, R=3, N_daq=N_daq, N_cal=N_cal, fir_bw=1.0, K=1, win='hann', reset=0)
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        # K > R required by fir_filter_designer (see test_case_5_2 note);
+        # CAL ramp frames bypass the FIR, so K does not affect the payload.
+        self._write_config_file(N=N_cpi, R=3, N_daq=N_daq, N_cal=N_cal, fir_bw=1.0, K=4, win='hann', reset=0)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         # -> Action
         # Start the frame generator
@@ -316,7 +336,7 @@ class TesterDecimatorModule(unittest.TestCase):
         self._write_config_file(N=N, R=decimation_ratio, N_daq=N, N_cal=N, fir_bw=1.0, K=tap_size, win='hann', reset=0)            
         
         # -> Action
-        proc = subprocess.Popen(["./fir_filter_designer.py",], stdout=subprocess.DEVNULL)
+        proc = subprocess.Popen([sys.executable, join(root_path, "fir_filter_designer.py")], stdout=subprocess.DEVNULL)
         proc.wait()
         data_throughput_ratio = self._run_throughput_test(frame_count, decimation_ratio, N)
                 
@@ -604,8 +624,11 @@ class TesterDecimatorModule(unittest.TestCase):
                     else: 
                         signal_array = np.append(signal_array, iq_cf64,axis=1)  
         
-        logging.info("Received blocks: {:d}".format(blocks))       
-        signal_array = signal_array[:,keep_out:]    
+        logging.info("Received blocks: {:d}".format(blocks))
+        if blocks == 0 or signal_array is None:
+            logging.error("Phase continuity check: no frames were recorded")
+            return True  # caller asserts falsiness -> this is a failure
+        signal_array = signal_array[:,keep_out:]
         """
         -------------------------------
             Check phase continuity
@@ -623,19 +646,23 @@ class TesterDecimatorModule(unittest.TestCase):
         #fig.add_trace(go.Scatter(y=ref.real,  name= "Reference-real", line=dict(width=2, dash='dash')))            
         #fig.add_trace(go.Scatter(y=ref.imag,  name= "Reference-imag", line=dict(width=2, dash='dash')))            
 
-        # Compare obtained responses with the reference
+        # Compare obtained responses with the reference. Every channel's
+        # verdict is accumulated (the old code leaked the loop variable and
+        # effectively checked only the LAST channel).
+        channel_failed = []
         for m in range(iq_header.active_ant_chs):
             # -> Calulcation
             mf_output  = signal_array[m,:] * ref.conj()
             phase_diff = np.abs(np.diff(np.angle(mf_output)))
-                                 
+            channel_failed.append(bool((phase_diff > tolerance).any()))
+
             # -> Logging
-            logging.info('Checking phase conitnuity on channel: {:d}'.format(m))            
-            logging.info("Maximum deviation: {:.2f} rad".format(max(np.abs(phase_diff))))            
+            logging.info('Checking phase conitnuity on channel: {:d}'.format(m))
+            logging.info("Maximum deviation: {:.2f} rad".format(max(np.abs(phase_diff))))
             fig.add_trace(go.Scatter(y=signal_array[m,:].real, name = "Channel {:d} - real".format(m), line=dict(width=2, dash='solid')))
             #fig.add_trace(go.Scatter(y=signal_array[m,:].imag, name = "Channel {:d} - imag".format(m), line=dict(width=2, dash='solid')))
             fig.add_trace(go.Scatter(y=np.append(np.zeros(1),phase_diff), name = "Phase diff, channel :{:d}".format(m), line=dict(width=2, dash='solid')))
-            
+
         # Export figure
         fig.update_layout(
             title = "Test Case: 5_11 : Decimator Phase Conitnuity",
@@ -643,9 +670,9 @@ class TesterDecimatorModule(unittest.TestCase):
             yaxis_title = "Phase difference",
             font=dict(size=18),
             hovermode='x')
-        fig.write_html(join(test_logs_path,'TestCase-5_11.html'))       
-        
-        return (phase_diff > tolerance).any() 
+        fig.write_html(join(test_logs_path,'TestCase-5_11.html'))
+
+        return any(channel_failed)
     
     def check_ramp(self, file_name, frame_count):
         iq_header = IQHeader()
@@ -692,11 +719,14 @@ class TesterDecimatorModule(unittest.TestCase):
                     for m in range(iq_header.active_ant_chs):
                         ch_m_data_i = iq_cf64[m,:].real
                         ch_m_data_q = iq_cf64[m,:].imag
-                        diff_i = (raw_sig[:]+2*m*ramp_max - ch_m_data_i)
-                        diff_q = (raw_sig[:]+(2*m+1)*ramp_max - ch_m_data_q)
-                        if (diff_i < 0.1).all() and (diff_q < 0.1).all(): 
+                        # abs(): corruption in EITHER direction must fail
+                        # (the old signed compare passed when received >
+                        # expected)
+                        diff_i = np.abs(raw_sig[:]+2*m*ramp_max - ch_m_data_i)
+                        diff_q = np.abs(raw_sig[:]+(2*m+1)*ramp_max - ch_m_data_q)
+                        if (diff_i < 0.1).all() and (diff_q < 0.1).all():
                             pass
-                            logging.info("Block {:d}, Channel {:d} - Passed".format(iq_header.daq_block_index, m))                    
+                            logging.info("Block {:d}, Channel {:d} - Passed".format(iq_header.daq_block_index, m))
                         else:
                             errors = 0
                             logging.error("Ramp test failed!")
@@ -733,7 +763,7 @@ class TesterDecimatorModule(unittest.TestCase):
 
         """
         parser = ConfigParser()
-        found = parser.read([config_filename])
+        found = parser.read([self.config_filename])
         if not found:            
             return 0,0,0,0,0,'',0
         N       = parser.getint('pre_processing', 'cpi_size')        
@@ -752,7 +782,7 @@ class TesterDecimatorModule(unittest.TestCase):
         
         """
         parser = ConfigParser()
-        found = parser.read([config_filename])
+        found = parser.read([self.config_filename])
         if not found:            
             return -1
         
@@ -764,6 +794,6 @@ class TesterDecimatorModule(unittest.TestCase):
         parser['pre_processing']['fir_tap_size'] = str(K)
         parser['pre_processing']['fir_window'] = win
         parser['pre_processing']['en_filter_reset'] = str(reset) 
-        with open(config_filename, 'w') as configfile:
+        with open(self.config_filename, 'w') as configfile:
             parser.write(configfile)
         return 0

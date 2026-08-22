@@ -115,9 +115,13 @@ class OrientationController:
         self._scan_points = []
         self._scan_index = 0
         self._scan_dwell_counter = 0
+        self._scan_settle_counter = 0
+        self._scan_obj_sum = 0.0
+        self._scan_obj_count = 0
         self._scan_best_obj = None
         self._scan_best_bearing = None
         self._scan_grid = None
+        self._auto_scan_started = False  # en_scan fires at most once
 
     # ---- public API -------------------------------------------------------
     def open(self):
@@ -165,12 +169,16 @@ class OrientationController:
         self._scan_points = []
 
     def home(self):
+        """Drive to the home/reference position. A real rotator home is a
+        physical slew, so transition through SLEWING like set_bearing and let
+        tick() wait for arrival plus the configured settle time."""
         try:
             self.backend.home()
         except Exception as e:
             self.logger.error("Rotator home failed: %s", e)
         self.cmd_az, self.cmd_el = 0.0, 0.0
-        self.state = self.STATE_SETTLED
+        self.state = self.STATE_SLEWING
+        self._settle_counter = 0
 
     def start_scan(self, grid=None):
         """Begin an autonomous scan-and-peak over a bearing grid."""
@@ -180,13 +188,20 @@ class OrientationController:
             self.logger.warning("Empty scan grid, ignoring")
             return
         self._scan_index = 0
-        self._scan_dwell_counter = 0
+        self._reset_scan_point_state()
         self._scan_best_obj = None
         self._scan_best_bearing = None
         az, el = self._scan_points[0]
         self.set_bearing(az, el)
         self.state = self.STATE_SCANNING
         self.logger.info("Scan-and-peak started over %d points", len(self._scan_points))
+
+    def _reset_scan_point_state(self):
+        """Reset the per-grid-point settle/dwell accumulators."""
+        self._scan_dwell_counter = 0
+        self._scan_settle_counter = 0
+        self._scan_obj_sum = 0.0
+        self._scan_obj_count = 0
 
     def get_status(self):
         return {
@@ -221,6 +236,16 @@ class OrientationController:
     def tick(self, iq_header, power_metric=None):
         """Called once per frame. Returns ("ORIENTATION", {...}) on a state
         transition worth reporting, else None."""
+        # en_scan: start one autonomous scan automatically as soon as the sync
+        # chain first permits motion (mirrors how bearing_mode='fixed' is
+        # honored in open()). An operator SCAN command is unaffected.
+        if (self.config.en_scan and not self._auto_scan_started and
+                self.state in (self.STATE_IDLE, self.STATE_SETTLED) and
+                self._can_move(iq_header)):
+            self._auto_scan_started = True
+            self.logger.info("en_scan=1: starting autonomous scan-and-peak")
+            self.start_scan()
+
         if self.state == self.STATE_IDLE or self.state == self.STATE_SETTLED:
             return None
         # Freeze motion during calibration
@@ -246,17 +271,28 @@ class OrientationController:
         if self.state == self.STATE_SCANNING:
             if self.backend.is_moving():
                 return None
-            # Dwell at the current grid point, sampling the objective
             if is_data:
+                # Discard the first settle_frames DATA frames at each grid
+                # point — the mast may still be oscillating after arrival
+                if self._scan_settle_counter < self.config.settle_frames:
+                    self._scan_settle_counter += 1
+                    return None
+                # Dwell: accumulate the objective for a per-point average so a
+                # single impulsive-noise frame cannot win the whole scan
                 self._scan_dwell_counter += 1
                 obj = self._read_objective(iq_header, power_metric)
                 if obj is not None:
-                    bearing = self._scan_points[self._scan_index]
-                    if self._scan_best_obj is None or obj > self._scan_best_obj:
-                        self._scan_best_obj = obj
-                        self._scan_best_bearing = bearing
+                    self._scan_obj_sum += obj
+                    self._scan_obj_count += 1
             if self._scan_dwell_counter >= self._scan_grid.dwell_frames:
-                self._scan_dwell_counter = 0
+                # Dwell complete: compare this point's mean objective
+                if self._scan_obj_count > 0:
+                    point_mean = self._scan_obj_sum / self._scan_obj_count
+                    bearing = self._scan_points[self._scan_index]
+                    if self._scan_best_obj is None or point_mean > self._scan_best_obj:
+                        self._scan_best_obj = point_mean
+                        self._scan_best_bearing = bearing
+                self._reset_scan_point_state()
                 self._scan_index += 1
                 if self._scan_index < len(self._scan_points):
                     az, el = self._scan_points[self._scan_index]

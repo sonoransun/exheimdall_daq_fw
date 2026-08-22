@@ -8,6 +8,7 @@
 #define __STDC_FORMAT_MACROS
 #include <stdio.h>
 #include <inttypes.h>
+#include <stddef.h>
 
 #define FRAME_TYPE_DATA  0
 #define FRAME_TYPE_DUMMY 1
@@ -37,6 +38,8 @@
 #define IQH_RSV_ANTENNA_EL_CDEG    99  /* antenna elevation, centi-deg (+9000 offset) */
 #define IQH_RSV_ROTATOR_STATE      100 /* orientation controller state enum */
 #define IQH_RSV_AGG_POWER_MDB      101 /* aggregate channel power, milli-dB (scan objective) */
+#define IQH_RSV_BUFFER_OVERRUN_CNT 102 /* cumulative USB ring-buffer overrun events since start,
+                                          stamped by rtl_daq; 0 = none/unsupported */
 struct iq_frame_struct 
 {
 	struct iq_header_struct* header;
@@ -75,7 +78,18 @@ struct iq_header_struct {
 	uint32_t sync_state;           //Updates: Delay synchronizer
 	uint32_t noise_source_state;   //Updates: RTL-DAQ	
 	uint32_t reserved[192];        //Updates: RTL-DAQ - Static
-	uint32_t header_version;       //Updates: RTL-DAQ - Static   
+	uint32_t header_version;       //Updates: RTL-DAQ - Static
 };
+
+/* Compile-time enforcement of the wire ABI. The header must be exactly 1024
+ * bytes with native alignment, and the field offsets are frozen (they are
+ * mirrored byte-for-byte by iq_header.py - edit the two files in lockstep). */
+_Static_assert(sizeof(struct iq_header_struct) == IQ_HEADER_LENGTH,
+               "IQ header ABI broken: struct iq_header_struct must be exactly 1024 bytes");
+_Static_assert(offsetof(struct iq_header_struct, reserved) == 252,
+               "IQ header ABI broken: reserved[] must start at byte offset 252");
+_Static_assert(offsetof(struct iq_header_struct, header_version) == 1020,
+               "IQ header ABI broken: header_version must be at byte offset 1020");
+
 void dump_iq_header(struct iq_header_struct* iq_header);
 int check_sync_word(struct iq_header_struct* iq_header);

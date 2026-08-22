@@ -1,18 +1,55 @@
-Firmware/_logs/*.log
-Firmware/_logs/*.html
+# =============================================================================
+# HeIMDALL DAQ Firmware - .gitignore
+# =============================================================================
+
+# --- C build outputs (Firmware/_daq_core, Firmware/_fpga_gateware) ---
+*.o
+*.d
+*.out
+*.so
+*.a
+*.gcda
+*.gcno
+Firmware/_daq_core/serial_test
+Firmware/_fpga_gateware/build/
+
+# --- Vendored copy-in dependencies (copied into _daq_core before building,
+# --- see CLAUDE.md; NE10*.h headers ARE tracked - only the copy-ins are not)
+Firmware/_daq_core/rtl-sdr.h
+Firmware/_daq_core/rtl-sdr_export.h
+Firmware/_daq_core/librtlsdr.a
+Firmware/_daq_core/libNE10.a
+Firmware/_daq_core/libkfr_capi.so*
+Firmware/_daq_core/kfr/
+
+# --- CI dependency cache (ci/build.sh) ---
+.ci-deps/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Runtime state: logs (keep the 'logs' legend file), PID files, archives ---
+Firmware/_logs/*
+!Firmware/_logs/logs
+Firmware/_testing/test_logs/*
+Firmware/_testing/benchmark_results/
+
+# --- Runtime state: control files, FIFOs, hardware caps, FIR coefficients ---
 Firmware/_data_control/*
-!Firmware/_data_control/iq_track_lock
-Firmware/_test_vectors/*.iq
-Firmware/_daq_core/*.out
-Firmware/_daq_core/*.o
-Firmware/_daq_core/*.a
-Firmware/_daq_core/__pycache__/*.pyc
-Firmware/_daq_core/__pycache__/*.nbi
-Firmware/_daq_core/__pycache__/*.nbc
-Firmware/_daq_core/__pycache__/*.cpython-35.pyc
-Fimrware/_daq_core/__pycache__/*
-Firmware/_testing/unit_test/__pycache__/*
-Firmware/_testing/__pycache__/*
-Firmware/_testing/test_logs/*.log
-Firmware/_testing/test_logs/*.html
-Firmware/__pycache__/*
+!Firmware/_data_control/.gitkeep
+
+# --- Runtime state: BerkeleyDB telemetry ---
+Firmware/_db/*
+!Firmware/_db/.gitkeep
+
+# --- Editors / OS noise ---
+.DS_Store
+*.swp
+*~

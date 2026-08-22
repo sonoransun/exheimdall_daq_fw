@@ -19,25 +19,39 @@ import threading
 class FederationHealth:
     """Lightweight peer health monitor using StatusServer TCP endpoints."""
 
-    def __init__(self, instance_id, peer_addresses, poll_interval=5.0, event_bus=None):
+    def __init__(self, instance_id, peer_addresses, poll_interval=5.0, event_bus=None,
+                 status_base_port=5002, port_stride=100):
         """
         Parameters
         ----------
         instance_id : int
             This instance's ID.
         peer_addresses : list of str
-            List of "host:status_port" strings for peer instances.
+            Peer entries in the canonical "host:instance_id" form (the same
+            [federation] peer_list format federation_coordinator parses); the
+            peer's status port is derived as status_base_port +
+            instance_id * port_stride. The legacy "host:status_port" form
+            (number >= 1024) is still accepted for backward compatibility,
+            with the instance_id derived from the port when it fits the
+            base + id * stride formula.
         poll_interval : float
             Seconds between health polls.
         event_bus : EventBus or None
             Optional event bus for emitting federation events.
+        status_base_port : int
+            Base status-server port (default 5002).
+        port_stride : int
+            Federation port stride (default 100).
         """
         self.logger = logging.getLogger(__name__)
         self.instance_id = instance_id
         self.poll_interval = poll_interval
         self.event_bus = event_bus
+        self.status_base_port = status_base_port
+        self.port_stride = port_stride
         self._peer_addresses = peer_addresses
         self._peer_table = {}
+        self._peer_endpoints = {}  # addr -> (host, status_port)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
@@ -45,14 +59,34 @@ class FederationHealth:
 
         # Initialize peer table
         for addr in peer_addresses:
+            host, port, peer_iid = self._parse_peer(addr)
+            self._peer_endpoints[addr] = (host, port)
             self._peer_table[addr] = {
                 "alive": False,
                 "last_seen": 0.0,
                 "sync_state": 0,
                 "frequency_hz": 0,
                 "health": "unknown",
-                "instance_id": -1,
+                "instance_id": peer_iid,
             }
+
+    def _parse_peer(self, addr):
+        """Resolve a peer entry to (host, status_port, instance_id)."""
+        host, num_str = addr.rsplit(":", 1)
+        num = int(num_str)
+        if num >= 1024:
+            # Legacy "host:status_port" form
+            port = num
+            offset = num - self.status_base_port
+            if self.port_stride > 0 and offset >= 0 and offset % self.port_stride == 0:
+                peer_iid = offset // self.port_stride
+            else:
+                peer_iid = -1  # unknown until the peer reports it
+        else:
+            # Canonical "host:instance_id" form
+            peer_iid = num
+            port = self.status_base_port + peer_iid * self.port_stride
+        return host, port, peer_iid
 
     def start(self):
         """Start the background polling thread."""
@@ -71,8 +105,7 @@ class FederationHealth:
 
     def _poll_peer(self, addr):
         """Send PING and optionally STATUS to a single peer."""
-        host, port_str = addr.rsplit(":", 1)
-        port = int(port_str)
+        host, port = self._peer_endpoints[addr]
         try:
             with socket.create_connection((host, port), timeout=2.0) as sock:
                 sock.sendall(b"STATUS\n")
@@ -83,28 +116,36 @@ class FederationHealth:
                         break
                     data += chunk
             response = json.loads(data.decode("utf-8", errors="replace"))
-            was_alive = self._peer_table[addr]["alive"]
             with self._lock:
+                was_alive = self._peer_table[addr]["alive"]
+                # Prefer the config-derived instance_id; take the reported one
+                # when the config form did not carry it
+                peer_iid = self._peer_table[addr]["instance_id"]
+                if peer_iid < 0:
+                    peer_iid = response.get("instance_id", -1)
                 self._peer_table[addr].update({
                     "alive": True,
                     "last_seen": time.time(),
                     "sync_state": response.get("sync_state", 0),
                     "frequency_hz": response.get("current_frequency_hz", 0),
                     "health": response.get("pipeline_health", "unknown"),
-                    "instance_id": response.get("instance_id", -1),
+                    "instance_id": peer_iid,
                 })
             if not was_alive:
                 self._emit_event("peer_up", addr)
         except Exception:
-            was_alive = self._peer_table[addr]["alive"]
             now = time.time()
+            went_down = False
             with self._lock:
+                was_alive = self._peer_table[addr]["alive"]
                 # Mark as down if 3 intervals missed
                 if now - self._peer_table[addr]["last_seen"] > 3 * self.poll_interval:
                     if was_alive:
                         self._peer_table[addr]["alive"] = False
                         self._peer_table[addr]["health"] = "error"
-                        self._emit_event("peer_down", addr)
+                        went_down = True
+            if went_down:
+                self._emit_event("peer_down", addr)
 
     def _check_coordinator(self):
         """Elect coordinator as lowest instance_id among healthy peers + self."""
@@ -146,7 +187,7 @@ class FederationHealth:
     def get_peer_table(self):
         """Return a copy of the current peer health table."""
         with self._lock:
-            return dict(self._peer_table)
+            return {addr: dict(info) for addr, info in self._peer_table.items()}
 
     def get_healthy_peers(self):
         """Return list of peer addresses that are alive and not in error state."""

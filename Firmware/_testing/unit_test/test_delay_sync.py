@@ -24,8 +24,11 @@
 """
 import unittest
 from os.path import join, dirname, realpath
+import os
+import shutil
 import sys
 import subprocess
+import tempfile
 import logging
 import numpy as np
 from struct import pack
@@ -34,7 +37,6 @@ import time
 current_path      = dirname(realpath(__file__))
 root_path         = dirname(dirname(current_path))
 daq_core_path     = join(root_path, "_daq_core")
-data_control_path = join(root_path, "_data_control")
 log_path          = join(root_path, "_logs")
 unit_test_path    = join(root_path, "_testing", "unit_test")
 test_logs_path    = join(root_path, "_testing", "test_logs")
@@ -48,80 +50,57 @@ from capture_shmem_stream import IQFrameRecorder
 
 class TesterDelaySyncModule(unittest.TestCase):
 
+    """
+        Runs inside a per-test temporary working directory holding a private
+        COPY of daq_chain_config.ini plus the _data_control FIFOs (both are
+        resolved relative to the cwd by delay_sync.py and the Python shmem
+        interfaces), so parallel runs cannot collide and the live config is
+        never touched.
+    """
+
     @classmethod
     def setUpClass(cls):
         logging.basicConfig(filename=join(test_logs_path,'unit_test.log'),
-                             level=logging.INFO)   
+                             level=logging.INFO)
         logging.info("--> Starting Delay synchronizer unit test <--")
-        try:
-            # Close control FIFOs
-            proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_out")], stderr=subprocess.DEVNULL)
-            proc.wait()
-            proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_out")], stderr=subprocess.DEVNULL)
-            proc.wait()
 
-            proc = subprocess.Popen(["rm",join(data_control_path,"fw_delay_sync_iq")], stderr=subprocess.DEVNULL)
-            proc.wait()
-            proc = subprocess.Popen(["rm",join(data_control_path,"bw_delay_sync_iq")], stderr=subprocess.DEVNULL)
-            proc.wait()
-
-            proc = subprocess.Popen(["rm",join(data_control_path,"fw_delay_sync_hwc")], stderr=subprocess.DEVNULL)
-            proc.wait()
-            proc = subprocess.Popen(["rm",join(data_control_path,"bw_delay_sync_hwc")], stderr=subprocess.DEVNULL)
-            proc.wait()
-        except (IOError, OSError):
-            pass
-
-        
-    def setUp(self):        
+    def setUp(self):
+        # Isolated working directory with a private copy of the config
+        self.workdir = tempfile.mkdtemp(prefix="delay_sync_test_")
+        self.prev_cwd = os.getcwd()
+        shutil.copyfile(join(root_path, 'daq_chain_config.ini'),
+                        join(self.workdir, 'daq_chain_config.ini'))
+        data_control_path = join(self.workdir, "_data_control")
+        os.makedirs(data_control_path)
+        os.chdir(self.workdir)
 
         # Open log files
         self.fd_log_gen_err  = open(join(log_path,"gen.log"),  "w")
         self.fd_log_delay_sync_err = open(join(log_path,"delay_sync.log"), "w")
 
-        # Set-up control FIFOs   
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"fw_decimator_out")])
-        proc.wait()
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"bw_decimator_out")])
-        proc.wait()
+        # Set-up control FIFOs
+        os.mkfifo(join(data_control_path,"fw_decimator_out"))
+        os.mkfifo(join(data_control_path,"bw_decimator_out"))
+        os.mkfifo(join(data_control_path,"fw_delay_sync_iq"))
+        os.mkfifo(join(data_control_path,"bw_delay_sync_iq"))
+        os.mkfifo(join(data_control_path,"fw_delay_sync_hwc"))
+        os.mkfifo(join(data_control_path,"bw_delay_sync_hwc"))
 
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"fw_delay_sync_iq")])
-        proc.wait()
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"bw_delay_sync_iq")])
-        proc.wait()
-
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"fw_delay_sync_hwc")])
-        proc.wait()
-        proc = subprocess.Popen(["mkfifo",join(data_control_path,"bw_delay_sync_hwc")])
-        proc.wait()
-        
     def tearDown(self):
         # Close log files
         self.fd_log_gen_err.close()
         self.fd_log_delay_sync_err.close()
-        
-        # Close control FIFOs
-        proc = subprocess.Popen(["rm",join(data_control_path,"fw_decimator_out")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        proc = subprocess.Popen(["rm",join(data_control_path,"bw_decimator_out")], stderr=subprocess.DEVNULL)
-        proc.wait()
 
-        proc = subprocess.Popen(["rm",join(data_control_path,"fw_delay_sync_iq")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        proc = subprocess.Popen(["rm",join(data_control_path,"bw_delay_sync_iq")], stderr=subprocess.DEVNULL)
-        proc.wait()
+        # Remove test data files
+        for fname in ('decimator_test_0.dat', 'decimator_test_1.dat'):
+            try:
+                os.remove(join(unit_test_path, fname))
+            except OSError:
+                pass
 
-        proc = subprocess.Popen(["rm",join(data_control_path,"fw_delay_sync_hwc")], stderr=subprocess.DEVNULL)
-        proc.wait()
-        proc = subprocess.Popen(["rm",join(data_control_path,"bw_delay_sync_hwc")], stderr=subprocess.DEVNULL)
-        proc.wait()       
-
-        # Remove test data file
-        proc = subprocess.Popen(["rm", join(unit_test_path,'decimator_test_0.dat')], stderr=subprocess.DEVNULL)
-        proc.wait()
-
-        proc = subprocess.Popen(["rm", join(unit_test_path,'decimator_test_1.dat')], stderr=subprocess.DEVNULL)
-        proc.wait()
+        # Drop the isolated working directory (config copy + FIFOs)
+        os.chdir(self.prev_cwd)
+        shutil.rmtree(self.workdir, ignore_errors=True)
 
 
     #############################################

@@ -19,6 +19,8 @@ offload_engine_t offload_engine_from_string(const char* str)
         return OFFLOAD_CPU_NEON;
     if (strcmp(str, "cpu_kfr") == 0 || strcmp(str, "kfr") == 0)
         return OFFLOAD_CPU_KFR;
+    if (strcmp(str, "cpu_generic") == 0 || strcmp(str, "generic") == 0)
+        return OFFLOAD_CPU_GENERIC;
     if (strcmp(str, "fpga") == 0)
         return OFFLOAD_FPGA;
     if (strcmp(str, "gpu") == 0)
@@ -39,7 +41,9 @@ offload_engine_t offload_auto_detect(void)
     /* TODO: probe GPU before selecting */
 #endif
 
-#ifdef ARM_NEON
+#if defined(OFFLOAD_GENERIC_ONLY)
+    return OFFLOAD_CPU_GENERIC;
+#elif defined(ARM_NEON)
     return OFFLOAD_CPU_NEON;
 #else
     return OFFLOAD_CPU_KFR;
@@ -54,15 +58,21 @@ struct fir_engine* fir_engine_create(offload_engine_t type)
     struct fir_engine* eng = NULL;
 
     switch (type) {
-#ifdef ARM_NEON
+#if defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
     case OFFLOAD_CPU_NEON:
         eng = fir_engine_neon_create();
         break;
 #endif
 
-#ifndef ARM_NEON
+#if !defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
     case OFFLOAD_CPU_KFR:
         eng = fir_engine_kfr_create();
+        break;
+#endif
+
+#if defined(HAS_GENERIC_OFFLOAD) || defined(OFFLOAD_GENERIC_ONLY)
+    case OFFLOAD_CPU_GENERIC:
+        eng = fir_engine_generic_create();
         break;
 #endif
 
@@ -85,7 +95,9 @@ struct fir_engine* fir_engine_create(offload_engine_t type)
     if (eng == NULL) {
         log_warn("FIR engine type %d unavailable, falling back to platform default", type);
         /* Fall back to compile-time default */
-#ifdef ARM_NEON
+#if defined(OFFLOAD_GENERIC_ONLY)
+        eng = fir_engine_generic_create();
+#elif defined(ARM_NEON)
         eng = fir_engine_neon_create();
 #else
         eng = fir_engine_kfr_create();
@@ -103,15 +115,21 @@ struct convert_engine* convert_engine_create(offload_engine_t type)
     struct convert_engine* eng = NULL;
 
     switch (type) {
-#ifdef ARM_NEON
+#if defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
     case OFFLOAD_CPU_NEON:
         eng = convert_engine_neon_create();
         break;
 #endif
 
-#ifndef ARM_NEON
+#if !defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
     case OFFLOAD_CPU_KFR:
         eng = convert_engine_kfr_create();
+        break;
+#endif
+
+#if defined(HAS_GENERIC_OFFLOAD) || defined(OFFLOAD_GENERIC_ONLY)
+    case OFFLOAD_CPU_GENERIC:
+        eng = convert_engine_generic_create();
         break;
 #endif
 
@@ -120,7 +138,9 @@ struct convert_engine* convert_engine_create(offload_engine_t type)
     }
 
     if (eng == NULL) {
-#ifdef ARM_NEON
+#if defined(OFFLOAD_GENERIC_ONLY)
+        eng = convert_engine_generic_create();
+#elif defined(ARM_NEON)
         eng = convert_engine_neon_create();
 #else
         eng = convert_engine_kfr_create();

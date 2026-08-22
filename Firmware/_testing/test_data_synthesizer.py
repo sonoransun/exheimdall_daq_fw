@@ -41,7 +41,16 @@ sys.path.insert(0, os.path.join(rootPath, "_daq_core"))
 from iq_header import IQHeader
 
 # Import third party modules
-from pyargus.directionEstimation import gen_scanning_vectors
+# pyargus is only needed by (disabled-by-default) test case 4 - import it
+# lazily so plain simulation mode does not depend on it
+gen_scanning_vectors = None
+
+def _require_pyargus():
+    global gen_scanning_vectors
+    if gen_scanning_vectors is None:
+        from pyargus.directionEstimation import gen_scanning_vectors as _gsv
+        gen_scanning_vectors = _gsv
+    return gen_scanning_vectors
 
 #TODO: Use mutexes for the control variables
 class FIFO_rd_thread(Thread):
@@ -115,7 +124,7 @@ parser = ConfigParser()
 found = parser.read(['daq_chain_config.ini'])
 if not found:
     logger.error("DAQ core configuration file not found. Exiting..")
-    exit
+    sys.exit(1)
 logger.setLevel((parser.getint('daq', 'log_level')*10))
 
 N = parser.getint('pre_processing', 'cpi_size')
@@ -360,7 +369,7 @@ try:
                         theta_tc4 += 5
                         #theta_tc4 = 20
                     #phase_diffs = np.rad2deg(np.arange(M)*np.pi*np.cos(np.deg2rad(theta_tc4)))
-                    phase_diffs = np.rad2deg(np.angle(gen_scanning_vectors(M, ant_x, ant_y, [theta_tc4,])[:,0]))
+                    phase_diffs = np.rad2deg(np.angle(_require_pyargus()(M, ant_x, ant_y, [theta_tc4,])[:,0]))
                     logging.info("DoA simulation - incident anlge :{:.2f}".format(theta_tc4))
                 
                 if test_case_ctr_vector[5] and b> tc5_start:
@@ -479,7 +488,7 @@ try:
             
             signal[0::2] = raw_sig_m.real
             signal[1::2] = raw_sig_m.imag      
-            byte_array= pack('B'*block_size, *signal)
+            byte_array = signal.tobytes()
             #logger.debug("Data block size: {:d} bytes".format(len(byte_array)))
             #iq_header.encode_header()
             #logger.debug("Header size: {:d}".format(len(iq_header.encode_header())))
@@ -489,8 +498,8 @@ try:
                 sys.stdout.buffer.write(iq_header.encode_header()) # Write the IQ header
                 
             sys.stdout.buffer.write(byte_array) #Write IQ data
-except:
-    logging.error("Unexpected error: {:s}".format(sys.exc_info()[0]))
+except Exception:
+    logging.exception("Unexpected error in the synthetic data chain")
          
     
     

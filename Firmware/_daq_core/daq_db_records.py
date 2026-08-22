@@ -12,12 +12,34 @@ import time
 
 M_MAX = 32  # Maximum number of channels (matches IQ header)
 
-# Record version constants
-FRAME_METRICS_VERSION = 1
-CAL_HISTORY_VERSION = 1
-FREQ_SCAN_VERSION = 1
-HW_SNAPSHOT_VERSION = 1
-SCHEDULE_STATE_VERSION = 1
+# Record version constants.
+# v2: value formats pinned with '=' (packed, native-endian) so byte offsets are
+#     deterministic, and all BTree keys packed big-endian ('>') so BerkeleyDB's
+#     memcmp key ordering equals numeric ordering (range scans / rotation).
+FRAME_METRICS_VERSION = 2
+CAL_HISTORY_VERSION = 2
+FREQ_SCAN_VERSION = 2
+HW_SNAPSHOT_VERSION = 2
+SCHEDULE_STATE_VERSION = 1  # raw bytes payload, format unchanged
+
+# On-disk schema generation for the whole DB directory. Bump together with the
+# record versions above whenever KEY_FORMAT/VALUE_FORMAT change. daq_db.py
+# discards (re-creates) databases written by a different schema generation —
+# they are rolling telemetry with a bounded retention window.
+DB_SCHEMA_VERSION = 2
+
+
+class RecordVersionError(ValueError):
+    """Raised when a stored record carries an unsupported version byte."""
+    pass
+
+
+def _check_version(value_data, expected, record_name):
+    if not value_data or value_data[0] != expected:
+        found = value_data[0] if value_data else None
+        raise RecordVersionError(
+            "{:s}: unsupported record version {} (expected {:d})".format(
+                record_name, found, expected))
 
 # Calibration event types
 CAL_EVENT_SAMPLE_CAL_DONE = 0
@@ -34,17 +56,23 @@ CAL_EVENT_CAL_START = 8
 class FrameMetricsRecord:
     """Per-frame metrics record stored in frame_metrics.db"""
 
-    # Key format: timestamp_ms (Q) + cpi_index (Q)
-    KEY_FORMAT = "QQ"
+    # Key format: timestamp_ms (Q) + cpi_index (Q), big-endian (memcmp-ordered)
+    KEY_FORMAT = ">QQ"
     KEY_SIZE = struct.calcsize(KEY_FORMAT)
 
-    # Value format: version(B) + frame_type(I) + rf_center_freq(Q) + active_ant_chs(I) +
+    # Value format (packed, native-endian): version(B) + frame_type(I) +
+    #   rf_center_freq(Q) + active_ant_chs(I) +
     #   cpi_length(I) + daq_block_index(I) + sampling_freq(Q) + if_gains[32](I*32) +
     #   delay_sync_flag(I) + iq_sync_flag(I) + sync_state(I) + noise_source_state(I) +
     #   adc_overdrive_flags(I) + num_channels(I) + channel_powers[32](f*32) +
     #   snr_estimate(f) + cal_quality(f)
-    VALUE_FORMAT = "B I Q I I I Q " + "I " * M_MAX + "I I I I I I " + "f " * M_MAX + "f f"
+    VALUE_FORMAT = "=B I Q I I I Q " + "I " * M_MAX + "I I I I I I " + "f " * M_MAX + "f f"
     VALUE_FORMAT = VALUE_FORMAT.replace(" ", "")
+
+    # Byte offsets of secondary-index fields, derived from the format itself
+    OFFSET_FRAME_TYPE = struct.calcsize("=B")
+    OFFSET_RF_CENTER_FREQ = struct.calcsize("=BI")
+    OFFSET_SYNC_STATE = struct.calcsize("=BIQIIIQ" + "I" * M_MAX + "II")
 
     def __init__(self):
         self.timestamp_ms = 0
@@ -88,6 +116,7 @@ class FrameMetricsRecord:
 
     @classmethod
     def from_bytes(cls, key_data, value_data):
+        _check_version(value_data, FRAME_METRICS_VERSION, "FrameMetricsRecord")
         rec = cls()
         rec.timestamp_ms, rec.cpi_index = struct.unpack(cls.KEY_FORMAT, key_data)
         vals = struct.unpack(cls.VALUE_FORMAT, value_data)
@@ -142,14 +171,19 @@ class FrameMetricsRecord:
 class CalHistoryRecord:
     """Calibration event record stored in cal_history.db"""
 
-    KEY_FORMAT = "QQ"  # timestamp_ms + event_seq
+    KEY_FORMAT = ">QQ"  # timestamp_ms + event_seq, big-endian (memcmp-ordered)
     KEY_SIZE = struct.calcsize(KEY_FORMAT)
 
-    # Value: version(B) + event_type(I) + rf_center_freq(Q) + sync_state_before(I) +
+    # Value (packed, native-endian): version(B) + event_type(I) +
+    #   rf_center_freq(Q) + sync_state_before(I) +
     #   sync_state_after(I) + num_channels(I) + iq_corrections_re[32](f*32) +
     #   iq_corrections_im[32](f*32) + delays[32](i*32) + sync_failed_cntr(I)
-    VALUE_FORMAT = "B I Q I I I " + "f " * M_MAX + "f " * M_MAX + "i " * M_MAX + "I"
+    VALUE_FORMAT = "=B I Q I I I " + "f " * M_MAX + "f " * M_MAX + "i " * M_MAX + "I"
     VALUE_FORMAT = VALUE_FORMAT.replace(" ", "")
+
+    # Byte offsets of secondary-index fields, derived from the format itself
+    OFFSET_EVENT_TYPE = struct.calcsize("=B")
+    OFFSET_RF_CENTER_FREQ = struct.calcsize("=BI")
 
     def __init__(self):
         self.timestamp_ms = 0
@@ -183,6 +217,7 @@ class CalHistoryRecord:
 
     @classmethod
     def from_bytes(cls, key_data, value_data):
+        _check_version(value_data, CAL_HISTORY_VERSION, "CalHistoryRecord")
         rec = cls()
         rec.timestamp_ms, rec.event_seq = struct.unpack(cls.KEY_FORMAT, key_data)
         vals = struct.unpack(cls.VALUE_FORMAT, value_data)
@@ -203,14 +238,15 @@ class CalHistoryRecord:
 class FreqScanRecord:
     """Per-frequency aggregate record stored in freq_scan.db"""
 
-    KEY_FORMAT = "Q"  # rf_center_freq
+    KEY_FORMAT = ">Q"  # rf_center_freq, big-endian (memcmp-ordered)
     KEY_SIZE = struct.calcsize(KEY_FORMAT)
 
-    # Value: version(B) + last_visit_ts(Q) + total_frames(Q) + total_cal_success(Q) +
+    # Value (packed, native-endian): version(B) + last_visit_ts(Q) +
+    #   total_frames(Q) + total_cal_success(Q) +
     #   total_cal_fail(Q) + avg_snr(f) + avg_cal_quality(f) + num_channels(I) +
     #   last_iq_corrections_re[32](f*32) + last_iq_corrections_im[32](f*32) +
     #   last_delays[32](i*32)
-    VALUE_FORMAT = "B Q Q Q Q f f I " + "f " * M_MAX + "f " * M_MAX + "i " * M_MAX
+    VALUE_FORMAT = "=B Q Q Q Q f f I " + "f " * M_MAX + "f " * M_MAX + "i " * M_MAX
     VALUE_FORMAT = VALUE_FORMAT.replace(" ", "")
 
     def __init__(self):
@@ -246,6 +282,7 @@ class FreqScanRecord:
 
     @classmethod
     def from_bytes(cls, key_data, value_data):
+        _check_version(value_data, FREQ_SCAN_VERSION, "FreqScanRecord")
         rec = cls()
         rec.rf_center_freq = struct.unpack(cls.KEY_FORMAT, key_data)[0]
         vals = struct.unpack(cls.VALUE_FORMAT, value_data)
@@ -267,12 +304,12 @@ class FreqScanRecord:
 class HWSnapshotRecord:
     """Hardware state snapshot stored in hw_snapshots.db"""
 
-    KEY_FORMAT = "Q"  # timestamp_ms
+    KEY_FORMAT = ">Q"  # timestamp_ms, big-endian (memcmp-ordered)
     KEY_SIZE = struct.calcsize(KEY_FORMAT)
 
-    # Value: version(B) + rf_center_freq(Q) + noise_source_state(I) +
-    #   overdrive_events(I) + num_channels(I) + gains[32](I*32)
-    VALUE_FORMAT = "B Q I I I " + "I " * M_MAX
+    # Value (packed, native-endian): version(B) + rf_center_freq(Q) +
+    #   noise_source_state(I) + overdrive_events(I) + num_channels(I) + gains[32](I*32)
+    VALUE_FORMAT = "=B Q I I I " + "I " * M_MAX
     VALUE_FORMAT = VALUE_FORMAT.replace(" ", "")
 
     def __init__(self):
@@ -301,6 +338,7 @@ class HWSnapshotRecord:
 
     @classmethod
     def from_bytes(cls, key_data, value_data):
+        _check_version(value_data, HW_SNAPSHOT_VERSION, "HWSnapshotRecord")
         rec = cls()
         rec.timestamp_ms = struct.unpack(cls.KEY_FORMAT, key_data)[0]
         vals = struct.unpack(cls.VALUE_FORMAT, value_data)
@@ -345,6 +383,7 @@ class ScheduleStateRecord:
 
     @classmethod
     def from_bytes(cls, key_data, value_data):
+        _check_version(value_data, SCHEDULE_STATE_VERSION, "ScheduleStateRecord")
         rec = cls()
         rec.key = key_data
         _version = value_data[0]

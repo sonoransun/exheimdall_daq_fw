@@ -28,6 +28,7 @@
 import json
 import logging
 import os
+import re
 import sys
 from configparser import ConfigParser
 
@@ -98,15 +99,71 @@ def auto_configure(caps_file, config_file):
             logger.debug("Field [%s] %s = '%s' (not 'auto'), skipping",
                          section, key, current)
 
-    # Write updated config
+    # Write updated config. Targeted in-place substitution keeps the
+    # operator's comments and formatting byte-identical; only the resolved
+    # 'key = auto' lines change. ConfigParser.write() (which discards all
+    # comments) remains only as a last-resort fallback.
     if changes:
-        with open(config_file, 'w') as f:
-            config.write(f)
+        applied = _apply_targeted_updates(config_file, changes)
+        if applied != len(changes):
+            logger.warning(
+                "Targeted config rewrite applied %d/%d change(s); "
+                "falling back to full rewrite (comments will be lost)",
+                applied, len(changes))
+            with open(config_file, 'w') as f:
+                config.write(f)
         logger.info("Updated %d field(s) in %s", len(changes), config_file)
     else:
         logger.info("No fields set to 'auto' -- config unchanged")
 
     return changes
+
+
+def _apply_targeted_updates(config_file, changes):
+    """Rewrite only the changed 'key = value' lines, preserving all comments.
+
+    Parameters
+    ----------
+    changes : dict
+        {(section, key): new_value, ...} as produced by auto_configure().
+
+    Returns
+    -------
+    int
+        Number of changes actually applied to the file.
+    """
+    pending = {(s.lower(), k.lower()): str(v) for (s, k), v in changes.items()}
+
+    with open(config_file, 'r') as f:
+        lines = f.readlines()
+
+    section_re = re.compile(r'^\s*\[([^\]]+)\]')
+    current_section = None
+    applied = 0
+    out_lines = []
+    for line in lines:
+        stripped = line.strip()
+        m = section_re.match(line)
+        if m:
+            current_section = m.group(1).strip().lower()
+        elif (current_section is not None and stripped and
+              not stripped.startswith(('#', ';'))):
+            for delim in ('=', ':'):
+                if delim in line:
+                    key = line.split(delim, 1)[0].strip().lower()
+                    target = (current_section, key)
+                    if target in pending:
+                        prefix = line[:line.index(delim) + 1]
+                        eol = '\n' if line.endswith('\n') else ''
+                        line = "{} {}{}".format(prefix, pending.pop(target), eol)
+                        applied += 1
+                    break
+        out_lines.append(line)
+
+    if applied:
+        with open(config_file, 'w') as f:
+            f.writelines(out_lines)
+    return applied
 
 
 # ---------------------------------------------------------------------------

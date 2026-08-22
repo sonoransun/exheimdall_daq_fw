@@ -22,7 +22,10 @@
 # Import built in modules
 from struct import pack, unpack
 import threading
+import queue
 import logging
+import json
+import os
 
 # Import third-party modules
 import numpy as np
@@ -31,16 +34,34 @@ from configparser import ConfigParser
 
 # Import HeIMDALL modules
 from iq_header import IQHeader
-from shmemIface import inShmemIface
+from shmemIface import inShmemIface, TERMINATE
 from transportIface import TransportConsumer
 import zmq
 import inter_module_messages
 from daq_db_records import (CAL_EVENT_NOISE_ON, CAL_EVENT_NOISE_OFF,
                             CAL_EVENT_FREQ_CHANGE, CAL_EVENT_GAIN_CHANGE)
 
-# Global: Used to communicate between the HWC module and the Control Interface server
-ctr_request = [] # This list stores the confiuration command and parameters [cmd, param 1, param 2, ..]
-ctr_request_condition = threading.Condition()
+
+class CtrRequest:
+    """One in-flight control request handed from the CtrIfaceServer thread to
+    the HWC main loop. The server thread waits on `done` (with timeout) and
+    then reads `reply_payload` (bytes, query replies only, None otherwise).
+    On timeout the server thread sets `cancelled` so the main loop withdraws
+    the request instead of executing it at an arbitrary later frame."""
+
+    def __init__(self, command, params):
+        self.command = command
+        self.params = params
+        self.done = threading.Event()
+        self.reply_payload = None
+        self.cancelled = False
+
+
+# Global: request queue between the Control Interface server thread and the
+# HWC main loop. The server enqueues CtrRequest objects; the main loop drains
+# the queue once per frame (queries in any state, hardware mutations only in
+# the safe STATE_IQ_CAL state) and sets each request's `done` event.
+ctr_request_queue = queue.Queue(maxsize=8)
 
 class HWC():
     
@@ -100,6 +121,14 @@ class HWC():
         self.instance_id = 0
         self.port_stride = 100
 
+        # Control interface bind address ([daq] listen_address, optional)
+        self.listen_address = "0.0.0.0"
+
+        # ZMQ control-link robustness (rtl_daq REQ/REP)
+        self.ZMQ_TIMEOUT_MS = 5000
+        self.zmq_context = None
+        self.zmq_port = 1130
+
         # Offload / transport defaults
         self.transport_type = 'shm'
 
@@ -118,6 +147,12 @@ class HWC():
         self._orientation_state_fname = "_data_control/orientation_state"
         self._orientation_write_counter = 0
 
+        # Bias-tee relay file (read by delay_sync for v8 header stamping)
+        self._bias_tee_state_fname = "_data_control/bias_tee_state"
+
+        # Control requests deferred while the FSM is not in a safe state
+        self._pending_ctr_requests = []
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
         self.iq_header = IQHeader()
@@ -132,7 +167,8 @@ class HWC():
 
         # Control interface server
         hwc_port = 5001 + self.instance_id * self.port_stride
-        self.ctr_iface_server = CtrIfaceServer(self.M, port=hwc_port)
+        self.ctr_iface_server = CtrIfaceServer(self.M, port=hwc_port,
+                                               listen_address=self.listen_address)
         self.ctr_iface_server.start()
 
         self.logger.info("Antenna channles {:d}".format(self.M))
@@ -195,6 +231,8 @@ class HWC():
         else:
             self.en_iq_cal = False
         self.log_level = parser.getint('daq','log_level')*10
+        # Optional bind address for the TCP control servers (default: all interfaces)
+        self.listen_address = parser.get('daq', 'listen_address', fallback='0.0.0.0').strip() or '0.0.0.0'
 
         # Convert the gain list
         gains_init_str = gains_init_str.split(',')
@@ -219,33 +257,8 @@ class HWC():
                 self.gains=[0]*self.M
                 self.last_gains=[0]*self.M
 
-        # Schedule configuration
-        if parser.has_section('schedule'):
-            en_schedule = parser.getint('schedule', 'en_schedule', fallback=0)
-            if en_schedule:
-                try:
-                    from signal_scheduler import SignalScheduler, ScheduleParser
-                    sample_rate = parser.getint('daq', 'sample_rate', fallback=2400000)
-                    decimation_ratio = parser.getint('pre_processing', 'decimation_ratio', fallback=1)
-                    self.scheduler = SignalScheduler(self.M, sample_rate, self.N, decimation_ratio)
-                    self.scheduler.max_cal_wait_frames = parser.getint('schedule', 'max_cal_wait_frames', fallback=500)
-                    sched_mode = parser.get('schedule', 'schedule_mode', fallback='none')
-                    if sched_mode == 'inline':
-                        sched = ScheduleParser.from_ini_section(parser, 'schedule')
-                        if sched is not None:
-                            self.scheduler.load_schedule(sched)
-                            logging.info("Inline schedule loaded with {:d} entries".format(len(sched.entries)))
-                    elif sched_mode == 'file':
-                        sched_file = parser.get('schedule', 'schedule_file', fallback='')
-                        if sched_file:
-                            sched = ScheduleParser.from_file(sched_file)
-                            self.scheduler.load_schedule(sched)
-                            logging.info("File schedule loaded from {:s}".format(sched_file))
-                except Exception as e:
-                    logging.error("Failed to initialize scheduler: {:s}".format(str(e)))
-                    self.scheduler = None
-
-        # Database configuration
+        # Database configuration (parsed BEFORE the schedule section so the
+        # scheduler can be handed the database for schedule persist/resume)
         if parser.has_section('database'):
             self._en_db = parser.getint('database', 'en_db', fallback=0) == 1
             self._hw_snapshot_interval = parser.getint('database', 'hw_snapshot_interval', fallback=100)
@@ -264,6 +277,35 @@ class HWC():
                 except Exception as e:
                     logging.error("Failed to initialize DAQ database: {:s}".format(str(e)))
                     self.db = None
+
+        # Schedule configuration
+        if parser.has_section('schedule'):
+            en_schedule = parser.getint('schedule', 'en_schedule', fallback=0)
+            if en_schedule:
+                try:
+                    from signal_scheduler import SignalScheduler, ScheduleParser
+                    sample_rate = parser.getint('daq', 'sample_rate', fallback=2400000)
+                    decimation_ratio = parser.getint('pre_processing', 'decimation_ratio', fallback=1)
+                    # db= activates schedule-state persist/resume when the
+                    # database is enabled too (no-op with db=None)
+                    self.scheduler = SignalScheduler(self.M, sample_rate, self.N,
+                                                     decimation_ratio, db=self.db)
+                    self.scheduler.max_cal_wait_frames = parser.getint('schedule', 'max_cal_wait_frames', fallback=500)
+                    sched_mode = parser.get('schedule', 'schedule_mode', fallback='none')
+                    if sched_mode == 'inline':
+                        sched = ScheduleParser.from_ini_section(parser, 'schedule')
+                        if sched is not None:
+                            self.scheduler.load_schedule(sched)
+                            logging.info("Inline schedule loaded with {:d} entries".format(len(sched.entries)))
+                    elif sched_mode == 'file':
+                        sched_file = parser.get('schedule', 'schedule_file', fallback='')
+                        if sched_file:
+                            sched = ScheduleParser.from_file(sched_file)
+                            self.scheduler.load_schedule(sched)
+                            logging.info("File schedule loaded from {:s}".format(sched_file))
+                except Exception as e:
+                    logging.error("Failed to initialize scheduler: {:s}".format(str(e)))
+                    self.scheduler = None
 
         # Monitoring configuration
         if parser.has_section('monitoring'):
@@ -287,6 +329,11 @@ class HWC():
                 except Exception as e:
                     logging.error("Failed to initialize event bus: {:s}".format(str(e)))
                     self.event_bus = None
+
+        # Wire the event bus into the database (queue-full diagnostics; the
+        # DAQDatabase docstring expects this to be set externally)
+        if self.db is not None:
+            self.db.event_bus = self.event_bus
 
         # Federation configuration
         if parser.has_section('federation'):
@@ -357,16 +404,17 @@ class HWC():
                 - Initializes the DAC controller module (ADPIS control)
                 - Sets initial IQ values in the ADPIS
         """
-        # Open RTL-DAQ control socket
-        zmq_port = 1130 + self.instance_id * self.port_stride
-        context = zmq.Context()
-        self.rtl_daq_socket = context.socket(zmq.REQ)
-        self.rtl_daq_socket.connect("tcp://localhost:{:d}".format(zmq_port))
+        # Open RTL-DAQ control socket (bounded timeouts so a wedged/dead
+        # rtl_daq degrades the control plane instead of deadlocking it)
+        self.zmq_port = 1130 + self.instance_id * self.port_stride
+        self.zmq_context = zmq.Context()
+        self.rtl_daq_socket = self._create_rtl_daq_socket()
 
         # Open control FIFOs (namespaced by instance_id)
         if self.instance_id != 0:
             self.track_lock_ctr_fname = "_data_control/inst{:d}_iq_track_lock".format(self.instance_id)
             self._orientation_state_fname = "_data_control/inst{:d}_orientation_state".format(self.instance_id)
+            self._bias_tee_state_fname = "_data_control/inst{:d}_bias_tee_state".format(self.instance_id)
         try:
             self.track_lock_ctr_fd = open(self.track_lock_ctr_fname, 'r')
         except OSError as err:
@@ -408,7 +456,54 @@ class HWC():
                 self._write_orientation_state()
             except Exception as e:
                 logging.error("Orientation controller open failed: {:s}".format(str(e)))
+
+        # Publish the initial bias-tee state for delay_sync header stamping
+        if self._en_amplification:
+            self._write_bias_tee_state()
         return 0
+
+    def _create_rtl_daq_socket(self):
+        """Create the REQ socket toward rtl_daq with bounded send/recv timeouts."""
+        sock = self.zmq_context.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, self.ZMQ_TIMEOUT_MS)
+        sock.setsockopt(zmq.SNDTIMEO, self.ZMQ_TIMEOUT_MS)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect("tcp://localhost:{:d}".format(self.zmq_port))
+        return sock
+
+    def _rtl_daq_transaction(self, msg_byte_array):
+        """Send one 128-byte control message to rtl_daq and wait for the reply.
+
+        Bounded by the socket timeouts. On timeout/error the strict REQ/REP
+        lockstep would brick the socket, so it is closed and rebuilt (lazy
+        pirate pattern) and None is returned; the caller must treat None as
+        'command not confirmed' and carry on.
+        """
+        try:
+            self.rtl_daq_socket.send(msg_byte_array)
+            reply = self.rtl_daq_socket.recv()
+            self.logger.debug(f"Received reply: {reply}")
+            return reply
+        except zmq.ZMQError as e:
+            self.logger.critical("rtl_daq control transaction failed (%s), rebuilding socket", e)
+            try:
+                self.rtl_daq_socket.close(linger=0)
+            except zmq.ZMQError:
+                pass
+            self.rtl_daq_socket = self._create_rtl_daq_socket()
+            return None
+
+    @staticmethod
+    def _atomic_write(fname, content):
+        """Write a small control file atomically (temp file + rename) so a
+        concurrent reader never observes a torn/partial value."""
+        tmp_fname = fname + '.tmp'
+        try:
+            with open(tmp_fname, 'w') as f:
+                f.write(content)
+            os.replace(tmp_fname, fname)
+        except OSError:
+            pass
 
     def _write_orientation_state(self):
         """Relay the current antenna bearing + rotator state to delay_sync via a
@@ -416,13 +511,19 @@ class HWC():
         outbound IQ header reserved region for the downstream DoA app."""
         if self.orientation is None:
             return
-        try:
-            with open(self._orientation_state_fname, 'w') as f:
-                f.write("{:.3f} {:.3f} {:d}".format(
-                    self.orientation.cmd_az, self.orientation.cmd_el,
-                    self.orientation.rotator_state_enum()))
-        except OSError:
-            pass
+        self._atomic_write(self._orientation_state_fname,
+                           "{:.3f} {:.3f} {:d}".format(
+                               self.orientation.cmd_az, self.orientation.cmd_el,
+                               self.orientation.rotator_state_enum()))
+
+    def _write_bias_tee_state(self):
+        """Relay the per-channel bias-tee state (as a bitmask) to delay_sync so
+        it can stamp the v8 RSV_BIAS_TEE_STATE header slot."""
+        mask = 0
+        for m, state in enumerate(self.bias_tee_state):
+            if state:
+                mask |= (1 << m)
+        self._atomic_write(self._bias_tee_state_fname, "{:d}".format(mask))
 
     def close(self):
         """
@@ -446,9 +547,7 @@ class HWC():
     def _enable_agc(self):
         if self.agc:
             msg_byte_array = inter_module_messages.pack_msg_enable_agc(self.module_identifier)
-            self.rtl_daq_socket.send(msg_byte_array)
-            reply = self.rtl_daq_socket.recv()
-            self.logger.debug(f"Received reply: {reply}")
+            self._rtl_daq_transaction(msg_byte_array)
 
 
     def _change_gains(self):
@@ -472,11 +571,9 @@ class HWC():
             self.logger.info("Send Ch {:d} Gain: {:d} [{:d}]".format(m, int(gains[m]), self.iq_header.cpi_index))
         # Send gain list
         msg_byte_array = inter_module_messages.pack_msg_set_gain(self.module_identifier, gains)
-        self.rtl_daq_socket.send(msg_byte_array)
-        reply = self.rtl_daq_socket.recv()
-        self.logger.debug(f"Received reply: {reply}")
+        self._rtl_daq_transaction(msg_byte_array)
         # Recompute the external-LNA link budget (advisory; does not change tuner gains)
-        self._update_link_budget(gains)        
+        self._update_link_budget(gains)
     def _tune_gains(self):
         """
             Performs IF gain tuning in order to maximaze the SINR in each channels by
@@ -567,16 +664,29 @@ class HWC():
 
         """
         if command == "FREQ":
-            msg_byte_array = inter_module_messages.pack_msg_rf_tune(self.module_identifier, params[0])
-            self.rtl_daq_socket.send(msg_byte_array)
-            reply = self.rtl_daq_socket.recv()
-            self.logger.debug(f"Received reply: {reply}")
+            # The client frame carries an uint64, but the ZMQ 'c' message toward
+            # rtl_daq is an uint32 (wire contract). Range-check here instead of
+            # letting struct.error kill the main loop.
+            frequency = int(params[0])
+            if not (0 < frequency < 2**32):
+                self.logger.error("Requested center frequency out of range: {:d} Hz".format(frequency))
+                return
+            msg_byte_array = inter_module_messages.pack_msg_rf_tune(self.module_identifier, frequency)
+            if self._rtl_daq_transaction(msg_byte_array) is None:
+                # Not confirmed by rtl_daq: the tuner may still be on the old
+                # frequency, so do not record a retune that never happened.
+                self.logger.error("FREQ change to {:d} Hz not confirmed by rtl_daq".format(frequency))
+                return
+            # Track the retune so the link budget uses the live RF frequency
+            self.rf_center_frequency = frequency
+            if self._en_amplification:
+                self._update_link_budget(self._current_tuner_gains_tenths())
             if self.db is not None:
                 self.db.put_cal_event(CAL_EVENT_FREQ_CHANGE, self.iq_header)
             if self.event_bus is not None:
                 from daq_events import DAQEvent, EVT_FREQ_CHANGE
                 self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
-                    event_type=EVT_FREQ_CHANGE, payload={"frequency": params[0]}))
+                    event_type=EVT_FREQ_CHANGE, payload={"frequency": frequency}))
         elif command == "GAIN":
             try:
                 if self.noise_source_state: # The noise source is turned on, we are storing only the gains
@@ -657,10 +767,10 @@ class HWC():
                     states = [1 if params[m] else 0 for m in range(self.M)]
                     self.bias_tee_state = states
                     msg_byte_array = inter_module_messages.pack_msg_set_bias_tee(self.module_identifier, states)
-                    self.rtl_daq_socket.send(msg_byte_array)
-                    reply = self.rtl_daq_socket.recv()
-                    self.logger.debug(f"Received reply: {reply}")
+                    self._rtl_daq_transaction(msg_byte_array)
                     self.logger.info("Bias-tee state set: {0}".format(states))
+                    # Relay to delay_sync for v8 header stamping
+                    self._write_bias_tee_state()
                     if self.event_bus is not None:
                         from daq_events import DAQEvent, EVT_BIAS_TEE_CHANGE
                         self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
@@ -704,7 +814,119 @@ class HWC():
         elif command == "OQRY":
             if self.orientation is not None:
                 self.logger.info("Orientation status: {0}".format(self.orientation.get_status()))
+        elif command == "INIT":
+            # Re-run the hardware initialization sequence: restore configured
+            # gains and disable the noise source by re-entering STATE_INIT.
+            # _drain_control_requests defers this command while a calibration
+            # noise burst is active, so self.gains hold the user gains here.
+            self.logger.info("Re-initialization requested, re-entering STATE_INIT")
+            self.current_state = "STATE_INIT"
 
+
+    # Read-only query verbs: replied with 'FNSD' + NUL-padded UTF-8 JSON in
+    # bytes 4-127 of the 128-byte reply frame; safe to execute in any FSM state.
+    QUERY_COMMANDS = ("RFQ ", "OQRY", "SCHQ")
+
+    def _handle_query_request(self, command):
+        """Build the JSON reply payload (bytes, <= 124) for a query verb.
+
+        Reply shapes (flat, documented for external clients):
+          RFQ  -> {"gains": [per-ch total system gain dB, 1 decimal],
+                   "nf": [per-ch system NF dB, 2 decimals],
+                   "comp": <compression bitmask int>}
+          OQRY -> {"az": <deg>, "el": <deg>, "state": <int enum
+                   0=IDLE 1=SLEWING 2=SETTLED 3=SCANNING>}
+          SCHQ -> {"state": <str>, "active": <bool>, "idx": <int>,
+                   "total": <int>, "freq": <int Hz>, "frames": <int>,
+                   "dwell": <int>} (only {"state","active"} without a schedule)
+        """
+        try:
+            if command == "RFQ ":
+                data = {"gains": [round(g, 1) for g in self.total_system_gains_db],
+                        "nf": [round(n, 2) for n in self.system_nf_db],
+                        "comp": int(self.compression_flags)}
+            elif command == "OQRY":
+                if self.orientation is not None:
+                    status = self.orientation.get_status()
+                    data = {"az": status["bearing_az_deg"],
+                            "el": status["bearing_el_deg"],
+                            "state": self.orientation.rotator_state_enum()}
+                else:
+                    data = {"az": 0.0, "el": 0.0, "state": 0}
+            elif command == "SCHQ":
+                if self.scheduler is not None:
+                    status = self.scheduler.get_status()
+                    data = {"state": status.get("state"),
+                            "active": status.get("active", False)}
+                    if status.get("active", False):
+                        data.update({"idx": status.get("current_index", 0),
+                                     "total": status.get("total_entries", 0),
+                                     "freq": status.get("current_freq", 0),
+                                     "frames": status.get("frames_at_current", 0),
+                                     "dwell": status.get("dwell_frames", 0)})
+                else:
+                    data = {"state": "IDLE", "active": False}
+            else:
+                data = {"error": "unknown query"}
+            payload = json.dumps(data, separators=(',', ':')).encode('utf-8')
+            if len(payload) > 124:  # trim rounding, then give up gracefully
+                if command == "RFQ ":
+                    data["gains"] = [int(round(g)) for g in self.total_system_gains_db]
+                    data["nf"] = [int(round(n)) for n in self.system_nf_db]
+                    payload = json.dumps(data, separators=(',', ':')).encode('utf-8')
+                if len(payload) > 124:
+                    payload = b'{"error":"overflow"}'
+            return payload
+        except Exception as e:
+            self.logger.error("Query handling failed ({:s}): {:s}".format(command, str(e)))
+            return b'{"error":"internal"}'
+
+    def _drain_control_requests(self, allow_mutations):
+        """Drain pending external control requests from the CtrIfaceServer.
+
+        Query verbs are read-only and served in ANY state. Hardware-mutating
+        commands are executed only when `allow_mutations` is True (the FSM is
+        in the safe STATE_IQ_CAL state on a non-dummy frame); otherwise the
+        request stays pending and is retried on the next frame, keeping the
+        original safety property that hardware is reconfigured only between
+        calibration activities.
+        """
+        work = self._pending_ctr_requests
+        self._pending_ctr_requests = []
+        while True:
+            try:
+                work.append(ctr_request_queue.get_nowait())
+            except queue.Empty:
+                break
+        for request in work:
+            if request.cancelled:
+                # The server thread stopped waiting (timeout) and already
+                # replied: withdraw the request instead of executing it at an
+                # arbitrary later frame. Known limitation: a request that
+                # begins executing just before the flag is set still runs.
+                self.logger.warning("Dropping timed-out control request: {:s}".format(
+                    request.command))
+                continue
+            if request.command in self.QUERY_COMMANDS:
+                request.reply_payload = self._handle_query_request(request.command)
+                request.done.set()
+            elif allow_mutations and not (request.command == "INIT" and
+                                          self.noise_source_state):
+                # INIT is additionally deferred while a calibration noise
+                # burst is active: re-entering STATE_INIT with the cal-table
+                # gains loaded would overwrite the saved user gains and leave
+                # noise_source_state stuck True.
+                self.logger.info("Control request: {:s}".format(request.command))
+                try:
+                    self._handle_control_reqest(request.command, request.params)
+                except Exception as e:
+                    self.logger.error("Control request {:s} failed: {:s}".format(
+                        request.command, str(e)))
+                request.done.set()
+            else:
+                # Not safe to touch the hardware now - retry next frame
+                # (relative order of deferred mutating commands is preserved)
+                self._pending_ctr_requests.append(request)
 
     def _control_noise_source(self, noise_source_state):
         """
@@ -733,9 +955,7 @@ class HWC():
 
             self.logger.info("Enable noise source, [{:d}]".format(self.iq_header.cpi_index))
             msg_byte_array = inter_module_messages.pack_msg_noise_source_ctr(self.module_identifier, True)
-            self.rtl_daq_socket.send(msg_byte_array)
-            reply = self.rtl_daq_socket.recv()
-            self.logger.debug(f"Received reply: {reply}")
+            self._rtl_daq_transaction(msg_byte_array)
             if self.db is not None:
                 self.db.put_cal_event(CAL_EVENT_NOISE_ON, self.iq_header)
             if self.event_bus is not None:
@@ -747,9 +967,7 @@ class HWC():
         else:
             self.logger.info("Disabling noise source [{:d}]".format(self.iq_header.cpi_index))
             msg_byte_array = inter_module_messages.pack_msg_noise_source_ctr(self.module_identifier, False)
-            self.rtl_daq_socket.send(msg_byte_array)
-            reply = self.rtl_daq_socket.recv()
-            self.logger.debug(f"Received reply: {reply}")
+            self._rtl_daq_transaction(msg_byte_array)
             if self.db is not None:
                 self.db.put_cal_event(CAL_EVENT_NOISE_OFF, self.iq_header)
             if self.event_bus is not None:
@@ -780,11 +998,17 @@ class HWC():
             #           OBTAIN NEW DATA BLOCK           #  
             #############################################
                         
-            # Obtained new data                                    
-            active_buff_index = self.in_shmem_iface.wait_buff_free()            
-            if active_buff_index < 0 or active_buff_index > 1:
+            # Obtained new data
+            active_buff_index = self.in_shmem_iface.wait_buff_free()
+            if active_buff_index == TERMINATE:
+                self.logger.info("Terminate signal received, exiting")
+                break
+            elif active_buff_index == -2:  # Read timeout - keep the loop alive
+                self.logger.warning("IQ frame wait timed out, retrying..")
+                continue
+            elif active_buff_index < 0 or active_buff_index > 1:
                 logging.critical("Failed to acquire iq frame, exiting ..")
-                break;          
+                break;
 
             buffer = self.in_shmem_iface.buffers[active_buff_index]
             iq_header_bytes = buffer[0:1024].tobytes()
@@ -844,9 +1068,7 @@ class HWC():
 
                     # Disable internal noise source
                     msg_byte_array = inter_module_messages.pack_msg_noise_source_ctr(self.module_identifier, False)
-                    self.rtl_daq_socket.send(msg_byte_array)
-                    reply = self.rtl_daq_socket.recv()
-                    self.logger.debug(f"Received reply: {reply}")                    
+                    self._rtl_daq_transaction(msg_byte_array)
 
                     # TODO: Set initial ADPIS values here
                     if any(self.gain_tune_states):
@@ -967,19 +1189,10 @@ class HWC():
                             self.event_bus.emit(DAQEvent(severity="info", module="hw_controller",
                                 event_type=etype, payload=ori_event[1]))
 
-                    # --> External control request handling
-                    ctr_request_condition.acquire()
-                    if len(ctr_request) !=0 :
-                        self.logger.info("Control request: {:s}".format(ctr_request[0]))
-                        self._handle_control_reqest(ctr_request[0], ctr_request[1:])
-                        ctr_request.clear()
-                        ctr_request_condition.notify()
-                    ctr_request_condition.release()
-
-                #          
+                #
                 #------------------------------------------>
                 #   
-                elif self.current_state == "STATE_NOISE_CTR_WAIT":                 
+                elif self.current_state == "STATE_NOISE_CTR_WAIT":
                     if self.noise_source_state == self.iq_header.noise_source_state:
                         gain_ctr_ready = True
                         # Check gain states
@@ -988,14 +1201,40 @@ class HWC():
                                 gain_ctr_ready = False
                         if gain_ctr_ready:
                             self.current_state = "STATE_IQ_CAL"
-                        
+
+            # --> External control request handling (every frame: queries are
+            #     answered in any state; hardware mutations only in the safe
+            #     STATE_IQ_CAL state on non-dummy frames)
+            self._drain_control_requests(
+                allow_mutations=(self.current_state == "STATE_IQ_CAL" and
+                                 self.iq_header.frame_type != IQHeader.FRAME_TYPE_DUMMY))
+
             self.in_shmem_iface.send_ctr_buff_ready(active_buff_index)
             
                         
 
 class CtrIfaceServer(threading.Thread):
-            
-    def __init__(self, M, port=5001):
+    """
+        TCP control interface server (port 5001 + instance offset).
+
+        Wire protocol (fixed, external contract):
+          Request : exactly 128 bytes = 4-byte ASCII command + 124-byte payload.
+          Reply   : exactly 128 bytes starting with 'FNSD'.
+                    - non-query commands: bytes 4-127 are all zeros
+                    - query commands (RFQ /OQRY/SCHQ): bytes 4-127 carry a
+                      NUL-padded UTF-8 JSON object (see HWC._handle_query_request)
+
+        Command payload layouts:
+          FREQ = uint64 LE @4, GAIN/EGAN/BIAS = M x uint32 LE @4,
+          ORNT = 2 x float32 LE @4, SCHD = UTF-8 path/JSON @4,
+          STHU = float32 @4 (accepted, currently not implemented),
+          AGC /INIT/SCHS/SCHQ/SCHN/RFQ /PARK/SCAN/OSTP/OQRY/EXIT = no payload.
+    """
+
+    # How long the server waits for the main loop to execute one request
+    REQUEST_TIMEOUT_S = 10.0
+
+    def __init__(self, M, port=5001, listen_address="0.0.0.0"):
         """
             Initialize the Ethernet socket based control interface
             Parameters:
@@ -1004,179 +1243,239 @@ class CtrIfaceServer(threading.Thread):
             :type:  M: int
             :param: port: TCP port number for the control interface
             :type:  port: int
+            :param: listen_address: Bind address ([daq] listen_address, default all interfaces)
+            :type:  listen_address: string
         """
 
         self.logger = logging.getLogger(__name__)
-        threading.Thread.__init__(self)
+        threading.Thread.__init__(self, daemon=True)
 
         # Control interface server parameters
         self.ctr_iface_port_no = port
         self.ctr_iface_socket =  socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.ctr_iface_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.ctr_iface_addr = ("", self.ctr_iface_port_no)
+        self.ctr_iface_addr = (listen_address, self.ctr_iface_port_no)
         self.M = M
         self.status=True
-       
+        self._shutdown_requested = False
+
+    def shutdown(self):
+        """Request a clean server stop: closing the listening socket unblocks
+        accept() and the run loop exits."""
+        self._shutdown_requested = True
+        try:
+            self.ctr_iface_socket.close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _recv_exact(connection, length):
+        """Receive exactly `length` bytes (TCP gives no message boundaries).
+        Returns None if the peer closes the connection first."""
+        data = bytearray()
+        while len(data) < length:
+            chunk = connection.recv(length - len(data))
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data)
+
     def run(self):
         """
             Starts the control server service thread
         """
 
-        self.logger.info("Opening control interface server on ip address: {:s} and port: {:d}".format("-", self.ctr_iface_port_no))
+        self.logger.info("Opening control interface server on ip address: {:s} and port: {:d}".format(
+            self.ctr_iface_addr[0], self.ctr_iface_port_no))
         try:
             self.ctr_iface_socket.bind(self.ctr_iface_addr)
-            self.ctr_iface_socket.listen(1)
+            self.ctr_iface_socket.listen(4)
         except socket.error:
             self.logger.error("Unable to open the Hardware configuration interface")
             self.status=False
             return -1
 
-        while(True):
+        while not self._shutdown_requested:
             # Wait for a connection
             self.logger.info("Waiting for new connection")
-            connection, client_address = self.ctr_iface_socket.accept()
+            try:
+                connection, client_address = self.ctr_iface_socket.accept()
+            except OSError:
+                break  # Listening socket closed by shutdown()
 
             try:
                 self.logger.info("Conenction established ")
 
                 # Main server loop
                 while True:
-                    ctr_frame = connection.recv(128)
-                    if ctr_frame:
-                        exit_flag = self.process_ctr_frame(ctr_frame)
-                        if exit_flag:
-                            break
-                        # Send config success
-                        msg_bytes=("FNSD".encode()+bytearray(124))
-                        connection.send(msg_bytes)
-                    else:
+                    ctr_frame = self._recv_exact(connection, 128)
+                    if ctr_frame is None:
                         self.logger.info("No more data from client, closing connection")
                         break
+                    exit_flag, reply = self.process_ctr_frame(ctr_frame)
+                    if exit_flag:
+                        break
+                    connection.sendall(reply)
+            except Exception as e:
+                # A misbehaving client must never take the control plane down
+                self.logger.error("Control connection error: {:s}".format(str(e)))
             finally:
                 # Clean up the connection
                 connection.close()
 
+        self.logger.info("Control interface server stopped")
+
+    def _submit_request(self, command, params):
+        """Enqueue one request for the HWC main loop and wait for completion.
+        Returns the 128-byte reply frame."""
+        request = CtrRequest(command, params)
+        try:
+            ctr_request_queue.put(request, timeout=2.0)
+        except queue.Full:
+            self.logger.error("Control request queue full, rejecting {:s}".format(command))
+            if command in HWC.QUERY_COMMANDS:
+                return self._build_reply(b'{"error":"busy"}')
+            return self._build_reply(None)
+        if not request.done.wait(timeout=self.REQUEST_TIMEOUT_S):
+            self.logger.warning("Control request {:s} timed out waiting for the main loop".format(command))
+            # Withdraw the request so the main loop does not execute it at an
+            # arbitrary later frame (checked by _drain_control_requests before
+            # execution). Documented limitation: the frozen wire contract has
+            # no distinct timeout reply for non-query verbs, so the client
+            # receives the standard 'FNSD' ack even though the command was
+            # never applied; a request that starts executing right before the
+            # flag is set can still complete.
+            request.cancelled = True
+            if command in HWC.QUERY_COMMANDS:
+                return self._build_reply(b'{"error":"busy"}')
+            return self._build_reply(None)
+        return self._build_reply(request.reply_payload)
+
+    @staticmethod
+    def _build_reply(payload):
+        """Assemble the fixed 128-byte reply frame: 'FNSD' + 124 payload bytes
+        (NUL-padded; all zeros when there is no payload)."""
+        if payload:
+            payload = payload[:124]
+            return b"FNSD" + payload + bytes(124 - len(payload))
+        return b"FNSD" + bytes(124)
+
     def process_ctr_frame(self, msg_bytes):
         """
-            Processes the control interface message and prepares the command parameters
-            for further command handling.
-            
+            Processes one control interface message: decodes the command,
+            hands it to the HWC main loop, and assembles the reply frame.
+
             The input message is composed as follows:
             Total length: 128 byte
             -----------------------------------
             |4 byte cmd|...124 byte payload...|
             -----------------------------------
-            For the detailed description of the valid command please check the corresponding
-            documentation.
+            See the class docstring for the per-command payload layouts.
+
             Parameters:
             -----------
             :param: msg_bytes: Received command, that has to be processed
             :type : msg_bytes: 128 byte length byte array
+
+            Return values:
+            --------------
+            :return: (exit_flag, reply): exit_flag True closes the connection
+                     (no reply is sent); otherwise reply is the 128-byte frame
+                     to send back.
         """
-        ctr_request_condition.acquire()
-        command = msg_bytes[0:4].decode()
+        command = msg_bytes[0:4].decode('ascii', errors='replace')
         self.logger.warning("Got command %s", command)
-        if command == "EXIT":
-            ctr_request_condition.release()
-            return -1
+        try:
+            if command == "EXIT":
+                return True, None
 
-        elif command == "STHU":
-            threshold = unpack('f',msg_bytes[4:8])[0]
-            self.logger.info("Received threshold value: {:f}".format(threshold))
-            ctr_request.clear()
-            ctr_request.append(command)
-            ctr_request.append(threshold)
+            elif command == "STHU":
+                # Accepted for wire compatibility; no threshold consumer exists
+                # in the current chain (there is no matching rtl_daq command).
+                threshold = unpack('f',msg_bytes[4:8])[0]
+                self.logger.warning("STHU threshold {:f} accepted but not implemented".format(threshold))
+                return False, self._build_reply(None)
 
-        elif command == "FREQ":
-            frequency = unpack('Q',msg_bytes[4:12])[0]
-            self.logger.info("Received frequency value: {:f} Hz".format(frequency))
-            ctr_request.clear()
-            ctr_request.append(command)
-            ctr_request.append(frequency)
+            elif command == "FREQ":
+                frequency = unpack('Q',msg_bytes[4:12])[0]
+                self.logger.info("Received frequency value: {:f} Hz".format(frequency))
+                return False, self._submit_request(command, [frequency])
 
-        elif command == "GAIN":
-            gains = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
-            ctr_request.clear()
-            ctr_request.append(command)
-            for m in range(self.M):
-                self.logger.info("Received gain values - CH{:d}: {:d} dB x 10".format(m, gains[m]))            
-                ctr_request.append(gains[m])
+            elif command == "GAIN":
+                gains = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
+                for m in range(self.M):
+                    self.logger.info("Received gain values - CH{:d}: {:d} dB x 10".format(m, gains[m]))
+                return False, self._submit_request(command, list(gains))
 
-        elif command == "AGC ":
-            self.logger.info("Received AGC request")
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command == "AGC ":
+                self.logger.info("Received AGC request")
+                return False, self._submit_request(command, [])
 
-        elif command == "INIT":
-            self.logger.info("Inititalization command received")
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command == "INIT":
+                self.logger.info("Inititalization command received")
+                return False, self._submit_request(command, [])
 
-        elif command == "SCHD":
-            # Schedule load: payload is file path or compact JSON
-            payload = msg_bytes[4:128].decode('utf-8', errors='ignore').rstrip('\x00').strip()
-            self.logger.info("Received schedule load command")
-            ctr_request.clear()
-            ctr_request.append(command)
-            ctr_request.append(payload)
+            elif command == "SCHD":
+                # Schedule load: payload is file path or compact JSON
+                payload = msg_bytes[4:128].decode('utf-8', errors='ignore').rstrip('\x00').strip()
+                self.logger.info("Received schedule load command")
+                return False, self._submit_request(command, [payload])
 
-        elif command == "SCHS":
-            self.logger.info("Received schedule stop command")
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command == "SCHS":
+                self.logger.info("Received schedule stop command")
+                return False, self._submit_request(command, [])
 
-        elif command == "SCHQ":
-            self.logger.info("Received schedule query command")
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command == "SCHQ":
+                self.logger.info("Received schedule query command")
+                return False, self._submit_request(command, [])
 
-        elif command == "SCHN":
-            self.logger.info("Received schedule next command")
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command == "SCHN":
+                self.logger.info("Received schedule next command")
+                return False, self._submit_request(command, [])
 
-        elif command == "EGAN":
-            gains = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
-            ctr_request.clear()
-            ctr_request.append(command)
-            for m in range(self.M):
-                self.logger.info("Received external LNA gain - CH{:d}: {:d} dB x 10".format(m, gains[m]))
-                ctr_request.append(gains[m])
+            elif command == "EGAN":
+                gains = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
+                for m in range(self.M):
+                    self.logger.info("Received external LNA gain - CH{:d}: {:d} dB x 10".format(m, gains[m]))
+                return False, self._submit_request(command, list(gains))
 
-        elif command == "RFQ ":
-            self.logger.info("Received link-budget query command")
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command == "RFQ ":
+                self.logger.info("Received link-budget query command")
+                return False, self._submit_request(command, [])
 
-        elif command == "BIAS":
-            states = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
-            ctr_request.clear()
-            ctr_request.append(command)
-            for m in range(self.M):
-                self.logger.info("Received bias-tee state - CH{:d}: {:d}".format(m, states[m]))
-                ctr_request.append(states[m])
+            elif command == "BIAS":
+                states = unpack('I'*self.M, msg_bytes[4:4+4*self.M])
+                for m in range(self.M):
+                    self.logger.info("Received bias-tee state - CH{:d}: {:d}".format(m, states[m]))
+                return False, self._submit_request(command, list(states))
 
-        elif command == "ORNT":
-            az, el = unpack('ff', msg_bytes[4:12])
-            self.logger.info("Received orientation bearing: az={:.2f} el={:.2f}".format(az, el))
-            ctr_request.clear()
-            ctr_request.append(command)
-            ctr_request.append(az)
-            ctr_request.append(el)
+            elif command == "ORNT":
+                az, el = unpack('ff', msg_bytes[4:12])
+                self.logger.info("Received orientation bearing: az={:.2f} el={:.2f}".format(az, el))
+                return False, self._submit_request(command, [az, el])
 
-        elif command in ("PARK", "SCAN", "OSTP", "OQRY"):
-            self.logger.info("Received orientation command: {:s}".format(command))
-            ctr_request.clear()
-            ctr_request.append(command)
+            elif command in ("PARK", "SCAN", "OSTP", "OQRY"):
+                self.logger.info("Received orientation command: {:s}".format(command))
+                return False, self._submit_request(command, [])
 
-        else:
-            self.logger.error("Unidentified control command: {:s}".format(command))
-
-        ctr_request_condition.wait() # Let the main thread process the request       
-        ctr_request_condition.release()
-        return 0
+            else:
+                self.logger.error("Unidentified control command: {:s}".format(command))
+                return False, self._build_reply(None)
+        except Exception as e:
+            # Malformed payloads must not kill the server thread
+            self.logger.error("Failed to process control frame {:s}: {:s}".format(command, str(e)))
+            return False, self._build_reply(None)
 
 if __name__ == "__main__":
+    import signal
+
+    def _sig_handler(signum, frame):
+        # Raise SystemExit so the finally block below runs the normal
+        # clean-shutdown path (daq_stop.sh sends SIGTERM by default).
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _sig_handler)
+
     HWC_inst0 = HWC()
     try:
         if HWC_inst0.init() == 0:
@@ -1186,6 +1485,7 @@ if __name__ == "__main__":
                     module="hw_controller", event_type=EVT_PROCESS_START, payload={}))
             HWC_inst0.start()
     finally:
+        HWC_inst0.ctr_iface_server.shutdown()
         if HWC_inst0.event_bus is not None:
             from daq_events import DAQEvent, EVT_PROCESS_STOP
             HWC_inst0.event_bus.emit(DAQEvent(severity="info",

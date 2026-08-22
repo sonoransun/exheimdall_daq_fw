@@ -40,8 +40,10 @@ import threading
 currentPath = os.path.dirname(os.path.realpath(__file__))
 rootPath = os.path.dirname(os.path.dirname(currentPath))
 sys.path.insert(0, os.path.join(rootPath, "_daq_core"))
+sys.path.insert(0, currentPath)
 from iq_header import IQHeader
 from shmemIface import outShmemIface
+from gen_utils import wait_consumer_done
 
 class rampFrameGenator(threading.Thread):
 
@@ -101,7 +103,8 @@ class rampFrameGenator(threading.Thread):
 										drop_mode = False)
 			if not self.out_shmem_iface.init_ok:
 				self.logger.critical("Shared memory initialization failed, exiting..")
-				self.out_shmem_iface.destory_sm_buffer()				
+				self.out_shmem_iface.destory_sm_buffer()
+				return
 			else:
 				self.logger.info("Shared memory interface succesfully initialized")
 
@@ -126,7 +129,8 @@ class rampFrameGenator(threading.Thread):
 				raw_sig_m = np.arange(time_index + self.delays[m], time_index + self.delays[m]+self.N_daq,1, dtype=np.uint32)%self.ramp_max
 				sig_out_ch1[0::2] = raw_sig_m[:]+2*m*self.ramp_max
 				sig_out_ch1[1::2] = raw_sig_m[:]+(2*m+1)*self.ramp_max
-				payload_byte_array += pack('B'*self.N_daq*2, *sig_out_ch1)
+				# tobytes(): byte-identical to pack('B'*N, *arr), ~100x faster
+				payload_byte_array += sig_out_ch1.tobytes()
 				sig_out_chm[m,:]  = sig_out_ch1[:]
 			time_index+=self.N_daq    
 			#######################################
@@ -135,7 +139,10 @@ class rampFrameGenator(threading.Thread):
 			if self.shmem_name != "":
 				active_buffer_index = self.out_shmem_iface.wait_buff_free()
 				logging.info("Buffer free: {:d}".format(active_buffer_index))
-				if active_buffer_index !=3:
+				if active_buffer_index == -1:
+					self.logger.error("Consumer disappeared, stopping generator")
+					break
+				if active_buffer_index in (0, 1):
 					# Get the shared memory buffer
 					iq_frame_buffer_out = (self.out_shmem_iface.buffers[active_buffer_index]).view(dtype=np.uint8)
 
@@ -153,7 +160,7 @@ class rampFrameGenator(threading.Thread):
 				sys.stdout.buffer.write(payload_byte_array) # Write IQ data
 		if self.shmem_name != "":
 			self.out_shmem_iface.send_ctr_terminate()
-			time.sleep(2)
+			wait_consumer_done(self.out_shmem_iface)
 			self.out_shmem_iface.destory_sm_buffer()
 			self.logger.info("Total dropped frames: {:d}".format(self.out_shmem_iface.dropped_frame_cntr))
 		self.logger.info("Standard frame generator exited")

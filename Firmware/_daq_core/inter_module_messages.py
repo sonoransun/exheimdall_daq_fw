@@ -24,9 +24,8 @@ def pack_msg_reconfiguration(module_identifier,center_frequency, sample_rate, ga
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 'r'.encode('ascii') # 1 byte
     msg_byte_array += pack('III', center_frequency, sample_rate, gain) # 12 byte
-    for m in range(msg_length-1-1-12):    
-        msg_byte_array +=pack('b',0)
-    
+    msg_byte_array += bytes(msg_length-1-1-12) # zero padding
+
     return msg_byte_array
 
 def pack_msg_rf_tune(module_identifier,center_frequency):
@@ -50,9 +49,8 @@ def pack_msg_rf_tune(module_identifier,center_frequency):
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 'c'.encode('ascii') # 1 byte
     msg_byte_array += pack('I', center_frequency) # 4 byte
-    for m in range(msg_length-1-1-4):    
-        msg_byte_array +=pack('b',0)
-    
+    msg_byte_array += bytes(msg_length-1-1-4) # zero padding
+
     return msg_byte_array
 
 def pack_msg_set_gain(module_identifier, gains):
@@ -76,8 +74,7 @@ def pack_msg_set_gain(module_identifier, gains):
     msg_byte_array += 'g'.encode('ascii') # 1 byte
     for gain in gains:
         msg_byte_array += pack('I',  gain) # 4 byte
-    for m in range(msg_length-1-1-len(gains)*4):    
-        msg_byte_array +=pack('b',0)    
+    msg_byte_array += bytes(msg_length-1-1-len(gains)*4) # zero padding
     return msg_byte_array
 
 
@@ -97,8 +94,7 @@ def pack_msg_enable_agc(module_identifier):
     msg_length = 128 # Total message length 128 byte
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 'a'.encode('ascii') # 1 byte
-    for _ in range(msg_length-1-1):
-        msg_byte_array +=pack('b',0)
+    msg_byte_array += bytes(msg_length-1-1) # zero padding
 
     return msg_byte_array
 
@@ -126,8 +122,7 @@ def pack_msg_noise_source_ctr(module_identifier, state):
         msg_byte_array += pack('b',1) # 1 byte
     else:
         msg_byte_array += pack('b',0) # 1 byte
-    for m in range(msg_length-1-1-1):    
-        msg_byte_array +=pack('b',0)    
+    msg_byte_array += bytes(msg_length-1-1-1) # zero padding
     return msg_byte_array
 
 def pack_msg_sample_freq_tune(module_identifier, fs_ppm_offsets):
@@ -151,8 +146,7 @@ def pack_msg_sample_freq_tune(module_identifier, fs_ppm_offsets):
     msg_byte_array += 's'.encode('ascii') # 1 byte
     for fs_offset in fs_ppm_offsets:
             msg_byte_array += pack('f',  fs_offset) # 4 byte
-    for m in range(msg_length-1-1-len(fs_ppm_offsets)*4):
-        msg_byte_array +=pack('b',0)
+    msg_byte_array += bytes(msg_length-1-1-len(fs_ppm_offsets)*4) # zero padding
 
     return msg_byte_array
 
@@ -178,6 +172,5 @@ def pack_msg_set_bias_tee(module_identifier, states):
     msg_byte_array += 'b'.encode('ascii') # 1 byte
     for state in states:
         msg_byte_array += pack('I', 1 if state else 0) # 4 byte
-    for m in range(msg_length-1-1-len(states)*4):
-        msg_byte_array += pack('b', 0)
+    msg_byte_array += bytes(msg_length-1-1-len(states)*4) # zero padding
     return msg_byte_array

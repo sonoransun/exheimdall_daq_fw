@@ -9,6 +9,7 @@
     License: GNU GPL V3
 """
 import os
+import fcntl
 import struct
 import time
 import logging
@@ -25,7 +26,8 @@ except ImportError:
 
 from daq_db_records import (
     FrameMetricsRecord, CalHistoryRecord, FreqScanRecord,
-    HWSnapshotRecord, ScheduleStateRecord, M_MAX
+    HWSnapshotRecord, ScheduleStateRecord, M_MAX,
+    DB_SCHEMA_VERSION, RecordVersionError
 )
 
 
@@ -40,7 +42,7 @@ class DAQDatabase:
     def __init__(self, db_dir="_db", max_db_size_mb=500,
                  rotation_max_age_hours=168,
                  write_batch_size=50, write_flush_interval_sec=1.0,
-                 num_channels=5):
+                 num_channels=5, read_only=False):
         self.logger = logging.getLogger(__name__)
         self.db_dir = db_dir
         self.max_db_size_mb = max_db_size_mb
@@ -48,10 +50,12 @@ class DAQDatabase:
         self.write_batch_size = write_batch_size
         self.write_flush_interval_sec = write_flush_interval_sec
         self.num_channels = num_channels
+        self.read_only = read_only
         self.event_bus = None  # Set externally for monitoring integration
         self._closed = False
         self._event_seq = 0
         self._event_seq_lock = threading.Lock()
+        self._read_errors = 0
 
         if bdb is None:
             self.logger.error("BerkeleyDB Python bindings not available (install berkeleydb or bsddb3)")
@@ -60,12 +64,20 @@ class DAQDatabase:
         self._enabled = True
 
         # Create DB directory
-        os.makedirs(self.db_dir, exist_ok=True)
+        if not read_only:
+            os.makedirs(self.db_dir, exist_ok=True)
+        elif not os.path.isdir(self.db_dir):
+            raise RuntimeError("No DAQ database directory at {:s}".format(self.db_dir))
+
+        # Discard databases written by an incompatible schema generation
+        self._check_schema_version()
 
         # Open BDB environment
+        env_flags = bdb.DB_INIT_CDB | bdb.DB_INIT_MPOOL | bdb.DB_THREAD
+        if not read_only:
+            env_flags |= bdb.DB_CREATE
         self._env = bdb.DBEnv()
-        self._env.open(self.db_dir,
-                       bdb.DB_CREATE | bdb.DB_INIT_CDB | bdb.DB_INIT_MPOOL | bdb.DB_THREAD)
+        self._env.open(self.db_dir, env_flags)
 
         # Open primary databases
         self._frame_metrics_db = self._open_db("frame_metrics.db", bdb.DB_BTREE)
@@ -90,84 +102,167 @@ class DAQDatabase:
         self._idx_cal_event_db = self._open_secondary(
             "idx_cal_event.db", self._cal_history_db, self._extract_cal_event_type)
 
-        # Write queue and background writer thread
-        self._write_queue = queue.Queue(maxsize=10000)
-        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True,
-                                                name="daq_db_writer")
-        self._writer_thread.start()
+        if not read_only:
+            # Write queue and background writer thread
+            self._write_queue = queue.Queue(maxsize=10000)
+            self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True,
+                                                    name="daq_db_writer")
+            self._writer_thread.start()
 
-        # Run initial rotation
-        self.rotate(self.rotation_max_age_hours)
-        self.logger.info("DAQ database opened at {:s}".format(self.db_dir))
+            # Run initial rotation
+            self.rotate(self.rotation_max_age_hours)
+        else:
+            self._write_queue = None
+            self._writer_thread = None
+        self.logger.info("DAQ database opened at {:s}{:s}".format(
+            self.db_dir, " (read-only)" if read_only else ""))
+
+    def _check_schema_version(self):
+        """Discard database files written by an older/other schema generation.
+
+        Records are rolling telemetry with a bounded retention window, so a
+        clean re-create on a schema change is acceptable (and the only safe
+        option: v1 records used native-alignment values and little-endian
+        keys, unreadable with the current formats).
+
+        The whole check-marker/delete/write-marker sequence is serialized
+        with an exclusive flock: delay_sync and hw_controller both open the
+        same db_dir at startup, and without the lock the slower process can
+        read a stale marker and delete the environment the faster one has
+        already re-created.
+        """
+        lock_path = os.path.join(self.db_dir, "_schema_version.lock")
+        lock_f = None
+        try:
+            lock_f = open(lock_path, "a")
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            self.logger.warning("Schema lock unavailable ({:s}), proceeding unlocked".format(str(e)))
+            if lock_f is not None:
+                lock_f.close()
+                lock_f = None
+        try:
+            self._check_schema_version_locked()
+        finally:
+            if lock_f is not None:
+                try:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock_f.close()
+
+    def _check_schema_version_locked(self):
+        """Body of _check_schema_version, run under the schema lock."""
+        marker_path = os.path.join(self.db_dir, "_schema_version")
+        stored = None
+        try:
+            with open(marker_path, "r") as f:
+                stored = f.read().strip()
+        except OSError:
+            stored = None
+
+        if stored == str(DB_SCHEMA_VERSION):
+            return
+
+        db_files = []
+        try:
+            for fname in os.listdir(self.db_dir):
+                if fname.endswith(".db") or fname.startswith("__db.") or \
+                   fname.startswith("log."):
+                    db_files.append(fname)
+        except OSError:
+            db_files = []
+
+        if self.read_only:
+            if db_files:
+                raise RuntimeError(
+                    "DAQ database at {:s} has schema version {} (expected {:d})".format(
+                        self.db_dir, stored, DB_SCHEMA_VERSION))
+            return
+
+        if db_files:
+            self.logger.warning(
+                "DB schema version changed ({} -> {:d}), discarding old databases".format(
+                    stored, DB_SCHEMA_VERSION))
+            for fname in db_files:
+                try:
+                    os.remove(os.path.join(self.db_dir, fname))
+                except OSError as e:
+                    self.logger.error("Failed to remove old DB file {:s}: {:s}".format(
+                        fname, str(e)))
+        try:
+            with open(marker_path, "w") as f:
+                f.write("{:d}\n".format(DB_SCHEMA_VERSION))
+        except OSError as e:
+            self.logger.error("Failed to write schema marker: {:s}".format(str(e)))
 
     def _open_db(self, filename, dbtype):
         d = bdb.DB(self._env)
-        d.open(filename, dbtype=dbtype,
-               flags=bdb.DB_CREATE | bdb.DB_THREAD)
+        flags = bdb.DB_THREAD
+        flags |= bdb.DB_RDONLY if self.read_only else bdb.DB_CREATE
+        d.open(filename, dbtype=dbtype, flags=flags)
         return d
 
     def _open_secondary(self, filename, primary_db, key_extractor):
         sec = bdb.DB(self._env)
         sec.set_flags(bdb.DB_DUPSORT)
-        sec.open(filename, dbtype=bdb.DB_BTREE,
-                 flags=bdb.DB_CREATE | bdb.DB_THREAD)
+        flags = bdb.DB_THREAD
+        flags |= bdb.DB_RDONLY if self.read_only else bdb.DB_CREATE
+        sec.open(filename, dbtype=bdb.DB_BTREE, flags=flags)
         primary_db.associate(sec, key_extractor)
         return sec
 
     # --- Secondary key extractors ---
+    # Value offsets are derived from the record VALUE_FORMATs ('=' packed) in
+    # daq_db_records.py; index keys are packed big-endian so BerkeleyDB's
+    # memcmp ordering equals numeric ordering.
 
     @staticmethod
     def _extract_freq(key, data):
         """Extract rf_center_freq from FrameMetricsRecord value"""
-        # Value offset: version(1) + frame_type(4) = 5 bytes, then Q (8 bytes)
-        rf_freq = struct.unpack_from("Q", data, 5)[0]
-        return struct.pack("Q", rf_freq)
+        rf_freq = struct.unpack_from("=Q", data, FrameMetricsRecord.OFFSET_RF_CENTER_FREQ)[0]
+        return struct.pack(">Q", rf_freq)
 
     @staticmethod
     def _extract_frame_type(key, data):
         """Extract frame_type from FrameMetricsRecord value"""
-        frame_type = struct.unpack_from("I", data, 1)[0]
-        return struct.pack("I", frame_type)
+        frame_type = struct.unpack_from("=I", data, FrameMetricsRecord.OFFSET_FRAME_TYPE)[0]
+        return struct.pack(">I", frame_type)
 
     @staticmethod
     def _extract_sync_state(key, data):
         """Extract sync_state from FrameMetricsRecord value"""
-        # version(1) + frame_type(4) + rf_center_freq(8) + active_ant_chs(4) +
-        # cpi_length(4) + daq_block_index(4) + sampling_freq(8) + if_gains(4*32) +
-        # delay_sync_flag(4) + iq_sync_flag(4) = 1+4+8+4+4+4+8+128+4+4 = 169
-        sync_state = struct.unpack_from("I", data, 169)[0]
-        return struct.pack("I", sync_state)
+        sync_state = struct.unpack_from("=I", data, FrameMetricsRecord.OFFSET_SYNC_STATE)[0]
+        return struct.pack(">I", sync_state)
 
     @staticmethod
     def _extract_time(key, data):
-        """Extract timestamp_ms from the primary key"""
-        ts = struct.unpack_from("Q", key, 0)[0]
-        return struct.pack("Q", ts)
+        """Extract timestamp_ms from the primary key (already big-endian)"""
+        return key[0:8]
 
     @staticmethod
     def _extract_cal_freq(key, data):
         """Extract rf_center_freq from CalHistoryRecord value"""
-        # version(1) + event_type(4) = 5 bytes, then Q (8 bytes)
-        rf_freq = struct.unpack_from("Q", data, 5)[0]
-        return struct.pack("Q", rf_freq)
+        rf_freq = struct.unpack_from("=Q", data, CalHistoryRecord.OFFSET_RF_CENTER_FREQ)[0]
+        return struct.pack(">Q", rf_freq)
 
     @staticmethod
     def _extract_cal_event_type(key, data):
         """Extract event_type from CalHistoryRecord value"""
-        event_type = struct.unpack_from("I", data, 1)[0]
-        return struct.pack("I", event_type)
+        event_type = struct.unpack_from("=I", data, CalHistoryRecord.OFFSET_EVENT_TYPE)[0]
+        return struct.pack(">I", event_type)
 
     # --- Write API (non-blocking, queued) ---
 
     def put_frame_metrics(self, iq_header, channel_powers=None, snr=0.0, cal_quality=0.0):
-        if not self._enabled or self._closed:
+        if not self._enabled or self._closed or self.read_only:
             return
         rec = FrameMetricsRecord.from_iq_header(iq_header, channel_powers, snr, cal_quality)
         self._enqueue(("frame_metrics", rec.to_key(), rec.to_bytes()))
 
     def put_cal_event(self, event_type, iq_header, iq_corrections=None,
                       delays=None, sync_state_before=0, sync_state_after=0):
-        if not self._enabled or self._closed:
+        if not self._enabled or self._closed or self.read_only:
             return
         rec = CalHistoryRecord()
         rec.timestamp_ms = int(time.time() * 1000)
@@ -191,24 +286,45 @@ class DAQDatabase:
     def update_freq_scan(self, rf_center_freq, cal_success=True, snr=0.0,
                          cal_quality=0.0, iq_corrections=None, delays=None,
                          num_channels=0):
-        if not self._enabled or self._closed:
+        if not self._enabled or self._closed or self.read_only:
             return
         self._enqueue(("freq_scan_update", rf_center_freq, cal_success, snr,
                         cal_quality, iq_corrections, delays, num_channels))
 
     def put_hw_snapshot(self, iq_header, overdrive_events=0):
-        if not self._enabled or self._closed:
+        if not self._enabled or self._closed or self.read_only:
             return
         rec = HWSnapshotRecord.from_iq_header(iq_header, overdrive_events)
         self._enqueue(("hw_snapshot", rec.to_key(), rec.to_bytes()))
 
     def put_schedule_state(self, key_bytes, value_bytes):
-        if not self._enabled or self._closed:
+        if not self._enabled or self._closed or self.read_only:
             return
         rec = ScheduleStateRecord()
         rec.key = key_bytes
         rec.value = value_bytes
         self._enqueue(("schedule_state", rec.to_key(), rec.to_bytes()))
+
+    def get_schedule_state(self, key_bytes):
+        """Synchronous read of a schedule-state value (or None if absent).
+
+        Note: writes are queued to the background thread, so a value written
+        moments ago may not be visible yet.
+        """
+        if not self._enabled:
+            return None
+        try:
+            data = self._schedule_state_db.get(key_bytes)
+        except Exception as e:
+            self._count_read_error("get_schedule_state", e)
+            return None
+        if not data:
+            return None
+        try:
+            return ScheduleStateRecord.from_bytes(key_bytes, data).value
+        except (RecordVersionError, struct.error) as e:
+            self._count_read_error("get_schedule_state", e)
+            return None
 
     def _enqueue(self, item):
         try:
@@ -304,26 +420,31 @@ class DAQDatabase:
 
     # --- Query API (synchronous reads) ---
 
+    def _count_read_error(self, where, exc):
+        self._read_errors += 1
+        self.logger.error("DB read error in {:s}: {:s}".format(where, str(exc)))
+
     def get_frame_metrics_by_time_range(self, start_ts_ms, end_ts_ms, limit=1000):
         if not self._enabled:
             return []
         results = []
         cursor = self._idx_time_db.cursor()
         try:
-            start_key = struct.pack("Q", start_ts_ms)
-            rec = cursor.set_range(start_key)
+            start_key = struct.pack(">Q", start_ts_ms)
+            # Secondary cursor pget returns (idx_key, primary_key, value)
+            rec = cursor.pget(start_key, flags=bdb.DB_SET_RANGE)
             while rec and len(results) < limit:
-                idx_key, value = rec
-                ts = struct.unpack("Q", idx_key)[0]
+                idx_key, pkey, value = rec
+                ts = struct.unpack(">Q", idx_key)[0]
                 if ts > end_ts_ms:
                     break
-                # Get primary key via pget
-                # We need to re-query using pget for proper key extraction
-                results.append(FrameMetricsRecord.from_bytes(
-                    cursor.pget_current()[1], value))
-                rec = cursor.next()
-        except Exception:
-            pass
+                try:
+                    results.append(FrameMetricsRecord.from_bytes(pkey, value))
+                except (RecordVersionError, struct.error) as e:
+                    self._count_read_error("get_frame_metrics_by_time_range", e)
+                rec = cursor.pget(flags=bdb.DB_NEXT)
+        except Exception as e:
+            self._count_read_error("get_frame_metrics_by_time_range", e)
         finally:
             cursor.close()
         return results
@@ -334,15 +455,17 @@ class DAQDatabase:
         results = []
         cursor = self._idx_freq_db.cursor()
         try:
-            search_key = struct.pack("Q", rf_center_freq)
-            rec = cursor.set(search_key)
+            search_key = struct.pack(">Q", rf_center_freq)
+            rec = cursor.pget(search_key, flags=bdb.DB_SET)
             while rec and len(results) < limit:
-                idx_key, value = rec
-                pkey = cursor.pget_current()[1]
-                results.append(FrameMetricsRecord.from_bytes(pkey, value))
-                rec = cursor.next_dup()
-        except Exception:
-            pass
+                idx_key, pkey, value = rec
+                try:
+                    results.append(FrameMetricsRecord.from_bytes(pkey, value))
+                except (RecordVersionError, struct.error) as e:
+                    self._count_read_error("get_frame_metrics_by_freq", e)
+                rec = cursor.pget(flags=bdb.DB_NEXT_DUP)
+        except Exception as e:
+            self._count_read_error("get_frame_metrics_by_freq", e)
         finally:
             cursor.close()
         return results
@@ -353,17 +476,19 @@ class DAQDatabase:
         results = []
         cursor = self._idx_sync_state_db.cursor()
         try:
-            rec = cursor.first()
+            rec = cursor.pget(flags=bdb.DB_FIRST)
             while rec and len(results) < limit:
-                idx_key, value = rec
-                sync_state = struct.unpack("I", idx_key)[0]
+                idx_key, pkey, value = rec
+                sync_state = struct.unpack(">I", idx_key)[0]
                 if sync_state >= 5:
                     break
-                pkey = cursor.pget_current()[1]
-                results.append(FrameMetricsRecord.from_bytes(pkey, value))
-                rec = cursor.next()
-        except Exception:
-            pass
+                try:
+                    results.append(FrameMetricsRecord.from_bytes(pkey, value))
+                except (RecordVersionError, struct.error) as e:
+                    self._count_read_error("get_frames_with_sync_lost", e)
+                rec = cursor.pget(flags=bdb.DB_NEXT)
+        except Exception as e:
+            self._count_read_error("get_frames_with_sync_lost", e)
         finally:
             cursor.close()
         return results
@@ -378,17 +503,19 @@ class DAQDatabase:
         if rf_center_freq is not None:
             cursor = self._idx_cal_freq_db.cursor()
             try:
-                search_key = struct.pack("Q", rf_center_freq)
-                rec = cursor.set(search_key)
+                search_key = struct.pack(">Q", rf_center_freq)
+                rec = cursor.pget(search_key, flags=bdb.DB_SET)
                 while rec and len(results) < limit:
-                    idx_key, value = rec
-                    pkey = cursor.pget_current()[1]
-                    cal_rec = CalHistoryRecord.from_bytes(pkey, value)
-                    if start_ts_ms <= cal_rec.timestamp_ms <= end_ts_ms:
-                        results.append(cal_rec)
-                    rec = cursor.next_dup()
-            except Exception:
-                pass
+                    idx_key, pkey, value = rec
+                    try:
+                        cal_rec = CalHistoryRecord.from_bytes(pkey, value)
+                        if start_ts_ms <= cal_rec.timestamp_ms <= end_ts_ms:
+                            results.append(cal_rec)
+                    except (RecordVersionError, struct.error) as e:
+                        self._count_read_error("get_cal_history", e)
+                    rec = cursor.pget(flags=bdb.DB_NEXT_DUP)
+            except Exception as e:
+                self._count_read_error("get_cal_history", e)
             finally:
                 cursor.close()
         else:
@@ -398,13 +525,16 @@ class DAQDatabase:
                 rec = cursor.set_range(start_key)
                 while rec and len(results) < limit:
                     key, value = rec
-                    cal_rec = CalHistoryRecord.from_bytes(key, value)
-                    if cal_rec.timestamp_ms > end_ts_ms:
-                        break
-                    results.append(cal_rec)
+                    try:
+                        cal_rec = CalHistoryRecord.from_bytes(key, value)
+                        if cal_rec.timestamp_ms > end_ts_ms:
+                            break
+                        results.append(cal_rec)
+                    except (RecordVersionError, struct.error) as e:
+                        self._count_read_error("get_cal_history", e)
                     rec = cursor.next()
-            except Exception:
-                pass
+            except Exception as e:
+                self._count_read_error("get_cal_history", e)
             finally:
                 cursor.close()
         return results
@@ -415,19 +545,27 @@ class DAQDatabase:
         results = []
         if rf_center_freq is not None:
             key = FreqScanRecord.make_key(rf_center_freq)
-            data = self._freq_scan_db.get(key)
-            if data:
-                results.append(FreqScanRecord.from_bytes(key, data))
+            try:
+                data = self._freq_scan_db.get(key)
+                if data:
+                    results.append(FreqScanRecord.from_bytes(key, data))
+            except (RecordVersionError, struct.error) as e:
+                self._count_read_error("get_freq_scan_summary", e)
+            except Exception as e:
+                self._count_read_error("get_freq_scan_summary", e)
         else:
             cursor = self._freq_scan_db.cursor()
             try:
                 rec = cursor.first()
                 while rec:
                     key, value = rec
-                    results.append(FreqScanRecord.from_bytes(key, value))
+                    try:
+                        results.append(FreqScanRecord.from_bytes(key, value))
+                    except (RecordVersionError, struct.error) as e:
+                        self._count_read_error("get_freq_scan_summary", e)
                     rec = cursor.next()
-            except Exception:
-                pass
+            except Exception as e:
+                self._count_read_error("get_freq_scan_summary", e)
             finally:
                 cursor.close()
         return results
@@ -444,13 +582,16 @@ class DAQDatabase:
             rec = cursor.set_range(start_key)
             while rec and len(results) < limit:
                 key, value = rec
-                hw_rec = HWSnapshotRecord.from_bytes(key, value)
-                if hw_rec.timestamp_ms > end_ts_ms:
-                    break
-                results.append(hw_rec)
+                try:
+                    hw_rec = HWSnapshotRecord.from_bytes(key, value)
+                    if hw_rec.timestamp_ms > end_ts_ms:
+                        break
+                    results.append(hw_rec)
+                except (RecordVersionError, struct.error) as e:
+                    self._count_read_error("get_hw_snapshots", e)
                 rec = cursor.next()
-        except Exception:
-            pass
+        except Exception as e:
+            self._count_read_error("get_hw_snapshots", e)
         finally:
             cursor.close()
         return results
@@ -459,28 +600,31 @@ class DAQDatabase:
 
     def rotate(self, max_age_hours=None):
         """Delete records older than max_age_hours"""
-        if not self._enabled:
+        if not self._enabled or self.read_only:
             return
         if max_age_hours is None:
             max_age_hours = self.rotation_max_age_hours
         cutoff_ms = int((time.time() - max_age_hours * 3600) * 1000)
-        cutoff_key = struct.pack("Q", cutoff_ms)
 
         deleted = 0
         for db_obj in [self._frame_metrics_db, self._cal_history_db, self._hw_snapshots_db]:
-            cursor = db_obj.cursor()
+            # CDB environments hand out read-only cursors by default; deleting
+            # through one fails with BDB0697, so request a write cursor.
+            cursor = db_obj.cursor(flags=bdb.DB_WRITECURSOR)
             try:
+                # Keys are big-endian, so memcmp iteration order is numeric
+                # timestamp order and breaking at the cutoff is correct.
                 rec = cursor.first()
                 while rec:
                     key, _ = rec
-                    ts = struct.unpack_from("Q", key, 0)[0]
+                    ts = struct.unpack_from(">Q", key, 0)[0]
                     if ts >= cutoff_ms:
                         break
                     cursor.delete()
                     deleted += 1
                     rec = cursor.next()
-            except Exception:
-                pass
+            except Exception as e:
+                self._count_read_error("rotate", e)
             finally:
                 cursor.close()
 
@@ -489,7 +633,7 @@ class DAQDatabase:
 
     def compact(self):
         """Compact all databases to reclaim space"""
-        if not self._enabled:
+        if not self._enabled or self.read_only:
             return
         for db_obj in [self._frame_metrics_db, self._cal_history_db,
                        self._freq_scan_db, self._hw_snapshots_db,
@@ -512,7 +656,8 @@ class DAQDatabase:
                 stats[fname] = {"size_bytes": os.path.getsize(fpath)}
             except OSError:
                 stats[fname] = {"size_bytes": 0}
-        stats["write_queue_size"] = self._write_queue.qsize()
+        stats["write_queue_size"] = self._write_queue.qsize() if self._write_queue else 0
+        stats["read_errors"] = self._read_errors
         return stats
 
     def close(self):
@@ -521,7 +666,8 @@ class DAQDatabase:
             return
         self._closed = True
         # Wait for writer thread to flush
-        self._writer_thread.join(timeout=5.0)
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=5.0)
 
         # Close secondary indices first
         for sec_db in [self._idx_freq_db, self._idx_frame_type_db,

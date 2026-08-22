@@ -36,7 +36,6 @@
 #include "log.h"
 
 #define CHK_SUCC(r, e)    if(r != 0)  {return e;}
-#define CHK_ZERO(r, e)    if(r == 0)  {return e;}
 #define CHK_READ(r, s ,e) if(r != s)  {return e;}
 #define CHK_DATA_PIPE(fd, e) if(feof(fd)) {return e;}
 
@@ -142,39 +141,62 @@ int wait_buff_ready(struct shmem_transfer_struct* sm_buff)
     return -2;
 }
 
-int init_out_sm_buffer(struct shmem_transfer_struct* sm_buff) 
+int init_out_sm_buffer(struct shmem_transfer_struct* sm_buff)
 {
-    /* Create the shared memory object */
-    sm_buff->shm_fd[0] = shm_open(sm_buff->shared_memory_names[0], O_CREAT | O_RDWR, 0666); 
-    CHK_ZERO(sm_buff->shm_fd[0], -1)
-    sm_buff->shm_fd[1] = shm_open(sm_buff->shared_memory_names[1], O_CREAT | O_RDWR, 0666);     
-    CHK_ZERO(sm_buff->shm_fd[1], -1)    
-  
-    /* Configure the size of the shared memory object */    
-    int ret = ftruncate(sm_buff->shm_fd[0], sm_buff->shared_memory_size); 
+    /* Create the shared memory object (shm_open returns -1 on error; fd 0 is valid) */
+    sm_buff->shm_fd[0] = shm_open(sm_buff->shared_memory_names[0], O_CREAT | O_RDWR, 0666);
+    if (sm_buff->shm_fd[0] < 0)
+    {
+        log_error("shm_open failed for %s: %s", sm_buff->shared_memory_names[0], strerror(errno));
+        return -1;
+    }
+    sm_buff->shm_fd[1] = shm_open(sm_buff->shared_memory_names[1], O_CREAT | O_RDWR, 0666);
+    if (sm_buff->shm_fd[1] < 0)
+    {
+        log_error("shm_open failed for %s: %s", sm_buff->shared_memory_names[1], strerror(errno));
+        return -1;
+    }
+
+    /* Configure the size of the shared memory object */
+    int ret = ftruncate(sm_buff->shm_fd[0], sm_buff->shared_memory_size);
     CHK_SUCC(ret, -2)
-    ret = ftruncate(sm_buff->shm_fd[1], sm_buff->shared_memory_size); 
+    ret = ftruncate(sm_buff->shm_fd[1], sm_buff->shared_memory_size);
     CHK_SUCC(ret, -2)
 
-    /* Memory map the shared memory object */    
-    sm_buff->shm_ptr[0] = mmap(0, sm_buff->shared_memory_size, PROT_WRITE, MAP_SHARED, sm_buff->shm_fd[0], 0); 
-    CHK_ZERO(sm_buff->shm_ptr[0], -3)
-    sm_buff->shm_ptr[1] = mmap(0, sm_buff->shared_memory_size, PROT_WRITE, MAP_SHARED, sm_buff->shm_fd[1], 0); 
-    CHK_ZERO(sm_buff->shm_ptr[1], -3)
+    /* Memory map the shared memory object (mmap returns MAP_FAILED on error, never NULL) */
+    sm_buff->shm_ptr[0] = mmap(0, sm_buff->shared_memory_size, PROT_WRITE, MAP_SHARED, sm_buff->shm_fd[0], 0);
+    if (sm_buff->shm_ptr[0] == MAP_FAILED)
+    {
+        log_error("mmap failed for %s: %s", sm_buff->shared_memory_names[0], strerror(errno));
+        return -3;
+    }
+    sm_buff->shm_ptr[1] = mmap(0, sm_buff->shared_memory_size, PROT_WRITE, MAP_SHARED, sm_buff->shm_fd[1], 0);
+    if (sm_buff->shm_ptr[1] == MAP_FAILED)
+    {
+        log_error("mmap failed for %s: %s", sm_buff->shared_memory_names[1], strerror(errno));
+        return -3;
+    }
 
     /* Open forward control FIFO*/
     sm_buff->fw_ctr_fifo = fopen(sm_buff->fw_ctr_fifo_name, "w");
-    CHK_ZERO(sm_buff->fw_ctr_fifo, -4);
+    if (sm_buff->fw_ctr_fifo == NULL)
+    {
+        log_error("Failed to open forward control FIFO %s: %s", sm_buff->fw_ctr_fifo_name, strerror(errno));
+        return -4;
+    }
 
     /* Open backward control FIFO*/
     sm_buff->bw_ctr_fifo= fopen(sm_buff->bw_ctr_fifo_name, "r");
+    if (sm_buff->bw_ctr_fifo == NULL)
+    {
+        log_error("Failed to open backward control FIFO %s: %s", sm_buff->bw_ctr_fifo_name, strerror(errno));
+        return -5;
+    }
     if (sm_buff->drop_mode)
     {
-         int ret= fcntl(fileno(sm_buff->bw_ctr_fifo), F_SETFL, fcntl(fileno(sm_buff->bw_ctr_fifo), F_GETFL) |  O_NONBLOCK);                               
+         int ret= fcntl(fileno(sm_buff->bw_ctr_fifo), F_SETFL, fcntl(fileno(sm_buff->bw_ctr_fifo), F_GETFL) |  O_NONBLOCK);
         CHK_SUCC(ret, -4);
     }
-    
-    CHK_ZERO(sm_buff->bw_ctr_fifo, -5);
 
     sm_buff->buffer_free[0] = true;
     sm_buff->buffer_free[1] = true;
@@ -185,34 +207,58 @@ int init_out_sm_buffer(struct shmem_transfer_struct* sm_buff)
 
     return 0;
 }
-int init_in_sm_buffer(struct shmem_transfer_struct* sm_buff) 
+int init_in_sm_buffer(struct shmem_transfer_struct* sm_buff)
 {
     /* Open forward control FIFO*/
     sm_buff->fw_ctr_fifo = fopen(sm_buff->fw_ctr_fifo_name, "r");
-    CHK_ZERO(sm_buff->fw_ctr_fifo, -1)
+    if (sm_buff->fw_ctr_fifo == NULL)
+    {
+        log_error("Failed to open forward control FIFO %s: %s", sm_buff->fw_ctr_fifo_name, strerror(errno));
+        return -1;
+    }
 
     /* Open backward control FIFO*/
     sm_buff->bw_ctr_fifo= fopen(sm_buff->bw_ctr_fifo_name, "w");
-    CHK_ZERO(sm_buff->bw_ctr_fifo, -2)
+    if (sm_buff->bw_ctr_fifo == NULL)
+    {
+        log_error("Failed to open backward control FIFO %s: %s", sm_buff->bw_ctr_fifo_name, strerror(errno));
+        return -2;
+    }
 
     /* Check init ready success on the generator side*/
     int ret = wait_ctr_init_ready(sm_buff);
     CHK_SUCC(ret, -3)
 
-    /* Create the shared memory object */
-    sm_buff->shm_fd[0] = shm_open(sm_buff->shared_memory_names[0], O_RDWR, 0666); 
-    CHK_ZERO(sm_buff->shm_fd[0], -4)
-    sm_buff->shm_fd[1] = shm_open(sm_buff->shared_memory_names[1], O_RDWR, 0666);     
-    CHK_ZERO(sm_buff->shm_fd[1], -4)    
-  
-    /* Memory map the shared memory object */    
-    sm_buff->shm_ptr[0] = mmap(0, sm_buff->shared_memory_size, PROT_READ, MAP_SHARED, sm_buff->shm_fd[0], 0); 
-    CHK_ZERO(sm_buff->shm_ptr[0], -5)
-    sm_buff->shm_ptr[1] = mmap(0, sm_buff->shared_memory_size, PROT_READ, MAP_SHARED, sm_buff->shm_fd[1], 0); 
-    CHK_ZERO(sm_buff->shm_ptr[1], -5)
-    
+    /* Create the shared memory object (shm_open returns -1 on error; fd 0 is valid) */
+    sm_buff->shm_fd[0] = shm_open(sm_buff->shared_memory_names[0], O_RDWR, 0666);
+    if (sm_buff->shm_fd[0] < 0)
+    {
+        log_error("shm_open failed for %s: %s", sm_buff->shared_memory_names[0], strerror(errno));
+        return -4;
+    }
+    sm_buff->shm_fd[1] = shm_open(sm_buff->shared_memory_names[1], O_RDWR, 0666);
+    if (sm_buff->shm_fd[1] < 0)
+    {
+        log_error("shm_open failed for %s: %s", sm_buff->shared_memory_names[1], strerror(errno));
+        return -4;
+    }
+
+    /* Memory map the shared memory object (mmap returns MAP_FAILED on error, never NULL) */
+    sm_buff->shm_ptr[0] = mmap(0, sm_buff->shared_memory_size, PROT_READ, MAP_SHARED, sm_buff->shm_fd[0], 0);
+    if (sm_buff->shm_ptr[0] == MAP_FAILED)
+    {
+        log_error("mmap failed for %s: %s", sm_buff->shared_memory_names[0], strerror(errno));
+        return -5;
+    }
+    sm_buff->shm_ptr[1] = mmap(0, sm_buff->shared_memory_size, PROT_READ, MAP_SHARED, sm_buff->shm_fd[1], 0);
+    if (sm_buff->shm_ptr[1] == MAP_FAILED)
+    {
+        log_error("mmap failed for %s: %s", sm_buff->shared_memory_names[1], strerror(errno));
+        return -5;
+    }
+
     sm_buff->dropped_frame_cntr = 0;
-    
+
     return 0;
 }
 
@@ -275,77 +321,8 @@ int destory_sm_buffer(struct shmem_transfer_struct* sm_buff)
     return 0;
 }
 
-/*
-*-------------------------------------
-*    Optimized Batched Control Functions
-*-------------------------------------
-*/
-
-#include <time.h>  // For clock_gettime
-
-int init_ctr_batch(struct shmem_control_batch* batch, uint32_t initial_sequence)
-{
-    if (!batch) return -1;
-
-    memset(batch, 0, sizeof(*batch));
-    batch->sequence = initial_sequence;
-    update_ctr_batch_timestamp(batch);
-    return 0;
-}
-
-void update_ctr_batch_timestamp(struct shmem_control_batch* batch)
-{
-    if (!batch) return;
-
-    struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-        batch->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-    }
-}
-
-void update_ctr_batch_buffer_ready(struct shmem_control_batch* batch, int buffer_index)
-{
-    if (!batch || buffer_index < 0 || buffer_index > 1) return;
-
-    // Set appropriate bit in buffer mask
-    if (buffer_index == 0) {
-        batch->buffer_mask |= 0x01;  // A_BUFF_READY equivalent
-    } else {
-        batch->buffer_mask |= 0x02;  // B_BUFF_READY equivalent
-    }
-
-    batch->frame_count++;
-    batch->sequence++;
-    update_ctr_batch_timestamp(batch);
-}
-
-void send_ctr_batch(struct shmem_transfer_struct* sm_buff, struct shmem_control_batch* batch)
-{
-    if (!sm_buff || !batch) return;
-
-    // Single write operation for entire batch structure
-    fwrite(batch, sizeof(*batch), 1, sm_buff->fw_ctr_fifo);
-    fflush(sm_buff->fw_ctr_fifo);  // Single flush for batched data
-
-    // Reset buffer mask after sending
-    batch->buffer_mask = 0;
-}
-
-void send_ctr_buff_ready_batch(struct shmem_transfer_struct* sm_buff, int active_buff_index,
-                              struct shmem_control_batch* batch)
-{
-    if (!sm_buff || !batch) {
-        // Fallback to original single-byte protocol
-        send_ctr_buff_ready(sm_buff, active_buff_index);
-        return;
-    }
-
-    // Update batch with buffer ready status
-    update_ctr_batch_buffer_ready(batch, active_buff_index);
-
-    // Mark buffer as not free
-    sm_buff->buffer_free[active_buff_index] = false;
-
-    // Send batched control data
-    send_ctr_batch(sm_buff, batch);
-}
+/* Note: the experimental "batched control" API that used to live here was
+ * removed. It framed a 64-byte packed struct onto the control FIFOs, which is
+ * protocol-incompatible with every consumer (C and Python) of the single-byte
+ * A_BUFF_READY/B_BUFF_READY/INIT_READY/TERMINATE signaling, and it was never
+ * called anywhere in the tree. */

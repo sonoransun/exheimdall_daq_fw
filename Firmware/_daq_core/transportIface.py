@@ -39,7 +39,8 @@ class _StubProducerBase:
 
     _TRANSPORT_LABEL = "unknown"
 
-    def __init__(self, shmem_name, shmem_size, drop_mode=False, instance_id=0):
+    def __init__(self, shmem_name, shmem_size, drop_mode=False, instance_id=0,
+                 **kwargs):
         raise NotImplementedError(
             "{} transport producer requires the native C extension library "
             "(lib{}_transport.so). Build and install it first.".format(
@@ -51,7 +52,7 @@ class _StubConsumerBase:
 
     _TRANSPORT_LABEL = "unknown"
 
-    def __init__(self, shmem_name, instance_id=0):
+    def __init__(self, shmem_name, instance_id=0, **kwargs):
         raise NotImplementedError(
             "{} transport consumer requires the native C extension library "
             "(lib{}_transport.so). Build and install it first.".format(
@@ -126,41 +127,57 @@ class TransportProducer:
 
         self.logger.info("Initializing producer transport: %s (%s)",
                          transport_type, backend_cls.__name__)
-        self._backend = backend_cls(shmem_name, shmem_size,
-                                    drop_mode=drop_mode,
-                                    instance_id=instance_id)
+        # Unavailable backends must fail through init_ok (the documented
+        # failure path checked by every caller), not with a traceback.
+        self._backend = None
+        try:
+            self._backend = backend_cls(shmem_name, shmem_size,
+                                        drop_mode=drop_mode,
+                                        instance_id=instance_id)
+        except NotImplementedError as e:
+            self.logger.critical("Producer transport '%s' unavailable: %s",
+                                 transport_type, e)
 
     # -- forwarded properties ------------------------------------------------
 
     @property
     def init_ok(self):
-        return self._backend.init_ok
+        return self._backend is not None and self._backend.init_ok
 
     @init_ok.setter
     def init_ok(self, value):
-        self._backend.init_ok = value
+        if self._backend is not None:
+            self._backend.init_ok = value
 
     @property
     def buffers(self):
-        return self._backend.buffers
+        return self._backend.buffers if self._backend is not None else []
 
     @property
     def memories(self):
-        return self._backend.memories
+        return self._backend.memories if self._backend is not None else []
 
     # -- forwarded methods ---------------------------------------------------
 
     def send_ctr_buff_ready(self, active_buffer_index):
+        if self._backend is None:
+            return None
         return self._backend.send_ctr_buff_ready(active_buffer_index)
 
     def send_ctr_terminate(self):
+        if self._backend is None:
+            return None
         return self._backend.send_ctr_terminate()
 
     def destory_sm_buffer(self):
         """Note: name preserved from outShmemIface for backward compatibility."""
+        if self._backend is None:
+            return None
         return self._backend.destory_sm_buffer()
 
     def wait_buff_free(self):
+        if self._backend is None:
+            return -1
         return self._backend.wait_buff_free()
 
 
@@ -171,7 +188,8 @@ class TransportConsumer:
     chosen backend so that existing callers need no modification.
     """
 
-    def __init__(self, shmem_name, instance_id=0, transport_type='shm'):
+    def __init__(self, shmem_name, instance_id=0, transport_type='shm',
+                 read_timeout_ms=0):
         self.logger = logging.getLogger(__name__)
         self.transport_type = transport_type
 
@@ -182,34 +200,49 @@ class TransportConsumer:
 
         self.logger.info("Initializing consumer transport: %s (%s)",
                          transport_type, backend_cls.__name__)
-        self._backend = backend_cls(shmem_name, instance_id=instance_id)
+        # Unavailable backends must fail through init_ok (the documented
+        # failure path checked by every caller), not with a traceback.
+        self._backend = None
+        try:
+            self._backend = backend_cls(shmem_name, instance_id=instance_id,
+                                        read_timeout_ms=read_timeout_ms)
+        except NotImplementedError as e:
+            self.logger.critical("Consumer transport '%s' unavailable: %s",
+                                 transport_type, e)
 
     # -- forwarded properties ------------------------------------------------
 
     @property
     def init_ok(self):
-        return self._backend.init_ok
+        return self._backend is not None and self._backend.init_ok
 
     @init_ok.setter
     def init_ok(self, value):
-        self._backend.init_ok = value
+        if self._backend is not None:
+            self._backend.init_ok = value
 
     @property
     def buffers(self):
-        return self._backend.buffers
+        return self._backend.buffers if self._backend is not None else []
 
     @property
     def memories(self):
-        return self._backend.memories
+        return self._backend.memories if self._backend is not None else []
 
     # -- forwarded methods ---------------------------------------------------
 
     def send_ctr_buff_ready(self, active_buffer_index):
+        if self._backend is None:
+            return None
         return self._backend.send_ctr_buff_ready(active_buffer_index)
 
     def destory_sm_buffer(self):
         """Note: name preserved from inShmemIface for backward compatibility."""
+        if self._backend is None:
+            return None
         return self._backend.destory_sm_buffer()
 
     def wait_buff_free(self):
+        if self._backend is None:
+            return -1
         return self._backend.wait_buff_free()

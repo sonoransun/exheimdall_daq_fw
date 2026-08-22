@@ -9,6 +9,7 @@ Author: Generated via Claude Code optimization plan
 """
 
 import os
+import shutil
 import sys
 import time
 import json
@@ -20,14 +21,32 @@ import unittest
 
 # Add the util directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent.parent / "util"))
-from performance_monitor import DAQPerformanceMonitor
+try:
+    from performance_monitor import DAQPerformanceMonitor
+    _MONITOR_IMPORT_ERROR = None
+except Exception as _e:  # psutil missing, Linux-only interfaces, ...
+    DAQPerformanceMonitor = None
+    _MONITOR_IMPORT_ERROR = _e
 
 class PerformanceRegressionTest(unittest.TestCase):
-    """Test suite for HeIMDALL DAQ performance regression detection"""
+    """Test suite for HeIMDALL DAQ performance regression detection.
+
+    Live-system checks skip cleanly (with a printed reason) when the DAQ
+    chain is not running, the platform is not Linux, or an optional tool
+    (psutil, stress-ng) is unavailable — so a CI box never reports bogus
+    failures, and a provisioned Pi still gets real assertions."""
 
     @classmethod
     def setUpClass(cls):
         """Set up test environment"""
+        if DAQPerformanceMonitor is None:
+            raise unittest.SkipTest(
+                "SKIP reason: performance_monitor unavailable "
+                "({})".format(_MONITOR_IMPORT_ERROR))
+        if not sys.platform.startswith("linux"):
+            raise unittest.SkipTest(
+                "SKIP reason: live performance checks are Linux-only "
+                "(/proc, RT scheduling)")
         cls.test_duration = 10  # Short tests for CI
         cls.instance_id = 0
         cls.monitor = DAQPerformanceMonitor(cls.instance_id)
@@ -103,7 +122,10 @@ class PerformanceRegressionTest(unittest.TestCase):
         if latency_measurements:
             mean_latency = statistics.mean(latency_measurements)
             max_latency = max(latency_measurements)
-            p95_latency = statistics.quantiles(latency_measurements, n=20)[18]  # 95th percentile
+            if len(latency_measurements) >= 2:
+                p95_latency = statistics.quantiles(latency_measurements, n=20)[18]  # 95th percentile
+            else:
+                p95_latency = max_latency  # quantiles() needs >= 2 samples
 
             print(f"Latency - Mean: {mean_latency:.2f}ms, Max: {max_latency:.2f}ms, P95: {p95_latency:.2f}ms")
 
@@ -174,6 +196,8 @@ class PerformanceRegressionTest(unittest.TestCase):
         self.assertGreater(len(rt_processes), 0,
                           "No processes found with real-time scheduling")
 
+    @unittest.skipUnless(shutil.which("stress-ng"),
+                         "SKIP reason: stress-ng not installed")
     def test_stress_optimization(self):
         """Verify optimizations under stress conditions"""
         print("\nTesting optimizations under stress...")
@@ -215,29 +239,33 @@ class PerformanceRegressionTest(unittest.TestCase):
                 stress_proc.wait()
 
     def test_simd_acceleration_active(self):
-        """Verify SIMD acceleration is being utilized (ARM/x86)"""
+        """The built decimator binary carries a real FIR offload engine
+        (KFR/NEON/Ne10 SIMD, or the explicit portable 'generic' engine) —
+        replaces the old assertTrue(True) placeholder with a check of the
+        actual binary."""
         print("\nTesting SIMD acceleration status...")
 
-        # Check if NEON/SSE acceleration is compiled in
-        try:
-            # Look for NEON/SSE indicators in process memory maps
-            for proc_name, process in self.monitor.processes.items():
-                try:
-                    maps_file = f"/proc/{process.pid}/maps"
-                    if os.path.exists(maps_file):
-                        with open(maps_file, 'r') as f:
-                            maps_content = f.read()
-                            # This is a basic check - in practice, we'd check binary symbols
-                            print(f"{proc_name} process maps checked")
-                except (FileNotFoundError, PermissionError):
-                    pass
+        decimate_bin = Path(__file__).parent.parent / "_daq_core" / "decimate.out"
+        if not decimate_bin.exists():
+            self.skipTest("SKIP reason: decimate.out not built")
 
-            # For now, just verify that optimized builds are enabled
-            # In practice, this would check for SIMD instruction usage
-            self.assertTrue(True, "SIMD acceleration check placeholder")
+        with open(decimate_bin, "rb") as f:
+            blob = f.read()
 
-        except Exception as e:
-            self.fail(f"SIMD acceleration test failed: {e}")
+        simd_markers = [b"kfr", b"KFR", b"neon", b"NEON", b"Ne10", b"ne10"]
+        generic_markers = [b"generic", b"cpu_generic"]
+        found_simd = [m.decode() for m in simd_markers if m in blob]
+        found_generic = [m.decode() for m in generic_markers if m in blob]
+
+        print(f"Engine markers in decimate.out - SIMD: {found_simd}, "
+              f"generic: {found_generic}")
+        self.assertTrue(
+            found_simd or found_generic,
+            "decimate.out contains no known FIR engine marker "
+            "(kfr/neon/Ne10/generic) - offload engine missing from the build")
+        if not found_simd:
+            print("Warning: only the portable generic engine is present - "
+                  "no SIMD acceleration in this build")
 
 def run_performance_suite():
     """Run the complete performance test suite"""

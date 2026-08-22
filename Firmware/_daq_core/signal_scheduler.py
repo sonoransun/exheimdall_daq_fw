@@ -20,6 +20,7 @@ class ScheduleEntry:
     gains: list = None  # R820T tenths-of-dB per channel, or None for no change
     dwell_frames: int = 100  # Number of DATA frames to dwell
     require_cal: bool = True  # Wait for calibration before counting dwell
+    dwell_time_sec: float = None  # Alternative to dwell_frames; converted on load
 
 
 @dataclass
@@ -50,24 +51,42 @@ class SignalScheduler:
     STATE_DWELLING = "ACTIVE_DWELLING"
     STATE_WAITING_CAL = "ACTIVE_WAITING_CAL"
 
-    def __init__(self, M, sample_rate=2400000, cpi_size=1048576, decimation_ratio=1):
+    def __init__(self, M, sample_rate=2400000, cpi_size=1048576, decimation_ratio=1,
+                 db=None):
         self.logger = logging.getLogger(__name__)
         self.M = M
         self.sample_rate = sample_rate
         self.cpi_size = cpi_size
         self.decimation_ratio = decimation_ratio
+        self.db = db  # Optional DAQDatabase for schedule-state persistence
 
         self.schedule = None
         self.state = self.STATE_IDLE
         self.max_cal_wait_frames = 500
         self.cal_wait_counter = 0
         self._pingpong_forward = True  # Direction for pingpong mode
+        # Armed by _restore_state so the first tick() commands FREQ for the
+        # restored entry (the DAQ boots at the [daq] center frequency)
+        self._pending_retune = False
+
+    def frames_for_seconds(self, seconds):
+        """Convert a dwell duration in seconds to a DATA-frame count.
+
+        One frame consumes cpi_size * decimation_ratio ADC samples at
+        sample_rate samples/sec.
+        """
+        frame_time = (self.cpi_size * self.decimation_ratio) / float(self.sample_rate)
+        return max(1, int(round(float(seconds) / frame_time)))
 
     def load_schedule(self, schedule):
         """Load and activate a schedule"""
         if not schedule.entries:
             self.logger.warning("Empty schedule, ignoring")
             return
+        # Convert time-based dwell to frames using the DAQ timing parameters
+        for entry in schedule.entries:
+            if entry.dwell_time_sec is not None:
+                entry.dwell_frames = self.frames_for_seconds(entry.dwell_time_sec)
         self.schedule = schedule
         self.schedule.active = True
         self.schedule.current_index = 0
@@ -75,15 +94,20 @@ class SignalScheduler:
         self.state = self.STATE_WAITING_CAL
         self.cal_wait_counter = 0
         self._pingpong_forward = True
+        self._pending_retune = False
+        self._restore_state()
         self.logger.info("Schedule '{:s}' loaded with {:d} entries".format(
             schedule.name, len(schedule.entries)))
+        self._persist_state()
 
     def clear_schedule(self):
         """Stop and clear the active schedule"""
         self.schedule = None
         self.state = self.STATE_IDLE
         self.cal_wait_counter = 0
+        self._pending_retune = False
         self.logger.info("Schedule cleared")
+        self._persist_state()
 
     def skip_to_next(self):
         """Skip to the next schedule entry"""
@@ -93,6 +117,51 @@ class SignalScheduler:
         self.schedule.frames_at_current = 0
         self.state = self.STATE_WAITING_CAL
         self.cal_wait_counter = 0
+        self._persist_state()
+
+    # --- Optional schedule-state persistence (active only when a db is set) ---
+
+    _STATE_KEY = b"scheduler_state"
+
+    def _persist_state(self):
+        """Store the current schedule position for resume-after-restart."""
+        if self.db is None:
+            return
+        try:
+            if self.schedule is None:
+                state = {"name": None, "current_index": 0, "active": False}
+            else:
+                state = {"name": self.schedule.name,
+                         "current_index": self.schedule.current_index,
+                         "active": self.schedule.active}
+            self.db.put_schedule_state(self._STATE_KEY,
+                                       json.dumps(state).encode("utf-8"))
+        except Exception as e:
+            self.logger.error("Failed to persist schedule state: {:s}".format(str(e)))
+
+    def _restore_state(self):
+        """Resume at the persisted index when the same schedule is reloaded."""
+        if self.db is None or self.schedule is None:
+            return
+        try:
+            raw = self.db.get_schedule_state(self._STATE_KEY)
+            if not raw:
+                return
+            state = json.loads(raw.decode("utf-8"))
+            idx = state.get("current_index", 0)
+            if (state.get("name") == self.schedule.name and
+                    state.get("active", False) and
+                    isinstance(idx, int) and
+                    0 <= idx < len(self.schedule.entries)):
+                self.schedule.current_index = idx
+                # The DAQ restarts at the [daq] center frequency, which almost
+                # never matches the resumed entry: command its FREQ on the
+                # first tick (mirrors _do_transition for a normal advance)
+                self._pending_retune = True
+                self.logger.info("Resuming schedule '{:s}' at entry {:d}".format(
+                    self.schedule.name, idx))
+        except Exception as e:
+            self.logger.error("Failed to restore schedule state: {:s}".format(str(e)))
 
     def get_status(self):
         """Return current scheduler status as a dict"""
@@ -117,10 +186,12 @@ class SignalScheduler:
         Called once per frame in STATE_IQ_CAL of hw_controller.
 
         Returns:
-            tuple (command_str, param_list) when a transition is due, e.g.:
-                ("FREQ", [frequency])
-                ("GAIN", [g0, g1, ...])
-            None if no action needed
+            tuple (command_str, value) when a transition is due:
+                ("FREQ", frequency) — scalar frequency in Hz; the caller
+                (hw_controller) wraps it into the parameter list itself.
+            None if no action needed.
+            Entry gains are fetched separately via get_pending_gain(),
+            which returns ("GAIN", [g0, g1, ...]).
         """
         if self.schedule is None or not self.schedule.active:
             return None
@@ -132,6 +203,18 @@ class SignalScheduler:
             return None
 
         entry = self.schedule.entries[self.schedule.current_index]
+
+        if self._pending_retune:
+            # A persisted index was adopted by _restore_state(): command the
+            # restored entry's frequency before any cal-wait/dwell accounting
+            # (mirrors _do_transition for a normal advance).
+            self._pending_retune = False
+            self.schedule.frames_at_current = 0
+            self.state = self.STATE_WAITING_CAL
+            self.cal_wait_counter = 0
+            self.logger.info("Retuning to restored entry {:d} at {:d} Hz".format(
+                self.schedule.current_index, entry.frequency))
+            return ("FREQ", entry.frequency)
 
         if self.state == self.STATE_WAITING_CAL:
             self.cal_wait_counter += 1
@@ -170,12 +253,14 @@ class SignalScheduler:
         if not self.schedule.active:
             self.state = self.STATE_IDLE
             self.logger.info("Schedule '{:s}' completed".format(self.schedule.name))
+            self._persist_state()
             return None
 
         entry = self.schedule.entries[self.schedule.current_index]
         self.schedule.frames_at_current = 0
         self.state = self.STATE_WAITING_CAL
         self.cal_wait_counter = 0
+        self._persist_state()
 
         self.logger.info("Transition to freq {:d} Hz (entry {:d}/{:d})".format(
             entry.frequency, self.schedule.current_index + 1,
@@ -248,6 +333,16 @@ class ScheduleParser:
         while len(dwell_frames) < len(frequencies):
             dwell_frames.append(dwell_frames[-1] if dwell_frames else 100)
 
+        # Optional time-based dwell (seconds); converted to frames by
+        # SignalScheduler.load_schedule using the DAQ timing parameters.
+        # Takes precedence over dwell_frames for the entries it covers.
+        dwell_sec_str = parser.get(section_name, 'dwell_time_sec', fallback='')
+        dwell_times = []
+        if dwell_sec_str.strip():
+            dwell_times = [float(d.strip()) for d in dwell_sec_str.split(',')]
+            while len(dwell_times) < len(frequencies):
+                dwell_times.append(dwell_times[-1])
+
         gains_str = parser.get(section_name, 'gains', fallback='')
         gains_list = []
         if gains_str.strip():
@@ -267,11 +362,13 @@ class ScheduleParser:
         for i, freq in enumerate(frequencies):
             gains = gains_list[i] if i < len(gains_list) else None
             dwell = dwell_frames[i] if i < len(dwell_frames) else 100
+            dwell_sec = dwell_times[i] if i < len(dwell_times) else None
             entries.append(ScheduleEntry(
                 frequency=freq,
                 gains=gains,
                 dwell_frames=dwell,
-                require_cal=require_cal
+                require_cal=require_cal,
+                dwell_time_sec=dwell_sec
             ))
 
         return Schedule(name=name, entries=entries, repeat_mode=repeat_mode)
@@ -282,11 +379,13 @@ class ScheduleParser:
         data = json.loads(json_str)
         entries = []
         for entry_data in data.get('entries', []):
+            dwell_sec = entry_data.get('dwell_time_sec')
             entries.append(ScheduleEntry(
                 frequency=int(entry_data['frequency']),
                 gains=entry_data.get('gains'),
                 dwell_frames=int(entry_data.get('dwell_frames', 100)),
-                require_cal=entry_data.get('require_cal', True)
+                require_cal=entry_data.get('require_cal', True),
+                dwell_time_sec=float(dwell_sec) if dwell_sec is not None else None
             ))
         return Schedule(
             name=data.get('name', 'json_schedule'),

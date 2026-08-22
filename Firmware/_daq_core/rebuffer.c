@@ -38,6 +38,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/mman.h>
 #include "rtl_daq.h"
 #include "log.h"
 #include "ini.h"
@@ -111,8 +113,10 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {pconfig->port_stride = atoi(value);}
     else if (MATCH("offload", "rebuffer_transport"))
     {strncpy(pconfig->rebuffer_transport, value, sizeof(pconfig->rebuffer_transport)-1);}
-    else {return 0;  /* unknown section/name, error */}
-    return 0;
+    /* Unknown sections/keys are accepted (non-fatal): always return 1 so
+     * ini_parse() reports 0 on success and callers can treat a positive
+     * return value (malformed line) as a warning only. */
+    return 1;
 }
 
 int main(int argc, char* argv[])
@@ -125,9 +129,10 @@ int main(int argc, char* argv[])
  */
 {    
     log_set_level(LOG_TRACE);
+    log_use_default_lock();
     install_signal_handlers();
     configuration config;
-    config.instance_id = 0;
+    memset(&config, 0, sizeof(config));
     config.port_stride = 100;
     strcpy(config.rebuffer_transport, "shm");
 
@@ -157,10 +162,36 @@ int main(int argc, char* argv[])
     if (argc == 2){drop_mode = atoi(argv[1]);}
 
     /* Set parameters from the config file*/
-    if (ini_parse(INI_FNAME, handler, &config) < 0) {
+    int ini_status = ini_parse(INI_FNAME, handler, &config);
+    if (ini_status < 0) {
         log_fatal("Configuration could not be loaded, exiting ..");
         return -2;
-    }   
+    }
+    else if (ini_status > 0) {
+        log_warn("Config file %s has a parse error at line %d, continuing with parsed values", INI_FNAME, ini_status);
+    }
+    if (config.num_ch < 1 || config.num_ch > 32)
+    {FATAL_ERR("Invalid or missing channel number in configuration")}
+    if (config.daq_buffer_size < 1)
+    {FATAL_ERR("Invalid or missing daq_buffer_size in configuration")}
+    if (config.cpi_size < 1 || config.decimation_ratio < 1 || config.cal_size < 1)
+    {FATAL_ERR("Invalid or missing cpi_size/decimation_ratio/corr_size in configuration")}
+
+    /* Lock memory to avoid page faults in the real-time data path (non-fatal).
+     * MCL_ONFAULT is required with MCL_FUTURE: the output transport below maps
+     * worst-case-sized shm segments, and a plain MCL_FUTURE would
+     * fault-populate and pin every page of them at mmap time. With
+     * MCL_ONFAULT only pages actually touched get locked. */
+#ifdef MCL_ONFAULT
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0)
+    {log_warn("mlockall failed: %s - continuing without memory locking", strerror(errno));}
+#else
+    /* No MCL_ONFAULT on this libc: never use bare MCL_FUTURE (it would
+     * pre-fault the worst-case shm segments); lock current pages only. */
+    if (mlockall(MCL_CURRENT) != 0)
+    {log_warn("mlockall failed: %s - continuing without memory locking", strerror(errno));}
+#endif
+
     in_buffer_size  = config.daq_buffer_size;
     out_buffer_size = config.cpi_size * config.decimation_ratio;
     cal_out_buffer_size = config.cal_size; 
@@ -387,10 +418,10 @@ int main(int argc, char* argv[])
     sleep(3);
     transport_destroy(output_transport);
     free(output_transport);
-    /* Free up buffers */     
+    /* Free up buffers */
     for(int m=0;m<ch_num;m++)
     {
-        free((circ_buff_structs + m * sizeof(*circ_buff_structs))->iq_circ_buffer);       
+        free(circ_buff_structs[m].iq_circ_buffer);
     }
     free(iq_header);
     free(circ_buff_structs);

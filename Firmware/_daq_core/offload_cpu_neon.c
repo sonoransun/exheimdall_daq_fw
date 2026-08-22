@@ -8,10 +8,11 @@
  * Copyright (C) 2018-2026 Tamás Pető
  */
 
-#ifdef ARM_NEON
+#if defined(ARM_NEON) && !defined(OFFLOAD_GENERIC_ONLY)
 
 #include <stdlib.h>
 #include <string.h>
+#include <arm_neon.h>
 #include "offload.h"
 #include "log.h"
 #include "NE10.h"
@@ -162,15 +163,41 @@ struct fir_engine* fir_engine_neon_create(void)
  *-------------------------------------
  */
 
+/* Conversion applies out = (in - 127.5) / 127.5 per component. The divide is
+ * kept as a divide (vdivq_f32 on AArch64): multiplying by the rounded
+ * reciprocal is NOT bit-identical to the scalar expression (126 of the 256
+ * possible byte inputs differ by 1 ulp). ARMv7 NEON has no float divide
+ * instruction, so it keeps the scalar expression for the compiler. */
+
 static int neon_u8_to_f32_deinterleave(struct convert_engine* eng,
                                         const uint8_t* in,
                                         float* out_i, float* out_q,
                                         size_t num_samples)
 {
     (void)eng;
-    for (size_t s = 0; s < num_samples; s++) {
-        out_i[s] = ((float)in[2 * s]     - DC) / DC;
-        out_q[s] = ((float)in[2 * s + 1] - DC) / DC;
+    const uint8_t* restrict src = in;
+    float* restrict di = out_i;
+    float* restrict dq = out_q;
+    size_t s = 0;
+#if defined(__aarch64__)
+    const float32x4_t dc = vdupq_n_f32(DC);
+    for (; s + 8 <= num_samples; s += 8) {
+        uint8x8x2_t iq = vld2_u8(src + 2 * s);
+        uint16x8_t i16 = vmovl_u8(iq.val[0]);
+        uint16x8_t q16 = vmovl_u8(iq.val[1]);
+        float32x4_t i_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(i16)));
+        float32x4_t i_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(i16)));
+        float32x4_t q_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q16)));
+        float32x4_t q_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(q16)));
+        vst1q_f32(di + s,     vdivq_f32(vsubq_f32(i_lo, dc), dc));
+        vst1q_f32(di + s + 4, vdivq_f32(vsubq_f32(i_hi, dc), dc));
+        vst1q_f32(dq + s,     vdivq_f32(vsubq_f32(q_lo, dc), dc));
+        vst1q_f32(dq + s + 4, vdivq_f32(vsubq_f32(q_hi, dc), dc));
+    }
+#endif
+    for (; s < num_samples; s++) {
+        di[s] = ((float)src[2 * s]     - DC) / DC;
+        dq[s] = ((float)src[2 * s + 1] - DC) / DC;
     }
     return 0;
 }
@@ -180,10 +207,28 @@ static int neon_u8_to_f32_interleaved(struct convert_engine* eng,
                                        size_t num_samples)
 {
     (void)eng;
-    for (size_t s = 0; s < num_samples; s++) {
-        out[2 * s]     = ((float)in[2 * s]     - DC) / DC;
-        out[2 * s + 1] = ((float)in[2 * s + 1] - DC) / DC;
+    const uint8_t* restrict src = in;
+    float* restrict dst = out;
+    const size_t total = num_samples * 2;
+    size_t n = 0;
+#if defined(__aarch64__)
+    const float32x4_t dc = vdupq_n_f32(DC);
+    for (; n + 16 <= total; n += 16) {
+        uint8x16_t raw = vld1q_u8(src + n);
+        uint16x8_t lo16 = vmovl_u8(vget_low_u8(raw));
+        uint16x8_t hi16 = vmovl_u8(vget_high_u8(raw));
+        float32x4_t f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16)));
+        float32x4_t f1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16)));
+        float32x4_t f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)));
+        float32x4_t f3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16)));
+        vst1q_f32(dst + n,      vdivq_f32(vsubq_f32(f0, dc), dc));
+        vst1q_f32(dst + n + 4,  vdivq_f32(vsubq_f32(f1, dc), dc));
+        vst1q_f32(dst + n + 8,  vdivq_f32(vsubq_f32(f2, dc), dc));
+        vst1q_f32(dst + n + 12, vdivq_f32(vsubq_f32(f3, dc), dc));
     }
+#endif
+    for (; n < total; n++)
+        dst[n] = ((float)src[n] - DC) / DC;
     return 0;
 }
 
@@ -200,4 +245,4 @@ struct convert_engine* convert_engine_neon_create(void)
     return eng;
 }
 
-#endif /* ARM_NEON */
+#endif /* ARM_NEON && !OFFLOAD_GENERIC_ONLY */
