@@ -637,10 +637,13 @@ class TestBurst(Base):
     def test_b7_uses_actual_rms(self):
         c = self.armed()
         x = np.zeros((1, 1000), complex)
-        x[0, ::10] = 0.5                                            # PAPR 10 dB
+        x[0, ::10] = 0.5                                            # sample PAPR 10 dB
         p = c.authorize_burst(x, [0], [0], FS)
         pr = p.prediction[0]
-        self.assertAlmostEqual(pr.device_pep_dbm - pr.device_avg_dbm, 10.0, places=6)
+        isp = float(S.reconstructed_peak(x)[0])                     # analog envelope peak >= 0.5
+        self.assertGreaterEqual(isp, 0.5)
+        self.assertAlmostEqual(pr.device_pep_dbm - pr.device_avg_dbm, 10.0 + 20 * math.log10(isp / 0.5),
+                               places=6)
 
     def test_b8_cabled_and_loopback(self):
         cab = make_cfg(self.td, tx={"allowed_modes": "cabled", "cabled_rx_path_loss_db": 30})
@@ -660,7 +663,9 @@ class TestBurst(Base):
 
     def test_b8_eirp_and_mpe(self):
         over = radiate_over(self.td)
-        c = self.ctl(make_cfg(self.td, **over), interlock=Loop(), telemetry=Tel(), is_simulation=True)
+        cal = [True]
+        c = self.ctl(make_cfg(self.td, **over), interlock=Loop(), telemetry=Tel(), is_simulation=True,
+                     tx_cal_valid=lambda: cal[0])
         c.arm("radiate", FC, S.ack_phrase("radiate", FC), "t", confirmation_source="tty")
         c.authorize_burst(wave(), [0, 1, 2, 3], [0] * 4, FS)
         c.policy = dataclasses.replace(c.policy, max_eirp_dbm=-30.0)
@@ -668,7 +673,11 @@ class TestBurst(Base):
         c.policy = dataclasses.replace(c.policy, max_eirp_dbm=10.0, mpe_exclusion_m=1e-9)
         self.refused("MPE", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS)
         c.policy = dataclasses.replace(c.policy, mpe_exclusion_m=5.0)
+        cal[0] = False
         self.refused("CAL_REQUIRED", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS, weights=np.ones(4))
+        # several chains in radiate are beamformed whatever the weights argument says
+        self.refused("CAL_REQUIRED", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS)
+        c.authorize_burst(wave(1), [0], [0], FS)                    # one chain, no weights: not beamformed
 
     def test_b9_rx_protection(self):
         c = self.armed()
@@ -684,12 +693,39 @@ class TestBurst(Base):
                 for b in range(4):
                     fh.write("%d,%d,%g,0\n" % (a, b, 0.05 if a == b else 0.3))
         c = self.armed(make_cfg(self.td, frontend={"s_matrix_file": "s.csv"}))
-        c.authorize_burst(wave(), [0, 1, 2, 3], [0] * 4, FS)                     # no weights: not evaluated
-        c.authorize_burst(wave(), [0, 1, 2, 3], [0] * 4, FS, weights=[1, 1j, -1, -1j])  # |G| = 0.25
+        w = np.array([1, 1j, -1, -1j])
+        steered = wave() * w[:, None]
+        c.authorize_burst(steered, [0, 1, 2, 3], [0] * 4, FS)                    # |G| = 0.25 from the samples
+        c.authorize_burst(steered, [0, 1, 2, 3], [0] * 4, FS, weights=w)
         e = self.refused("ACTIVE_REFLECTION", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS,
                          weights=np.ones(4))                                     # |G| = 0.95
         self.assertIn("VSWR", e.detail)
-        self.refused("SHAPE", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS, weights=np.ones(3))
+        # in-phase samples: refused from the samples, with the weights omitted or misdeclared
+        e = self.refused("ACTIVE_REFLECTION", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS)
+        self.assertIn("samples", e.detail)
+        self.refused("ACTIVE_REFLECTION", c.authorize_burst, wave(), [0, 1, 2, 3], [0] * 4, FS, weights=w)
+        self.refused("SHAPE", c.authorize_burst, steered, [0, 1, 2, 3], [0] * 4, FS, weights=np.ones(3))
+        self.assertEqual(c.duty.reserved(), 2)                                   # refusals reserve nothing
+
+    def test_b10_reverse_power_from_samples(self):
+        with open(os.path.join(self.td, "s.csv"), "w") as fh:
+            fh.write("# freq_hz=915e6\nm,n,re,im\n")
+            for a in range(4):
+                for b in range(4):
+                    fh.write("%d,%d,%g,0\n" % (a, b, 0.1 if a == b else 0.3))
+        cfg = make_cfg(self.td, frontend={"s_matrix_file": "s.csv"}, tx={"max_reverse_power_dbm": -60,
+                                                                          "max_vswr": 100},
+                       rf_control={"power_monitor": "sim"})
+        c = self.armed(cfg, telemetry=Tel(rev=-90.0))
+        x = wave(2)
+        # two in-phase chains: |b| at the idle chains 2, 3 = 0.6 |a| -> reverse power checked there too
+        e = self.refused("ACTIVE_REFLECTION", c.authorize_burst, x, [0, 1], [0, 0], FS)
+        self.assertIn("reverse power", e.detail)
+        fe = c.frontend
+        rev, gam = fe.active_waves_from_samples(x, [0, 1], [1.0, 1.0])
+        self.assertAlmostEqual(gam[0], 0.4, places=9)
+        self.assertTrue(math.isnan(gam[2]))
+        self.assertAlmostEqual(rev[2], 10 * math.log10((0.6 * 0.4) ** 2) + 30, places=6)
 
     def test_b11_start_time(self):
         dev = [DevTime(100, 0, 100_000_000)]
@@ -1599,6 +1635,230 @@ class TestFlowgraphGuard(Base):
         self.arm_for_guard()
         self.refused("SHAPE", S.flowgraph_guard, self.ini, self.fg, self.wf, [0, 0], [0, 1], 2 * FS,
                      state_dir=self.state, clock=self.clock, wallclock=lambda: WALL0 + self.clock.t)
+
+
+# ---------------------------------------------------------------------------
+class TestModelSignalSpectrum(Base):
+    """Stale model, signals inside critical sections, duty offsets, emission mask,
+    inter-sample peaks."""
+
+    def _rewrite_cal(self, path, offset_db):
+        with open(path, "w") as fh:
+            fh.write("chan,freq_hz,tx_gain_db,p_fs_dbm\n")
+            for ch in range(4):
+                for f in (900e6, 930e6):
+                    for g in (0.0, 10.0):
+                        fh.write("%d,%g,%g,%g\n" % (ch, f, g, -25.0 + offset_db + g))
+
+    def test_power_cal_edit_before_arm_rebuilds_the_model(self):
+        path = cal_csv(self.td)
+        cfg = make_cfg(self.td, frontend={"tx_power_cal_file": "tx_power_cal.csv"}, tx={"max_chain_power_dbm": 0})
+        c = self.ctl(cfg)
+        self._rewrite_cal(path, 35.0)                       # re-measured: 35 dB more power
+        self.refused("CHAIN_POWER", arm, c)                 # the arm checks the rebuilt model
+        self.assertEqual(c.state, S.TxState.SAFE)
+
+    def test_power_cal_edit_while_armed_then_rearm(self):
+        path = cal_csv(self.td)
+        cfg = make_cfg(self.td, frontend={"tx_power_cal_file": "tx_power_cal.csv"}, tx={"max_chain_power_dbm": 0})
+        c = self.armed(cfg)
+        p = c.authorize_burst(wave(1), [0], [0], FS)
+        self.assertLess(p.prediction[0].out_pep_dbm, -30.0)
+        self.assertEqual(c.arm_record.fingerprint, c._model_fp)
+        self._rewrite_cal(path, 45.0)
+        self.refused("CONFIG_CHANGED", c.authorize_burst, wave(1), [0], [0], FS)
+        self.assertEqual(c.state, S.TxState.SAFE)
+        self.refused("CHAIN_POWER", arm, c)                 # never re-armed against the old model
+        self._rewrite_cal(path, 5.0)                        # within limits again
+        rec = arm(c)
+        self.assertEqual(rec.fingerprint, C.config_fingerprint(cfg))
+        p = c.authorize_burst(wave(1), [0], [0], FS)
+        self.assertGreater(p.prediction[0].out_pep_dbm, -28.0)      # the rebuilt model is in use
+
+    def test_injected_model_is_refused_after_an_edit(self):
+        import active_frontend as F
+        path = cal_csv(self.td)
+        cfg = make_cfg(self.td, frontend={"tx_power_cal_file": "tx_power_cal.csv"})
+        fe = F.FrontendModel.from_config(cfg)
+        c = S.TxSafetyController(cfg, fe, None, EventLog(), clock=self.clock, state_dir=self.td,
+                                 ref_locked=lambda: True, sync_ok=lambda: True, coherence_class=lambda: 2,
+                                 wallclock=lambda: WALL0 + self.clock.t, sleep=lambda s: None)
+        self._rewrite_cal(path, 10.0)
+        self.refused("CONFIG_CHANGED", arm, c)
+
+    def _signal_inside(self, c, obj, name):
+        orig = getattr(obj, name)
+
+        def hook(*a, **k):
+            c._on_signal(signal.SIGTERM, None)              # delivered between bytecodes
+            return orig(*a, **k)
+        setattr(obj, name, hook)
+        return orig
+
+    def _with_noop_sigterm(self, c):
+        original = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda s, f: None)    # an application's graceful-stop handler
+        c.install_process_hooks()
+
+        def restore():
+            c.uninstall_process_hooks()
+            signal.signal(signal.SIGTERM, original)
+        self.addCleanup(restore)
+
+    def test_signal_inside_consume_is_never_overwritten(self):
+        log = []
+        c = self.ctl()
+        c.attach(RecBackend(log), None)
+        self._with_noop_sigterm(c)
+        arm(c)
+        p = c.authorize_burst(wave(1), [0], [0], FS)
+        self._signal_inside(c, c.duty, "would_exceed")
+        self.tripped("SIGNAL", c.consume, p)
+        self.assertEqual(c.state, S.TxState.FAULT)
+        self.assertEqual(c.fault_code, "SIGNAL")
+        self.assertIsNone(c._inflight)
+        self.assertIn("tx_abort", log)
+
+    def test_signal_inside_consume_commit_window(self):
+        c = self.ctl()
+        c.attach(RecBackend([]), None)
+        self._with_noop_sigterm(c)
+        arm(c)
+        p = c.authorize_burst(wave(1), [0], [0], FS)
+        # the trip lands after the last check, before the state write
+        self._signal_inside(c, c, "_frontend_state_problem")
+        self.tripped("SIGNAL", c.consume, p)
+        self.assertEqual(c.state, S.TxState.FAULT)
+        self.assertIsNone(c._inflight)
+
+    def test_signal_inside_arm_does_not_arm(self):
+        c = self.ctl()
+        c.attach(RecBackend([]), None)
+        self._with_noop_sigterm(c)
+        self._signal_inside(c, c, "validate_static")        # SAFE: the handler only shuts down
+        self.refused("SEQUENCE", arm, c)
+        self.assertEqual(c.state, S.TxState.SAFE)
+        self.assertIsNone(S.read_arm_record(self.td))
+        self.assertIsNone(c.arm_record)
+
+    def test_signal_inside_burst_complete(self):
+        c = self.ctl()
+        c.attach(RecBackend([]), None)
+        self._with_noop_sigterm(c)
+        arm(c)
+        p = c.authorize_burst(wave(1), [0], [0], FS)
+        c.consume(p)
+        self._signal_inside(c, c, "_check_underflows")
+        c.burst_complete(p, TxResult(True, 200))
+        self.assertEqual(c.state, S.TxState.FAULT)
+
+    def test_trip_from_another_thread_during_authorize(self):
+        c = self.armed()
+        self._signal_inside(c, c, "_expected_fs")
+        with self.assertRaises(InterlockTrip):
+            c.authorize_burst(wave(1), [0], [0], FS)
+        self.assertEqual(c.duty.reserved(), 0)
+        self.assertEqual(len(c._registry), 0)
+
+    def test_at_offset_only_for_adopted_flowgraph(self):
+        c = self.armed()
+        self.refused("SHAPE", c.authorize_burst, wave(1), [0], [0], FS, at_offset_s=10.0)
+        self.refused("SHAPE", c.authorize_burst, wave(1), [0], [0], FS, at_offset_s=10.0, purpose="flowgraph")
+        p = c.authorize_burst(wave(1), [0], [0], FS, at_offset_s=0.0)
+        c.consume(p)
+        self.assertAlmostEqual(c.duty._bursts[-1][0], self.clock.t)       # recorded at consume time
+
+    def test_back_to_back_offsets_cannot_bypass_duty(self):
+        cfg = make_cfg(self.td, tx={"duty_max": 0.1, "duty_window_s": 10, "max_burst_s": 0.1})
+        c = self.armed(cfg)
+        n = int(0.1 * FS)
+        sent = 0.0
+        for k in range(30):
+            try:
+                p = c.authorize_burst(wave(1, n), [0], [0], FS, at_offset_s=10.0 * (k // 10) if k else 0.0)
+            except SafetyRefusal:
+                try:
+                    p = c.authorize_burst(wave(1, n), [0], [0], FS)
+                except SafetyRefusal as e:
+                    self.assertEqual(e.code, "DUTY")
+                    break
+            c.consume(p)
+            self.clock.advance(p.duration_s)
+            sent += p.duration_s
+            c.burst_complete(p, TxResult(True, n))
+            c.heartbeat()
+        self.assertLessEqual(sent, 1.0 + 1e-9)
+
+    def test_untimed_refused_on_attached_hardware_backend(self):
+        class HwBackend(RecBackend):
+            is_simulation = False
+        cfg = make_cfg(self.td, active={"backend": "sim"})
+        c = self.ctl(cfg)
+        arm(c)
+        c.attach(HwBackend([]), None)
+        self.refused("START_TIME", c.authorize_burst, wave(1), [0], [0], FS)
+
+    def test_spur_in_builtin_deny_band_refused(self):
+        fc, fs = 1524e6, 4e6
+        cfg = make_cfg(self.td, rf={"center_freq_hz": fc, "sample_rate_hz": fs},
+                       tx={"allow_bands": "1500e6:1524.6e6", "occupied_bw_hz": 1e6})
+        c = self.armed(cfg, arm_kw={"fc": fc})
+        n = 4000
+        t = np.arange(n)
+        main = np.exp(2j * np.pi * (0.1e6 / fs) * t)
+        clean = 0.45 * main[None, :]
+        c.authorize_burst(clean, [0], [0], fs)                         # an in-band tone passes
+        spur = main + 0.095 * np.exp(2j * np.pi * (1.5e6 / fs) * t)    # -20.4 dBc at 1525.5 MHz (GNSS L1/MSS)
+        x = (0.45 * spur / np.max(np.abs(spur)))[None, :]
+        e = self.refused("FREQ_DENIED", c.authorize_burst, x, [0], [0], fs)
+        self.assertIn("1525.5", e.detail)
+        weak = main + 10 ** (-60 / 20) * np.exp(2j * np.pi * (1.5e6 / fs) * t)   # -60 dBc: below the mask
+        c.authorize_burst((0.45 * weak / np.max(np.abs(weak)))[None, :], [0], [0], fs)
+        # a spur below the allow band but in no deny band: outside every allow band
+        low = main + 0.095 * np.exp(2j * np.pi * (-1.5e6 / fs) * t)           # 1522.5 MHz (allowed)
+        c.authorize_burst((0.45 * low / np.max(np.abs(low)))[None, :], [0], [0], fs)
+
+    def test_spur_outside_allow_band_refused(self):
+        fc, fs = 1310e6, 25e6
+        cfg = make_cfg(self.td, rf={"center_freq_hz": fc, "sample_rate_hz": fs},
+                       tx={"allow_bands": "1300e6:1350e6", "occupied_bw_hz": 10e6})
+        c = self.armed(cfg, arm_kw={"fc": fc})
+        n = 5000
+        t = np.arange(n)
+        sig = np.exp(2j * np.pi * (1e6 / fs) * t) + 10 ** (-20.5 / 20) * np.exp(2j * np.pi * (-12e6 / fs) * t)
+        x = (0.45 * sig / np.max(np.abs(sig)))[None, :]
+        self.assertIn(self.refused_any(c, x, fs), ("FREQ_DENIED", "FREQ_NOT_ALLOWED"))
+
+    def refused_any(self, c, x, fs):
+        with self.assertRaises(SafetyRefusal) as cm:
+            c.authorize_burst(x, [0], [0], fs)
+        return cm.exception.code
+
+    def test_inter_sample_peak_raises_the_prediction(self):
+        n = 4000
+        x = np.cos(np.pi * np.arange(n) / 2 + np.pi / 4).astype(complex)   # two tones at +/- fs/4
+        x = (x * 0.5 / np.max(np.abs(x)))[None, :]
+        isp = S.reconstructed_peak(x)[0]
+        self.assertGreater(isp, 0.70)                                     # >= 0.7071 (+3 dB)
+        cfg = make_cfg(self.td, tx={"max_digital_amplitude": 0.5})
+        c = self.armed(cfg)
+        p = c.authorize_burst(x, [0], [0], FS)
+        pr = p.prediction[0]
+        self.assertGreaterEqual(pr.device_pep_dbm - (pr.p_fs_dbm + 20 * math.log10(0.5)), 3.0)
+        # a constant-envelope tone with integer cycles: no interior excess
+        t = np.arange(4000)
+        tone = 0.4 * np.exp(2j * np.pi * 0.05 * t)
+        self.assertLess(S.reconstructed_peak(tone[None, :])[0], 0.4 * 1.2)
+
+    def test_reconstructed_envelope_over_full_scale_refused(self):
+        # +/-0.5 samples whose band-limited reconstruction overshoots full scale
+        n = 512
+        k = np.arange(n) - n // 2
+        x = 0.5 * np.sign(np.sinc(k + 0.5))
+        x = x.astype(complex)[None, :]
+        self.assertGreater(S.reconstructed_peak(x)[0], 1.0)
+        c = self.armed()
+        self.refused("AMPLITUDE", c.authorize_burst, x, [0], [0], FS)
 
 if __name__ == "__main__":
     unittest.main()

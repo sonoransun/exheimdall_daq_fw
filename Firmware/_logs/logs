@@ -1,8 +1,55 @@
-Realtek data acquistion module : rtl_daq.log
-Sample delay synchronizer      : sync.log
-Sample rebuffer                : rebuffer.log
-Squelch module                 : squelch.log
-IQ sample decimator            : decimator.log
-Delay synchronizer module      : delay_sync.log
-IQ Server                      : iq_server.log
-Hardware controller module     : hwc.log
+HeIMDALL DAQ log legend (short copy)
+====================================
+
+The authoritative legend is the "Logs" section of
+Documentation/operations_runbook.md. This file is a convenience copy for
+source trees.
+
+Layout
+------
+_logs/*.log                      instance 0 (flat layout)
+_logs/inst<N>/*.log              instance N > 0
+_logs/archive/<time>/            previous runs of instance 0 (last 10 kept)
+_logs/inst<N>/archive/<time>/    previous runs of instance N > 0 (last 10 kept)
+_logs/inst<N>/pids/*.pid         PID files of every instance, including inst0
+_logs/inst<N>/pids/run_dir       registry directory ([host] instance_registry = 1)
+_logs/federation/coordinator.log federation_start.sh coordinator (--log-dir)
+_logs/federation/router.log      federation_start.sh router (--log-dir)
+_logs/federation/pids/*.pid      coordinator.pid, router.pid (federation_start.sh --pid-dir)
+
+Each start moves the old *.log files into archive/ before launching.
+
+Log files (one per process, stderr redirect)
+--------------------------------------------
+rtl_daq.log      _daq_core/rtl_daq.out (hardware mode): device open by serial,
+                 tuner settings, ZMQ commands, USB ring-buffer overruns
+synthetic.log    _testing/test_data_synthesizer.py (synthetic mode, replaces
+                 rtl_daq.log): ZMQ responder bind, decoded commands
+rebuffer.log     _daq_core/rebuffer.out: config load, frame index mismatches
+decimator.log    _daq_core/decimate.out: FIR coefficient file and tap count
+delay_sync.log   _daq_core/delay_sync.py: calibration FSM and sync loss, plus
+                 the status server, event bus, metrics, federation health
+                 monitor and database running in the same process
+hwc.log          _daq_core/hw_controller.py: :5001 commands, gain control,
+                 noise-source bursts, track-lock wait, scheduler, orientation
+iq_server.log    _daq_core/iq_server.out (only with out_data_iface_type = eth)
+
+Federation services (_daq_core/federation_coordinator.py,
+_daq_core/federation_iq_router.py) log to _logs/federation/coordinator.log
+and router.log when started by federation_start.sh; started by hand they
+log to stderr or to the file given with --log-file.
+
+PID files (_logs/inst<N>/pids/)
+-------------------------------
+rtl_daq.pid        rtl_daq.out (hardware mode)
+synthesizer.pid    test_data_synthesizer.py (synthetic mode)
+rebuffer.pid       rebuffer.out
+decimate.pid       decimate.out
+delay_sync.pid     delay_sync.py
+hw_controller.pid  sudo wrapper of hw_controller.py
+iq_server.pid      iq_server.out (eth output only)
+
+Log level
+---------
+[daq] log_level = 5 (shipped) shows only FATAL/CRITICAL lines.
+Set log_level = 2 (INFO) while troubleshooting and restart the chain.

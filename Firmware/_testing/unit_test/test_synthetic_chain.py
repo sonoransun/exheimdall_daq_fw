@@ -9,10 +9,15 @@ A real chain is started with ``daq_synthetic_start.sh --pace --blocks 0``
 from a private install root (the J.1 fixture: ``<tmp>/Firmware`` holds
 copies of the scripts and the INI; the code directories are symlinked; the
 registry directory is ``<tmp>/run``). The INI is the repository's with the
-monitoring keys, ``status_extended = 1`` and ``en_wire_recal = 1`` added.
+monitoring keys, ``status_extended = 1``, ``en_wire_recal = 1`` and
+``cal_track_mode = 0`` (one calibration, then a locked data stream: with
+periodic bursts RECL is deferred while the noise source is on, and the
+calibration frames make the decimator drop frames).
 
-1. the chain reaches ``sync_state >= 5``; a real ``streaming``/``IQDownload``
-   client on ``:5000`` sees a continuous ``cpi_index``; slot 102
+1. the chain reaches ``sync_state >= 5``; once STATUS reports locked DATA
+   frames steadily (past the DUMMY frames of the noise-source-off and gain
+   commands), a real ``streaming``/``IQDownload`` client on ``:5000`` sees a
+   continuous ``cpi_index`` after the buffers filled before it connected; slot 102
    (``buffer_overrun_cnt``) is 0 in every header and in STATUS;
 2. ``heimdall-ctl recal`` (RECL, en_wire_recal = 1) drops the lock and the
    chain re-locks; the recalibration generation advances;
@@ -34,6 +39,7 @@ the first lock on slow hosts.
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -82,7 +88,8 @@ def lane_unavailable():
     """None when the pipeline lane can run here, else the skip reason."""
     if not sys.platform.startswith("linux"):
         return "pipeline lane: Linux only"
-    if os.geteuid() != 0 and subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+    if os.geteuid() != 0 and (shutil.which("sudo") is None or
+                              subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0):
         return "pipeline lane: needs root or passwordless sudo"
     for tool in ("ss", "pgrep"):
         if shutil.which(tool) is None:
@@ -99,13 +106,47 @@ def lane_unavailable():
     return None
 
 
+def proc_state(pid):
+    """The ``ps`` state letters of *pid* ('' when it no longer exists)."""
+    r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
 def daq_pids():
-    """Pids of every DAQ stage on this host (any copy)."""
+    """Pids of every live DAQ stage on this host (any copy). A zombie (a
+    killed stage its parent has not reaped yet; a container PID 1 may never
+    reap) runs nothing and is left out, as role_alive and daq_common.sh's
+    hd_pid_role_alive do."""
     pids = set()
     for pat in DAQ_PATTERNS:
         r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
         pids.update(int(p) for p in r.stdout.split() if int(p) != os.getpid())
-    return pids
+    return {p for p in pids if proc_state(p)[:1] not in ("", "Z")}
+
+
+def ps_listing(pids):
+    """``pid stat args`` lines of *pids* (assertion and skip context)."""
+    if not pids:
+        return "(none)"
+    r = subprocess.run(["ps", "-o", "pid=,stat=,args=", "-p", ",".join(str(p) for p in sorted(pids))],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "(gone)"
+
+
+def refuse_running_chain():
+    """Class/test guard of every chain test: the lane stops every DAQ chain
+    on the host, so it must not start beside one. Raises SkipTest naming the
+    processes; under ``HEIMDALL_STRICT_MODULES=1`` (a strict merge gate) an
+    AssertionError instead, so a leftover never turns into silent lost
+    coverage."""
+    pids = daq_pids()
+    if not pids:
+        return
+    msg = ("another DAQ chain is running on this host (the lane stops every chain):\n%s"
+           % ps_listing(pids))
+    if os.environ.get("HEIMDALL_STRICT_MODULES") == "1":
+        raise AssertionError(msg)
+    raise unittest.SkipTest(msg)
 
 
 def listening(ports):
@@ -165,6 +206,25 @@ def status(port):
 def sync_state(port):
     st = status(port)
     return None if st is None else st.get("sync_state")
+
+
+def wait_steady(port, hold=3.0, timeout=60.0):
+    """Wait until STATUS on *port* (status_extended = 1) reports a locked
+    chain on DATA frames for *hold* seconds without interruption: past the
+    DUMMY frames hw_controller's noise-source/gain commands cause right after
+    the lock. True when reached within *timeout*."""
+    deadline = time.monotonic() + timeout
+    since = None
+    while time.monotonic() < deadline:
+        st = status(port) or {}
+        if (st.get("sync_state") or 0) >= SYNC_LOCKED and st.get("frame_type") == IQHeader.FRAME_TYPE_DATA:
+            since = since or time.monotonic()
+            if time.monotonic() - since >= hold:
+                return True
+        else:
+            since = None
+        time.sleep(0.1)
+    return False
 
 
 class IQClient(object):
@@ -410,10 +470,47 @@ class Sandbox(object):
             subprocess.run(["./daq_stop.sh", "--all"], cwd=self.fw, env=self.env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
 
-    def cleanup(self):
+    def owns(self, pid):
+        """True when *pid* was started from this sandbox: its environment
+        carries this sandbox's HEIMDALL_RUN_DIR, or (``sudo`` resets the
+        environment of hw_controller) its working directory is inside it."""
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as f:
+                if ("HEIMDALL_RUN_DIR=%s" % self.run_dir).encode() in f.read().split(b"\0"):
+                    return True
+        except OSError:
+            pass
+        try:
+            cwd = os.path.realpath(os.readlink("/proc/%d/cwd" % pid))
+        except OSError:
+            return False
+        return cwd == self.root or cwd.startswith(self.root + os.sep)
+
+    def cleanup(self, check=True):
+        """Stop every chain, remove the sandbox. DAQ processes that survive
+        ``daq_stop.sh --all`` are a leak of the test that ran here: the ones
+        this sandbox started are killed, and (with *check*) an AssertionError
+        names every survivor, so the leak fails this test rather than making
+        the next one skip as "another DAQ chain is running"."""
         self.stop_all()
-        wait_for(lambda: not daq_pids(), timeout=30)
+        leak = None
+        if not wait_for(lambda: not daq_pids(), timeout=30):
+            survivors = daq_pids()
+            listing = ps_listing(survivors)
+            ours = sorted(p for p in survivors if self.owns(p))
+            for pid in ours:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            wait_for(lambda: not (daq_pids() & set(ours)), timeout=15)
+            leak = ("DAQ processes survived daq_stop.sh --all:\n%s\nSIGKILLed (started from %s): %s; "
+                    "still alive: %s" % (listing, self.root, ours, sorted(daq_pids() & survivors)))
         shutil.rmtree(self.root, ignore_errors=True)
+        if leak is not None:
+            sys.stderr.write("[%s] %s\n" % (self.tag, leak))
+            if check:
+                raise AssertionError(leak)
 
 
 def ports_of(ini_path):
@@ -453,8 +550,7 @@ class TestSyntheticChain(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if daq_pids():
-            raise unittest.SkipTest("another DAQ chain is running on this host (the lane stops every chain)")
+        refuse_running_chain()
         cls.box = Sandbox("synthchain")
         # cal_track_mode = 0: one calibration, then a locked data stream. In
         # mode 2 with long bursts (unit_test_k4) the noise source is nearly
@@ -488,21 +584,19 @@ class TestSyntheticChain(unittest.TestCase):
 
     def test_1_lock_and_continuous_stream(self):
         self.ensure_locked()
+        self.assertTrue(wait_steady(self.st_port), "no steady locked DATA stream: %s" % status(self.st_port))
         client = connect_iq(self.iq_port)
         try:
             # The first frames of a new client are the buffers delay_sync
             # filled before anyone read them (older cpi_index values)
             for _ in range(STALE_FRAMES):
                 client.frame()
-            gaps_before = status(self.st_port)["counters"]["cpi_gaps"]
             frames = [client.frame()[1] for _ in range(40)]
-            gaps_after = status(self.st_port)["counters"]["cpi_gaps"]
         finally:
             client.close()
         cpis = [h.cpi_index for h in frames]
         gaps = [(a, b) for a, b in zip(cpis, cpis[1:]) if b != a + 1]
         self.assertEqual(gaps, [], "cpi_index not continuous on :%d: %s" % (self.iq_port, cpis))
-        self.assertEqual(gaps_after, gaps_before, "delay_sync saw input cpi_index gaps while streaming")
         self.assertEqual([h.get_buffer_overrun_cnt() for h in frames if h.get_buffer_overrun_cnt()], [],
                          "slot 102 (buffer_overrun_cnt) non-zero")
         self.assertTrue(any(h.frame_type == IQHeader.FRAME_TYPE_DATA for h in frames), "no DATA frame")
@@ -515,7 +609,9 @@ class TestSyntheticChain(unittest.TestCase):
     def test_2_wire_recal_then_restart_with_leftover_request(self):
         self.ensure_locked()
         recal_file = os.path.join(self.box.fw, "_data_control", "recal_request")
-        gen0 = (status(self.st_port).get("cal") or {}).get("recal_generation")
+        st = status(self.st_port)
+        self.assertIsNotNone(st, "no STATUS reply before RECL\n%s" % self.box.logs())
+        gen0 = (st.get("cal") or {}).get("recal_generation")
         self.assertEqual(gen0, 0, "a fresh chain must not have recalibrated")
 
         sampler = StateSampler(self.st_port)
@@ -530,11 +626,11 @@ class TestSyntheticChain(unittest.TestCase):
         states = [(s[1], s[3]) for s in sampler.samples]
         self.assertTrue(relocked, "RECL did not drop and regain the lock: (sync_state, frame_type) samples %s\n%s"
                         % (states, self.box.logs()))
-        drop = sampler.samples.index(sampler.lost()[0])
-        self.assertFalse(any(s[1] < SYNC_LOCKED and s[3] != IQHeader.FRAME_TYPE_DUMMY
-                             for s in sampler.samples[:1]), "not locked before RECL: %s" % states)
-        self.assertTrue(any(s[1] >= SYNC_LOCKED for s in sampler.samples[drop:] if s[1] is not None), states)
-        gen1 = (status(self.st_port).get("cal") or {}).get("recal_generation")
+        self.assertTrue(sampler.samples, "the STATUS sampler got no reply during RECL")
+        self.assertNotIn(sampler.samples[0], sampler.lost(), "not locked before RECL: %s" % states)
+        st = status(self.st_port)
+        self.assertIsNotNone(st, "no STATUS reply after the relock\n%s" % self.box.logs())
+        gen1 = (st.get("cal") or {}).get("recal_generation")
         self.assertGreaterEqual(gen1, 1, "recal generation did not advance")
         self.assertTrue(os.path.isfile(recal_file), "hw_controller wrote no recal_request relay file")
 

@@ -32,6 +32,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
+/build/
 .venv/
 venv/
 .pytest_cache/

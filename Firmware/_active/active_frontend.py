@@ -1140,6 +1140,59 @@ class FrontendModel:
         with np.errstate(divide="ignore"):
             return 10.0 * np.log10(np.abs(b) ** 2) + 30.0
 
+    def active_waves_from_samples(self, samples, chains, scale, window=64, block=1 << 16):
+        """Active reflection evaluated on the actual burst (no declared weights).
+
+        ``samples`` (K, N) are the digital chain waveforms of the global TX
+        ``chains``; ``scale[k]`` converts chain k's digital amplitude into the
+        incident wave at its array port (``|a|^2`` in W). ``b(t) = S a(t)`` per
+        sample. Returns ``(rev_peak_dbm, gamma)`` per TX chain (length n_tx):
+        the peak reverse power ``max_t |b_n(t)|^2`` (undriven chains included)
+        and, for driven chains, the largest windowed active reflection
+        ``sqrt(sum |b_n|^2 / sum |a_n|^2)`` over ``window``-sample windows that
+        carry at least a quarter of the chain's strongest window energy
+        (``nan`` for undriven chains). None without an S-matrix.
+        """
+        if self.s_matrix is None:
+            return None
+        x = np.asarray(samples)
+        chains = [int(c) for c in chains]
+        if x.ndim != 2 or x.shape[0] != len(chains):
+            raise ValueError("samples must be (K, N) with K = len(chains)")
+        sc = np.asarray(scale, dtype=float).reshape(-1)
+        if sc.size != len(chains):
+            raise ValueError("scale must have one entry per chain")
+        n = int(x.shape[1])
+        w = max(1, min(int(window), n))
+        S = self.s_matrix[:, chains]                       # (n_tx, K)
+        rev_pk = np.zeros(self.n_tx)
+        num = [np.zeros(n) for _ in range(self.n_tx)]
+        den = {c: np.zeros(n) for c in chains}
+        for b0 in range(0, n, int(block)):
+            b1 = min(n, b0 + int(block))
+            a = np.asarray(x[:, b0:b1], dtype=np.complex128) * sc[:, None]
+            bw = S @ a                                     # (n_tx, L)
+            pb = np.abs(bw) ** 2
+            rev_pk = np.maximum(rev_pk, pb.max(axis=1))
+            for m in range(self.n_tx):
+                num[m][b0:b1] = pb[m]
+            for k, c in enumerate(chains):
+                den[c][b0:b1] = np.abs(a[k]) ** 2
+        with np.errstate(divide="ignore"):
+            rev_dbm = 10.0 * np.log10(rev_pk) + 30.0
+        gamma = np.full(self.n_tx, np.nan)
+
+        def wsum(v):
+            cs = np.concatenate(([0.0], np.cumsum(v)))
+            return cs[w:] - cs[:-w]
+        for c in chains:
+            d = wsum(den[c])
+            if not d.size or not d.max() > 0:
+                continue
+            sel = d >= 0.25 * d.max()
+            gamma[c] = float(np.sqrt(np.max(wsum(num[c])[sel] / d[sel])))
+        return rev_dbm, gamma
+
     # --- predictions -------------------------------------------------------------------
     def predict_all(self, f_hz, tx_gains_db, dig_rms, dig_peak, papr_margin_db=0.0,
                     pa_backoff_db=1.0) -> list:

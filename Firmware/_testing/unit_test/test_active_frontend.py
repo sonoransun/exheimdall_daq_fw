@@ -395,6 +395,34 @@ class TestFrontendModel(unittest.TestCase):
         with self.assertRaises(ConfigError):
             F.FrontendModel([], tx, s_matrix=np.eye(3))
 
+    def test_active_waves_from_samples(self):
+        tx = [F.TxChain(n, (), F.TxPowerCal(None, DEV.get_caps("sim"))) for n in range(2)]
+        S = np.array([[0.1, 0.2], [0.2, 0.1]], dtype=complex)
+        m = F.FrontendModel([], tx, s_matrix=S, design_freq_hz=1e9)
+        t = np.arange(512)
+        s = np.exp(2j * np.pi * 0.01 * t)
+        x = np.vstack([s, s])                                   # in phase, as weights [1, 1]
+        rev, gam = m.active_waves_from_samples(x, [0, 1], [1.0, 1.0])
+        self.assertTrue(np.allclose(gam, [0.3, 0.3]))
+        self.assertTrue(np.allclose(rev, 20 * math.log10(0.3) + 30))
+        rev, gam = m.active_waves_from_samples(np.vstack([s, -s]), [0, 1], [1.0, 1.0])
+        self.assertTrue(np.allclose(gam, [0.1, 0.1]))
+        # one driven chain: the idle chain's reverse power is reported, its |G| is nan
+        rev, gam = m.active_waves_from_samples(s[None, :], [0], [2.0])
+        self.assertAlmostEqual(gam[0], 0.1)
+        self.assertTrue(math.isnan(gam[1]))
+        self.assertAlmostEqual(rev[1], 10 * math.log10((0.2 * 2.0) ** 2) + 30)
+        # segment-wise in phase / anti-phase (Hadamard-like): the worst window counts
+        h = np.concatenate([np.ones(256), -np.ones(256)])
+        rev, gam = m.active_waves_from_samples(np.vstack([s, s * h]), [0, 1], [1.0, 1.0])
+        self.assertAlmostEqual(gam[0], 0.3, places=6)
+        # blocks give the same answer
+        r2, g2 = m.active_waves_from_samples(np.vstack([s, s * h]), [0, 1], [1.0, 1.0], block=100)
+        self.assertTrue(np.allclose(r2, rev) and np.allclose(g2, gam))
+        self.assertIsNone(F.FrontendModel([], tx, design_freq_hz=1e9).active_waves_from_samples(x, [0, 1], [1, 1]))
+        with self.assertRaises(ValueError):
+            m.active_waves_from_samples(x, [0], [1.0])
+
     def test_from_config(self):
         with tempfile.TemporaryDirectory() as td:
             write(os.path.join(td, "cal.csv"), "chan,freq_hz,tx_gain_db,p_fs_dbm\n" + "".join(

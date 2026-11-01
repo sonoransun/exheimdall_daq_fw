@@ -20,13 +20,34 @@
         the arm session and carry a deadline; violations at ``consume`` time are
         trips;
       - duty: every issued permit reserves its duty at the burst's REAL start
-        (timed: ``now + lead``) until consumed / revoked / expired; ``consume``
-        re-checks it. The tuned frequency (``tx_freq``) is authoritative and is
-        re-read at ``consume`` and by ``poll`` (retune: ARMED -> SAFE, a trip
-        while TRANSMITTING); ``fs_hz`` must equal the TX rate; a declared
-        ``occupied_bw_hz`` is verified on the samples (99 % power + peak bin);
-        ``consume`` verifies that the front end is in the state the RX
-        protection credited (LNA off, T/R tx);
+        (timed: ``now + lead``; untimed: the consume time - ``at_offset_s`` is
+        accepted only for flowgraph bursts of an adopted controller) until
+        consumed / revoked / expired; ``consume`` re-checks it. Untimed bursts
+        are refused once a hardware (non-simulation) backend is attached. The
+        tuned frequency (``tx_freq``) is authoritative and is re-read at
+        ``consume`` and by ``poll`` (retune: ARMED -> SAFE, a trip while
+        TRANSMITTING); ``fs_hz`` must equal the TX rate; a declared
+        ``occupied_bw_hz`` is verified on the samples (99 % power + peak bin)
+        and an emission mask keeps the energy on bins the frequency policy
+        forbids (LO images included) below -50 dBc; ``consume`` verifies that
+        the front end is in the state the RX protection credited (LNA off, T/R
+        tx);
+      - PEP from the reconstructed envelope: every PEP-based limit uses the
+        peak of an 8x band-limited interpolation of each chain (inter-sample
+        peaks, burst edges), and an envelope above DAC full scale is refused;
+      - active reflection (B10) is evaluated on the burst samples
+        (``b(t) = S a(t)``) whenever an S-matrix is configured, whatever the
+        declared weights; radiate with several chains always needs a valid TX
+        calibration (``CAL_REQUIRED``);
+      - the front-end model, power-cal table, isolation, S-matrix and geometry
+        are tied to the fingerprint they were built from: the arm record
+        carries THAT fingerprint, and an arm after a change rebuilds the model
+        (or refuses ``CONFIG_CHANGED`` for an injected one);
+      - trip generation: every trip / ``safe_shutdown`` bumps a counter, and
+        ``arm`` / ``consume`` / ``burst_complete`` / ``refresh`` /
+        ``authorize_burst`` re-check it right before and right after their
+        state commit, so a signal handler that runs inside the critical section
+        (the RLock is re-entrant) can never be overwritten by the commit;
       - PA idle rule: the PA may be on only for a burst in flight, an issued
         unexpired permit or the hold session. A refused ``consume``, an
         abandoned or expired permit and ``poll`` bring it back to RX;
@@ -129,6 +150,20 @@ F32_REL_TOL = 1e-6                 # complex64 rounding allowance on the frozen 
 # outside the armed band (the 99 % power definition of occupied bandwidth, ITU-R SM.328),
 # and the strongest spectral bin must lie inside it.
 OCC_OOB_MAX_FRACTION = 0.01
+# Emission mask: at most this fraction of a chain's burst energy (-50 dBc in total) may fall on
+# spectral bins (or their LO images) that the frequency policy forbids (outside every allow band,
+# in a configured or built-in deny band). The 99 % rule above only proves that the declared band
+# is honest; this proves that nothing significant is emitted where transmitting is not allowed.
+FORBIDDEN_MAX_FRACTION = 1e-5
+SPEC_MIN_BINS_PER_BAND = 8         # spectral resolution of the B12 sample checks
+SPEC_MAX_PAD = 1 << 20             # cap of the zero-padded FFT length
+# Inter-sample peak: the analog envelope after DAC reconstruction is estimated on an
+# ISP_OVERSAMPLE x band-limited (FFT) interpolation of each chain, with the idle (zero) DAC
+# before and after the burst. Every PEP-based limit uses max(sample peak, reconstructed peak).
+ISP_OVERSAMPLE = 8
+ISP_BLOCK = 1 << 14                # interpolation core block (samples)
+ISP_GUARD = 256                    # overlap on each side of a block (circular-wrap guard)
+DAC_FULL_SCALE = 1.0               # a reconstructed envelope above this clips in the DUC / DAC
 TRIP_LOCK_TIMEOUT_S = 1.0          # trip() proceeds without the lock after this wait
 _REL_TOL = 1e-9
 
@@ -162,6 +197,54 @@ def vswr_from_powers(fwd_dbm, rev_dbm) -> float:
 def gamma_from_vswr(vswr) -> float:
     v = float(vswr)
     return (v - 1.0) / (v + 1.0) if math.isfinite(v) else 1.0
+
+
+def reconstructed_peak(x, oversample=ISP_OVERSAMPLE, block=ISP_BLOCK, guard=ISP_GUARD) -> np.ndarray:
+    """Per-row peak of the band-limited reconstruction of ``x`` (K, N).
+
+    Each row is embedded in ``guard`` zeros on both sides (the idle DAC), then
+    interpolated ``oversample`` x by zero-padding its spectrum, block by block
+    (cores of ``block`` samples with ``guard`` samples of overlap whose output
+    is discarded). Returns ``max(sample peak, reconstructed peak)`` per row:
+    the inter-sample peak of the analog envelope that the DAC produces, which
+    can exceed the largest sample by several dB (e.g. two tones at +/- fs/4).
+    """
+    a = np.atleast_2d(np.asarray(x, dtype=np.complex128))
+    k, n = a.shape
+    os_ = max(1, int(oversample))
+    g = max(1, int(guard))
+    out = np.max(np.abs(a), axis=1) if n else np.zeros(k)
+    if os_ == 1 or n == 0:
+        return out
+    blk = max(1, int(block))
+    for r in range(k):
+        y = np.concatenate((np.zeros(g, complex), a[r], np.zeros(g, complex)))
+        L = y.size
+        best = out[r]
+        for c0 in range(0, L, blk):
+            c1 = min(L, c0 + blk)
+            s0, s1 = max(0, c0 - g), min(L, c1 + g)
+            seg = y[s0:s1]
+            m = seg.size
+            X = np.fft.fft(seg)
+            h = (m + 1) // 2                     # bins 0..h-1 positive, the rest negative
+            Xu = np.zeros(m * os_, complex)
+            Xu[:h] = X[:h]
+            if m % 2 == 0:                       # split the Nyquist bin between +/- fs/2
+                Xu[h] = 0.5 * X[h]
+                Xu[-h] = 0.5 * X[h]
+                if m - h - 1 > 0:
+                    Xu[m * os_ - (m - h - 1):] = X[h + 1:]
+            else:
+                Xu[m * os_ - (m - h):] = X[h:]
+            yu = np.fft.ifft(Xu) * os_
+            lo = (c0 - s0) * os_
+            hi = lo + (c1 - c0) * os_
+            pk = float(np.max(np.abs(yu[lo:hi]))) if hi > lo else 0.0
+            if pk > best:
+                best = pk
+        out[r] = best
+    return out
 
 
 def _finite_or_none(v):
@@ -571,15 +654,20 @@ class TxSafetyController:
         self._tx_freq = tx_freq            # () -> tuned TX centre (Hz): authoritative when given
         self._tx_rate = tx_rate            # () -> actual TX sample rate (Hz): else the configured rate
         self._adopted = False
-        if geometry is None:
-            try:
-                import active_geometry as ageo
-                geometry = ageo.geometry_from_config(cfg)
-            except Exception as exc:  # geometry problems are reported by validate_static
-                logger.warning("TX safety: geometry unavailable: %s", exc)
-                geometry = None
-        self.geometry = geometry
-        self.frontend = frontend if frontend is not None else afe.FrontendModel.from_config(cfg, geometry)
+        # Bumped by every trip / safe_shutdown (also from a signal handler running inside a
+        # critical section): consume / arm / burst_complete / refresh never commit a state
+        # across a bump.
+        self._trip_gen = 0
+        # The front-end model / geometry and the fingerprint of the config + auxiliary files
+        # they were built from (``_model_fp``): the arm record carries THIS fingerprint, so a
+        # table edited after the model was built is a CONFIG_CHANGED, never a silent mismatch.
+        self._geometry_in = geometry
+        self._frontend_in = frontend
+        self._owns_model = frontend is None and geometry is None
+        self.geometry = None
+        self.frontend = None
+        self._model_fp = None
+        self._load_model()
         self.state_dir = state_dir if state_dir is not None else cfg.resolved_state_dir()
         self.backend = None
         self.rf = None
@@ -620,6 +708,65 @@ class TxSafetyController:
                 logger.warning("TX safety: deleted a stale arm record in %s", self.state_dir)
                 self._event(EVT_ACTIVE_TX_DISARM, "warning", reason="stale_arm_record",
                             session=getattr(stale, "session_id", ""), path=_arm_path(self.state_dir))
+
+    # --- model ---------------------------------------------------------------------------
+    def _load_model(self) -> None:
+        """Build (or rebuild) the geometry and front-end model from the config and stamp
+        ``_model_fp`` with the fingerprint they were built from. The fingerprint is taken
+        before and after the build; an auxiliary file that changes during the build is
+        retried, and a model that cannot be tied to one fingerprint gets ``_model_fp =
+        None`` (arming then refuses CONFIG_CHANGED). Injected models are kept as given and
+        tied to the fingerprint at construction."""
+        cfg = self.cfg
+        fp = None
+        geometry, frontend = self._geometry_in, self._frontend_in
+        for _ in range(3):
+            fp0 = self._fingerprint()
+            geometry = self._geometry_in
+            if geometry is None:
+                try:
+                    import active_geometry as ageo
+                    geometry = ageo.geometry_from_config(cfg)
+                except Exception as exc:  # geometry problems are reported by validate_static
+                    logger.warning("TX safety: geometry unavailable: %s", exc)
+                    geometry = None
+            frontend = self._frontend_in if self._frontend_in is not None else \
+                afe.FrontendModel.from_config(cfg, geometry)
+            fp1 = self._fingerprint()
+            if fp0 == fp1:
+                fp = fp1
+                break
+            if not self._owns_model:
+                break
+        self.geometry = geometry
+        self.frontend = frontend
+        self._model_fp = fp
+
+    def _model_current(self):
+        """None when the model in use matches the config / aux files on disk; else why.
+        A model this controller built is rebuilt first (a rebuild that raises is
+        reported as the reason)."""
+        try:
+            cur = self._fingerprint()
+        except Exception as exc:
+            return "cannot fingerprint the configuration: %r" % (exc,)
+        if self._model_fp is not None and cur == self._model_fp:
+            return None
+        if not self._owns_model:
+            return ("the injected front-end model / geometry predates a change of the configuration or of "
+                    "an auxiliary table: build a new controller")
+        try:
+            self._load_model()
+            self.policy = TxPolicy.from_config(self.cfg)
+            self.duty.window_s = float(self.policy.duty_window_s)
+            self.duty.duty_max = float(self.policy.duty_max)
+        except Exception as exc:
+            self._model_fp = None
+            return "rebuilding the front-end model failed: %r" % (exc,)
+        if self._model_fp is None:
+            return "an auxiliary table kept changing while the front-end model was rebuilt"
+        logger.warning("TX safety: configuration / auxiliary tables changed since the model was built: rebuilt")
+        return None
 
     # --- small helpers --------------------------------------------------------------
     def _event(self, etype, severity="info", **payload):
@@ -991,6 +1138,7 @@ class TxSafetyController:
         """Run the preflight A1..A15 and arm (spec 12.3). ``SafetyRefusal`` on the
         first failure; the state is unchanged and no RF is emitted."""
         with self._lock:
+            gen0 = self._trip_gen
             p = self.policy
             checks = []
             self.last_arm_checks = checks
@@ -1030,7 +1178,11 @@ class TxSafetyController:
             if sim and p.backend != "sim":
                 self._refuse("BACKEND", "simulation fallback for a %s configuration: TX is refused" % p.backend)
             ok("A5")
-            # A6
+            # A6: the model the checks use must be the one the config / aux files describe
+            why = self._model_current()
+            if why is not None:
+                self._refuse("CONFIG_CHANGED", why)
+            p = self.policy
             static = self.validate_static()
             deferred_radiate = [i for i in static if i.level == "error" and i.code == "TX_RADIATE"
                                 and mode == "radiate"]
@@ -1131,10 +1283,14 @@ class TxSafetyController:
                     if p.n_tx else 0.0
             except ValueError:
                 mpe = None
+            # the record certifies the model the checks above used (not the files as they are now)
+            if self._fingerprint() != self._model_fp:
+                self._refuse("CONFIG_CHANGED", "the configuration / an auxiliary table changed during arming")
             rec = ArmRecord(session_id=uuid.uuid4().hex, mode=mode, operator=op, fc_hz=fc, occupied_bw_hz=occ,
-                            armed_unix=wall, expires_unix=wall + dur, fingerprint=self._fingerprint(),
+                            armed_unix=wall, expires_unix=wall + dur, fingerprint=self._model_fp,
                             flowgraph_sha256=str(flowgraph_sha256 or ""),
                             waveform_sha256=str(waveform_sha256 or ""), max_bursts=int(max_bursts or 0))
+            self._check_not_interrupted(gen0, "arming")
             try:
                 write_arm_record(self.state_dir, rec)
             except OSError as exc:
@@ -1151,6 +1307,9 @@ class TxSafetyController:
             self._underflows.clear()
             self._adopted = False
             self.state = TxState.ARMED
+            if self._trip_gen != gen0:
+                # a trip / shutdown (e.g. a signal handler) ran inside this commit
+                self._undo_interrupted(rec.session_id, "arming")
             self._station_next = (now + p.station_id_interval_s) if p.authorization_kind == "amateur" else None
             banner = areg.regulatory_banner(mode, fc, p.authorization, p.authorization_kind, p.callsign, fiss,
                                             eirp if mode == "radiate" else None,
@@ -1172,17 +1331,56 @@ class TxSafetyController:
             if p.authorization_kind == "amateur":
                 self._event(EVT_ACTIVE_STATION_ID, "info", callsign=p.callsign, session=rec.session_id)
             if p.pa_hold_between_bursts and self.rf is not None and not self._atr():
+                gen1 = self._trip_gen
                 try:
                     self.rf.sequence_to_tx(rec)
                 except Exception as exc:
                     self.trip("SEQUENCE", "PA hold sequencing failed: %r" % (exc,))
                     raise InterlockTrip("SEQUENCE", "PA hold sequencing failed: %r" % (exc,))
+                if self._trip_gen != gen1:
+                    # a trip ran while the PA was being sequenced on: re-assert the safe state
+                    self.safe_shutdown("trip_during_sequencing", fault=self.state == TxState.FAULT)
+                    self._raise_interrupted("arming")
             return rec
+
+    # --- trip-generation guards (signal handlers run inside critical sections) ----------
+    def _raise_interrupted(self, what):
+        if self.state == TxState.FAULT:
+            raise InterlockTrip(self.fault_code or "SIGNAL", "%s interrupted by a trip: %s"
+                                % (what, self.fault_detail))
+        self._refuse("SEQUENCE", "%s interrupted by a shutdown (signal / trip): nothing committed" % what)
+
+    def _check_not_interrupted(self, gen0, what):
+        """Raise when a trip / safe_shutdown ran since ``gen0`` (nothing committed yet)."""
+        if self._trip_gen != gen0:
+            self._raise_interrupted(what)
+
+    def _undo_interrupted(self, session, what, entry=None):
+        """A trip / shutdown ran between the last check and a state commit: restore the
+        state it left (FAULT when a fault is latched, else SAFE), drop the committed
+        burst / record, then raise."""
+        if self.state in (TxState.ARMED, TxState.TRANSMITTING):
+            self.state = TxState.FAULT if self.fault_code else TxState.SAFE
+        if entry is not None and self._inflight is entry:
+            self._inflight = None
+        if self.state != TxState.FAULT:
+            self.arm_record = None
+            self._mode = None
+        try:
+            disk = read_arm_record(self.state_dir)
+            if disk is not None and disk.session_id == session and not self._adopted:
+                clear_arm_record(self.state_dir)
+        except Exception:  # pragma: no cover
+            pass
+        self._raise_interrupted(what)
 
     def _adopt(self, rec: ArmRecord) -> None:
         """Adopt an arm record written by the arming process (flowgraph_guard only)."""
         if not self.policy.enabled:
             raise SafetyRefusal("TX_DISABLED", "TX is disabled in this configuration")
+        if self._model_fp is None or self._model_fp != rec.fingerprint:
+            raise SafetyRefusal("CONFIG_CHANGED", "the front-end model was built from a configuration / "
+                                "auxiliary tables that differ from the arm record")
         p = self.policy
         now, wall = self._clock(), self._wallclock()
         span = float(rec.expires_unix) - float(rec.armed_unix)
@@ -1238,7 +1436,12 @@ class TxSafetyController:
             self._expiry_mono = max(self._expiry_mono, new)
             rec = dataclasses.replace(self.arm_record,
                                       expires_unix=self._wallclock() + (self._expiry_mono - now))
+            gen0 = self._trip_gen
             write_arm_record(self.state_dir, rec)
+            if self._trip_gen != gen0 or self.state not in (TxState.ARMED, TxState.TRANSMITTING):
+                # a trip / shutdown cleared the record meanwhile: never leave a refreshed one behind
+                self._clear_own_record(rec.session_id)
+                self._raise_interrupted("refresh")
             self.arm_record = rec
             self._last_hb = now
             return rec
@@ -1321,31 +1524,65 @@ class TxSafetyController:
         lna_on = not p.lna_off_during_tx
         return lna_on, "tx", (not lna_on) and bool(fe.lna_controllable), bool(fe.has_tr_switch)
 
-    def _spectrum_problem(self, x, fs, fc_b, a_lo, a_hi):
-        """Detail when a chain's burst energy is not contained in ``[a_lo, a_hi]`` (RF Hz),
-        else None. Skipped when the band covers the whole baseband ``fc +/- fs/2``."""
+    def _spectrum_problem(self, x, fs, fc_b, a_lo, a_hi, mode=None):
+        """``(code, detail)`` when a chain's burst energy is not contained in ``[a_lo, a_hi]``
+        (RF Hz), else None. Skipped when the band covers the whole baseband ``fc +/- fs/2``
+        (the frequency policy then already covers every bin).
+
+        Three tests per chain: the strongest bin lies in the band and at most
+        ``OCC_OOB_MAX_FRACTION`` of the energy lies outside it (the declared band is
+        honest: ``FREQ_CHANGED``), and at most ``FORBIDDEN_MAX_FRACTION`` (-50 dBc) lies
+        on bins outside it that the frequency policy forbids, LO images included
+        (``FREQ_NOT_ALLOWED`` / ``FREQ_DENIED``: the emission mask)."""
         lo, hi = a_lo - fc_b, a_hi - fc_b
         if lo <= -fs / 2.0 + FREQ_TOL_HZ and hi >= fs / 2.0 - FREQ_TOL_HZ:
             return None
-        n = int(x.shape[1])
+        p = self.policy
+        mode = mode or self._mode
+        # resolution: at least SPEC_MIN_BINS_PER_BAND bins across the band (a burst shorter
+        # than that is zero-padded: its gated spectrum, not a coarse bin straddling the edge)
+        n = max(int(x.shape[1]), min(SPEC_MAX_PAD, int(math.ceil(
+            SPEC_MIN_BINS_PER_BAND * fs / max(hi - lo, FREQ_TOL_HZ)))))
         f = np.fft.fftfreq(n, 1.0 / fs)
-        half_bin = fs / n / 2.0
+        bin_hz = fs / n
+        half_bin = bin_hz / 2.0
         inband = (f >= lo - half_bin) & (f <= hi + half_bin)
+        forb = areg.forbidden_mask(fc_b + f, bin_hz, mode, p.allow_bands, p.deny_bands,
+                                   p.conducted_ignore_builtin_deny, p.lo_offset_hz, fc_b) & ~inband
         for k in range(x.shape[0]):                     # one chain at a time (memory)
-            spec = np.abs(np.fft.fft(np.asarray(x[k], dtype=np.complex128))) ** 2
+            spec = np.abs(np.fft.fft(np.asarray(x[k], dtype=np.complex128), n)) ** 2
             tot = float(spec.sum())
             if not tot > 0:
                 continue
             pk = int(np.argmax(spec))
             if not inband[pk]:
-                return ("burst chain %d: spectral peak at %.6f MHz is outside the armed band %.6f..%.6f MHz "
-                        "(occupied_bw_hz does not describe this waveform)"
-                        % (k, (fc_b + f[pk]) / 1e6, a_lo / 1e6, a_hi / 1e6))
+                return "FREQ_CHANGED", ("burst chain %d: spectral peak at %.6f MHz is outside the armed band "
+                                        "%.6f..%.6f MHz (occupied_bw_hz does not describe this waveform)"
+                                        % (k, (fc_b + f[pk]) / 1e6, a_lo / 1e6, a_hi / 1e6))
+            if forb.any():
+                fe = float(spec[forb].sum()) / tot
+                if fe > FORBIDDEN_MAX_FRACTION:
+                    j = int(np.flatnonzero(forb)[np.argmax(spec[forb])])
+                    fj = fc_b + f[j]
+                    iv = [(fj - half_bin, fj + half_bin, "emission")]
+                    if p.lo_offset_hz:
+                        for lo_c in (fc_b - p.lo_offset_hz, fc_b + p.lo_offset_hz):
+                            iv.append((2 * lo_c - fj - half_bin, 2 * lo_c - fj + half_bin, "emission image"))
+                    errs = [i for i in areg.band_check(iv, mode, p.allow_bands, p.deny_bands,
+                                                       ignore_builtin=p.conducted_ignore_builtin_deny)
+                            if i.level == "error"]
+                    errs.sort(key=lambda i: i.code != "FREQ_DENIED")      # a denial is the stronger code
+                    code = errs[0].code if errs else "FREQ_DENIED"
+                    return code, ("burst chain %d: %.1f dBc of the energy falls where transmitting is not "
+                                  "allowed (limit %.0f dBc); strongest at %.6f MHz (%.1f dBc): %s"
+                                  % (k, 10 * math.log10(fe), 10 * math.log10(FORBIDDEN_MAX_FRACTION), fj / 1e6,
+                                     10 * math.log10(max(float(spec[j]) / tot, 1e-300)),
+                                     errs[0].message if errs else "forbidden by the frequency policy"))
             oob = float(spec[~inband].sum()) / tot
             if oob > OCC_OOB_MAX_FRACTION:
-                return ("burst chain %d: %.2f %% of the energy lies outside the armed band %.6f..%.6f MHz "
-                        "(limit %.2f %%: widen occupied_bw_hz or shape the burst)"
-                        % (k, 100.0 * oob, a_lo / 1e6, a_hi / 1e6, 100.0 * OCC_OOB_MAX_FRACTION))
+                return "FREQ_CHANGED", ("burst chain %d: %.2f %% of the energy lies outside the armed band "
+                                        "%.6f..%.6f MHz (limit %.2f %%: widen occupied_bw_hz or shape the burst)"
+                                        % (k, 100.0 * oob, a_lo / 1e6, a_hi / 1e6, 100.0 * OCC_OOB_MAX_FRACTION))
         return None
 
     def authorize_burst(self, samples, chains, tx_gains_db, fs_hz, start=None, weights=None,
@@ -1357,11 +1594,13 @@ class TxSafetyController:
         authoritative; ``fc_hz`` is only a cross-check against it (without a
         provider it is the burst centre, default the configured one). ``fs_hz``
         must equal the device / configured TX rate. ``at_offset_s`` places an
-        untimed burst at ``now + offset`` in the duty window (flowgraph TX). The
-        burst's duty is reserved at its real start until it is consumed, revoked
-        or expires.
+        untimed burst at ``now + offset`` in the duty window; it is accepted only
+        for ``purpose="flowgraph"`` on an adopted (flowgraph_guard) controller
+        (``SHAPE`` otherwise). The burst's duty is reserved at its real start
+        until it is consumed, revoked or expires.
         """
         with self._lock:
+            gen0 = self._trip_gen
             p = self.policy
             now = self._clock()
             self._expire_permits(now)
@@ -1426,6 +1665,12 @@ class TxSafetyController:
             if not math.isfinite(at_off):
                 self._refuse("SHAPE", "at_offset_s must be finite")
             at_off = max(0.0, at_off)
+            flowgraph = str(purpose) == "flowgraph" and self._adopted
+            if at_off > 0 and not flowgraph:
+                # an untimed send starts at consume(): a declared offset would place its duty in a
+                # window it does not occupy. Timed bursts use ``start``.
+                self._refuse("SHAPE", "at_offset_s is accepted only for flowgraph bursts of an adopted "
+                             "(flowgraph_guard) controller; use a timed start")
             x128 = np.array(x, dtype=np.complex128, copy=True)
             if not np.all(np.isfinite(x128)):
                 self._refuse("NONFINITE", "samples contain NaN or inf")
@@ -1433,13 +1678,22 @@ class TxSafetyController:
             # B3 (complex magnitude bounds |I| and |Q|): exact on complex128, and the frozen
             # complex64 copy (what is sent) within float32 rounding (~1e-7 relative)
             pk128 = np.max(np.abs(x128), axis=1)
-            pk64 = np.max(np.abs(frozen.astype(np.complex128)), axis=1)
+            f64 = frozen.astype(np.complex128)
+            pk64 = np.max(np.abs(f64), axis=1)
             for k, c in enumerate(chains):
                 pk = (pk128[k], pk64[k])
                 if (pk128[k] > p.max_digital_amplitude * (1.0 + 1e-12)
                         or pk64[k] > p.max_digital_amplitude * (1.0 + F32_REL_TOL)):
                     self._refuse("AMPLITUDE", "chain %d peak |s| %.9f > max_digital_amplitude %.6f (never "
                                  "clipped: scale the waveform)" % (c, max(pk), p.max_digital_amplitude))
+            # B3 (analog): the reconstructed envelope (inter-sample peaks, burst edges) must not
+            # clip the DUC / DAC; its peak drives every PEP-based limit below
+            isp = reconstructed_peak(f64)
+            for k, c in enumerate(chains):
+                if isp[k] > DAC_FULL_SCALE:
+                    self._refuse("AMPLITUDE", "chain %d reconstructed (inter-sample) envelope peak %.4f > DAC "
+                                 "full scale %.1f (sample peak %.4f): reduce the amplitude or band-limit / ramp "
+                                 "the waveform" % (c, isp[k], DAC_FULL_SCALE, pk64[k]))
             # B4
             try:
                 gains = tuple(float(g) for g in (tx_gains_db if np.ndim(tx_gains_db) else
@@ -1478,8 +1732,8 @@ class TxSafetyController:
                 if now + lead + dur > self._expiry_mono:
                     self._refuse("START_TIME", "the burst would end after the arm expiry")
             else:
-                if self._time_now is not None and not (self.is_simulation
-                                                       or getattr(self.backend, "is_simulation", False)):
+                sim = self.is_simulation or bool(getattr(self.backend, "is_simulation", False))
+                if not sim and not flowgraph and (self._time_now is not None or self.backend is not None):
                     self._refuse("START_TIME", "hardware bursts must be timed (start required)")
                 if now + at_off + dur > self._expiry_mono:
                     self._refuse("START_TIME", "the burst would end after the arm expiry")
@@ -1513,10 +1767,9 @@ class TxSafetyController:
                 self._refuse("FREQ_CHANGED", "TX frequency %.6f MHz != armed %.6f MHz"
                              % (fc_b / 1e6, self.arm_record.fc_hz / 1e6))
             occ_b = p.occupied_bw_hz(fs)
-            # B7..B9 on the final buffer
-            f64 = frozen.astype(np.complex128)
+            # B7..B9 on the final buffer (PEP from the reconstructed envelope peak)
             rms = adsp.rms(f64, axis=1)
-            peak = adsp.peak(f64, axis=1)
+            peak = np.maximum(adsp.peak(f64, axis=1), isp)
             preds = {}
             for k, c in enumerate(chains):
                 preds[c] = self.frontend.tx[c].predict(fc_b, gains[k], float(rms[k]), float(peak[k]),
@@ -1527,7 +1780,27 @@ class TxSafetyController:
                                                      lna_on=lna_on, tr_state=tr_state))
             if e is not None:
                 self._refuse(e.code, e.message)
-            # B10
+            # B10 on the actual samples (whatever the declared weights say): b(t) = S a(t)
+            if self.frontend.s_matrix is not None:
+                gmax = gamma_from_vswr(p.max_vswr)
+                scale = []
+                for k, c in enumerate(chains):
+                    pep_w = afe._w(preds[c].out_pep_dbm) if preds[c].out_pep_dbm != afe.NEG_INF else 0.0
+                    scale.append(math.sqrt(pep_w) / float(peak[k]) if peak[k] > 0 else 0.0)
+                # the waves are sampled at the sample instants: scale the reverse peak by the
+                # largest inter-sample excess of the burst (conservative)
+                exc = max([float(isp[k] / pk64[k]) for k in range(len(chains)) if pk64[k] > 0] or [1.0])
+                rev_s, gam_s = self.frontend.active_waves_from_samples(f64, chains, scale)
+                for n in range(p.n_tx):
+                    rv = float(rev_s[n]) + 20.0 * math.log10(exc)
+                    if p.max_reverse_power_dbm is not None and rv > p.max_reverse_power_dbm + 1e-9:
+                        self._refuse("ACTIVE_REFLECTION", "chain %d predicted active reverse power %.2f dBm > "
+                                     "%.2f dBm (from the burst samples)" % (n, rv, p.max_reverse_power_dbm))
+                for c in chains:
+                    if math.isfinite(gam_s[c]) and gam_s[c] > gmax + 1e-9:
+                        self._refuse("ACTIVE_REFLECTION", "chain %d active reflection |G| %.3f > %.3f (VSWR %.2f), "
+                                     "from the burst samples" % (c, gam_s[c], gmax, p.max_vswr))
+            # B10 on the declared weights (an additional, never a replacing, check)
             if weights is not None and self.frontend.s_matrix is not None:
                 w = np.asarray(weights, dtype=complex).reshape(-1)
                 t = np.zeros(p.n_tx, dtype=complex)
@@ -1549,13 +1822,15 @@ class TxSafetyController:
                     if abs(t[c]) > 0 and gam[c] > gmax + 1e-12:
                         self._refuse("ACTIVE_REFLECTION", "chain %d active reflection |G| %.3f > %.3f (VSWR %.2f)"
                                      % (c, gam[c], gmax, p.max_vswr))
-            if weights is not None and mode == "radiate":
+            # radiate with several chains is beamformed whatever the weights argument says
+            if mode == "radiate" and (weights is not None or len(chains) > 1):
                 try:
                     cal_ok = bool(self._tx_cal_valid())
                 except Exception:
                     cal_ok = False
                 if not cal_ok:
-                    self._refuse("CAL_REQUIRED", "beamformed radiate burst without a valid TX calibration")
+                    self._refuse("CAL_REQUIRED", "beamformed / multi-chain radiate burst without a valid TX "
+                                 "calibration")
             # B12: the occupied band inside the armed band
             a_lo = self.arm_record.fc_hz - self.arm_record.occupied_bw_hz / 2.0
             a_hi = self.arm_record.fc_hz + self.arm_record.occupied_bw_hz / 2.0
@@ -1564,10 +1839,12 @@ class TxSafetyController:
                              % ((fc_b - occ_b / 2) / 1e6, (fc_b + occ_b / 2) / 1e6, a_lo / 1e6, a_hi / 1e6))
             # B12: the declared band must describe the actual samples
             why = self._spectrum_problem(frozen, fs, fc_b, max(a_lo, fc_b - occ_b / 2.0),
-                                         min(a_hi, fc_b + occ_b / 2.0))
+                                         min(a_hi, fc_b + occ_b / 2.0), mode)
             if why is not None:
-                self._refuse("FREQ_CHANGED", why)
-            # issue
+                self._refuse(why[0], why[1])
+            # issue (never across a trip / shutdown that ran during the checks)
+            if self._trip_gen != gen0 or self.state not in (TxState.ARMED, TxState.TRANSMITTING):
+                self._raise_interrupted("authorize_burst")
             frozen.flags.writeable = False
             deadline = now + lead + max(1.0, 2.0 * dur + tmo)
             permit = TxPermit(permit_id=uuid.uuid4().hex, session_id=self.arm_record.session_id, samples=frozen,
@@ -1577,6 +1854,9 @@ class TxSafetyController:
                               prediction=tuple(preds[c] for c in chains))
             self._registry[permit.permit_id] = _Entry(permit, duty_at, at_off, lna_credit, tr_credit)
             self.duty.reserve(permit.permit_id, duty_at, dur)
+            if self._trip_gen != gen0:
+                self._drop_permit(permit.permit_id, "interrupted")
+                self._raise_interrupted("authorize_burst")
             return permit
 
     # --- consume / complete ---------------------------------------------------------------------
@@ -1657,6 +1937,7 @@ class TxSafetyController:
     def consume(self, permit) -> None:
         """Called by the backend immediately before the first send (spec 12.4)."""
         with self._lock:
+            gen0 = self._trip_gen
             now = self._clock()
             if self.state == TxState.DISABLED:
                 self._refuse("TX_DISABLED", "TX is disabled")
@@ -1704,10 +1985,22 @@ class TxSafetyController:
             why = self._frontend_state_problem(entry)
             if why is not None:
                 self._refuse_consume(pid, "SEQUENCE", why)
+            # last step before the commit: a trip / shutdown since entry (signal handler, a
+            # trip from another thread) wins; never write TRANSMITTING over it
+            if self._trip_gen != gen0 or self.state != TxState.ARMED or self._registry.get(pid) is not entry:
+                self._registry.pop(pid, None)
+                self.duty.release(pid)
+                self._revoke(pid, "interrupted")
+                self._raise_interrupted("consume")
             entry.consumed = True
             entry.duty_at = start_mono
             self._inflight = entry
             self.state = TxState.TRANSMITTING
+            if self._trip_gen != gen0:
+                self._registry.pop(pid, None)
+                self.duty.release(pid)
+                self._revoke(pid, "interrupted")
+                self._undo_interrupted(sess, "consume", entry)
             self.duty.record(start_mono, permit.duration_s, key=pid)
             self._event(EVT_ACTIVE_TX_BURST, "info", phase="start", permit=pid, session=sess,
                         chains=list(permit.chains), duration_s=permit.duration_s, purpose=permit.purpose,
@@ -1769,6 +2062,7 @@ class TxSafetyController:
     def burst_complete(self, permit, result: TxResult) -> None:
         """Account the burst outcome; return to ARMED unless a trip occurred."""
         with self._lock:
+            gen0 = self._trip_gen
             now = self._clock()
             pid = getattr(permit, "permit_id", None)
             entry = self._registry.get(pid) if isinstance(pid, str) else None
@@ -1804,8 +2098,10 @@ class TxSafetyController:
             if result is not None and getattr(result, "events", None):
                 self.handle_async_events(result.events)
             self._check_underflows(now)
-            if self.state == TxState.TRANSMITTING:
+            if self.state == TxState.TRANSMITTING and self._trip_gen == gen0:
                 self.state = TxState.ARMED
+                if self._trip_gen != gen0 and self.state == TxState.ARMED:
+                    self.state = TxState.FAULT if self.fault_code else TxState.SAFE
             if self.state == TxState.ARMED:
                 if not self.policy.pa_hold_between_bursts and self.rf is not None and not self._atr():
                     try:
@@ -1953,6 +2249,7 @@ class TxSafetyController:
         in sensor / backend I/O while holding it cannot block a trip (e.g. from a
         signal handler); without the lock the fault is still latched and the
         shutdown sequence still runs."""
+        self._trip_gen += 1             # first: an interrupted critical section must not commit
         got = False
         try:
             try:
@@ -2028,6 +2325,7 @@ class TxSafetyController:
 
         ``lock_timeout``: how long to wait for the controller lock (default 5 s);
         the sequence runs without it after that."""
+        self._trip_gen += 1
         steps = []
         session = getattr(self.arm_record, "session_id", "")
 

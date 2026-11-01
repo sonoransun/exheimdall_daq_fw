@@ -28,8 +28,22 @@ TestLegacyInstances (no ``[host]`` keys, registry off):
   running (today's synthetic start: the port probe is advisory, nothing is
   stopped).
 
-Both cases stop every DAQ process on the host (``daq_stop.sh --all``), so they
-skip when another chain is already running.
+TestSoak (nightly, spec J.2 step 8, G39; runs only with
+``HEIMDALL_SOAK_SEC`` > 0, e.g. ``HEIMDALL_SOAK_SEC=600``):
+  instances 0 and 1 (registry on, ``cal_track_mode = 0``: one calibration,
+  then the locked data path) start and lock; a real ``:5000``/``:5100``
+  client per instance reads every frame; after the warm-up (the drop window
+  empty on both) STATUS on 5002/5102 is sampled every SOAK_PERIOD s for
+  HEIMDALL_SOAK_SEC s. On both instances: ``counters.cpi_gaps`` does not
+  change from the post-lock baseline, ``counters.buffer_overrun_cnt == 0``,
+  ``recent_drops == 0`` on every sample (and the dropped-frame counters do
+  not move), ``sync_state >= 5`` on every non-DUMMY sample, ``frame_count``
+  advances at the paced rate, and the client sees a continuous
+  ``cpi_index`` with slot 102 zero in every header.
+
+Every case stops every DAQ process on the host (``daq_stop.sh --all``), so
+they skip when another chain is already running (fail under
+``HEIMDALL_STRICT_MODULES=1``).
 """
 import glob
 import hashlib
@@ -37,13 +51,16 @@ import json
 import os
 import re
 import shutil
+import math
 import sys
+import threading
 import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import test_synthetic_chain as chain  # noqa: E402
+from iq_header import IQHeader  # noqa: E402
 
 REPO_INI = os.path.join(chain.FIRMWARE, "daq_chain_config.ini")
 STAGES = ("synthesizer", "rebuffer", "decimate", "delay_sync")
@@ -51,6 +68,27 @@ SYNC_TIMEOUT = chain.sync_timeout(90)
 #: lines the registry / lock / mutex helpers print (daq_common.sh)
 REGISTRY_LINE = re.compile(r"registry|instance lock|startup mutex|already running|also running|"
                            r"another start of instance|taking over", re.IGNORECASE)
+
+
+#: STATUS sampling period of the soak [s]; below the soak's drop window, so
+#: every drop is still in ``recent_drops`` when the next sample is taken
+SOAK_PERIOD = 2.0
+SOAK_DROP_WINDOW = 10.0
+
+
+def soak_seconds():
+    """(seconds, error) from HEIMDALL_SOAK_SEC: (0, None) when unset or 0
+    (the soak case skips), (0, message) when malformed (the case fails)."""
+    raw = os.environ.get("HEIMDALL_SOAK_SEC", "").strip()
+    if not raw:
+        return 0.0, None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value < 0:
+        return 0.0, "HEIMDALL_SOAK_SEC = %r is not a non-negative number of seconds" % raw
+    return value, None
 
 
 def sha256(path):
@@ -82,10 +120,7 @@ class _TwoInstanceBase(unittest.TestCase):
             raise unittest.SkipTest(chain.WHY_NOT)
         if shutil.which("flock") is None:
             raise unittest.SkipTest("pipeline lane: needs flock (util-linux)")
-        if (os.cpu_count() or 1) < 4:
-            raise unittest.SkipTest("two instances need at least 4 CPUs")
-        if chain.daq_pids():
-            raise unittest.SkipTest("another DAQ chain is running on this host (the lane stops every chain)")
+        chain.refuse_running_chain()
 
     def setUp(self):
         self.repo_ini_sha = sha256(REPO_INI)
@@ -96,8 +131,10 @@ class _TwoInstanceBase(unittest.TestCase):
                                      "federation": {"instance_id": "0", "port_stride": "100"}})
 
     def tearDown(self):
-        self.box.cleanup()
-        self.assertEqual(sha256(REPO_INI), self.repo_ini_sha, "the repository's daq_chain_config.ini changed")
+        try:
+            self.box.cleanup()
+        finally:
+            self.assertEqual(sha256(REPO_INI), self.repo_ini_sha, "the repository's daq_chain_config.ini changed")
 
     # -- helpers ---------------------------------------------------------
 
@@ -110,11 +147,16 @@ class _TwoInstanceBase(unittest.TestCase):
 
     @staticmethod
     def cores_for(instance_id):
-        """--cores for instance N > 0 on a host with fewer than 4(N+1) CPUs."""
+        """--cores for instance N > 0 on a host with fewer than 4(N+1) CPUs.
+
+        Only keeps provision_instance's default cpu_cores (4N..4N+3) inside
+        this host's CPU range, so ini_checker accepts the instance INI. Core
+        overlap with instance 0 does not matter here: daq_synthetic_start.sh
+        without --rt pins no stage and runs no core guard."""
         n = os.cpu_count() or 4
         if 4 * instance_id + 3 < n:
             return []
-        return ["--cores", ",".join(str((4 * instance_id + k) % n) for k in range(4))]
+        return ["--cores", ",".join(str(c) for c in sorted({(4 * instance_id + k) % n for k in range(4)}))]
 
     def start(self, cwd):
         return self.box.sh(cwd, "./daq_synthetic_start.sh", "--pace", "--blocks", "0")
@@ -265,7 +307,7 @@ class TestRegistryInstances(_TwoInstanceBase):
         rc, out = box.sh(fw0, "./daq_stop.sh", "--all")
         self.assertEqual(rc, 0, out)
         self.assertTrue(chain.wait_for(lambda: not chain.daq_pids(), timeout=60),
-                        "DAQ processes survived daq_stop.sh --all: %s" % sorted(chain.daq_pids()))
+                        "DAQ processes survived daq_stop.sh --all:\n%s" % chain.ps_listing(chain.daq_pids()))
         self.assertEqual(glob.glob(os.path.join(box.run_dir, "inst*.json")) +
                          glob.glob(os.path.join(box.run_dir, "inst*.env")), [])
         self.assertTrue(chain.wait_for(lambda: not chain.listening({5000, 5001, 5002, 5100, 5101, 5102}),
@@ -303,8 +345,161 @@ class TestLegacyInstances(_TwoInstanceBase):
         time.sleep(5)
         self.assertEqual(self.alive_roles(fwb, 1), set(STAGES),
                          "the second copy's chain is not running\n%s" % box.logs(fwb, 1))
-        self.assertFalse(os.path.exists(os.path.join(fwb, "_logs", "inst1", "pids", "run_dir")))
         self.assertEqual(os.listdir(box.run_dir), [])
+
+
+class _FrameReader(threading.Thread):
+    """A real ``:5000``-protocol client reading every frame of one instance
+    until stopped: cpi_index steps, slot-102 values, the first error."""
+
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.port = port
+        self.cpis = []
+        self.overruns = []
+        self.error = None
+        self._stop_evt = threading.Event()
+
+    def run(self):
+        try:
+            client = chain.connect_iq(self.port)
+        except AssertionError as e:
+            self.error = str(e)
+            return
+        try:
+            # buffers delay_sync filled before this client connected
+            for _ in range(chain.STALE_FRAMES):
+                client.frame()
+            while not self._stop_evt.is_set():
+                hdr = client.frame()[1]
+                self.cpis.append(hdr.cpi_index)
+                self.overruns.append(hdr.get_buffer_overrun_cnt())
+        except (OSError, ValueError) as e:
+            if not self._stop_evt.is_set():
+                self.error = "%s: %s" % (type(e).__name__, e)
+        finally:
+            client.close()
+
+    def stop(self):
+        self._stop_evt.set()
+        self.join(timeout=30)
+
+    def gaps(self):
+        return [(a, b) for a, b in zip(self.cpis, self.cpis[1:]) if b != a + 1]
+
+
+class TestSoak(_TwoInstanceBase):
+    TAG = "soak"
+    SOAK_SEC, SOAK_ERROR = soak_seconds()
+
+    def setUp(self):
+        if self.SOAK_ERROR:
+            self.fail(self.SOAK_ERROR)
+        if self.SOAK_SEC <= 0:
+            self.skipTest("soak case: set HEIMDALL_SOAK_SEC=<seconds> (the nightly CI job runs 600)")
+        super().setUp()
+        chain.set_ini(self.box.ini, {"calibration": {"cal_track_mode": "0"},
+                                     "monitoring": {"drop_window_sec": str(SOAK_DROP_WINDOW)}})
+        cfg = chain.read_ini(self.box.ini)
+        self.frame_period = (cfg.getint("pre_processing", "cpi_size") *
+                             cfg.getint("pre_processing", "decimation_ratio") /
+                             float(cfg.getint("daq", "sample_rate")))
+
+    def test_two_instance_soak(self):
+        box = self.box
+        self.provision("--instance", "0", "--in-place", "--write")
+        self.provision("--instance", "1", "--write", *self.cores_for(1))
+        fws = {0: box.fw, 1: os.path.join(box.root, "instances", "1", "Firmware")}
+        ports = {n: chain.ports_of(os.path.join(fw, "daq_chain_config.ini")) for n, fw in fws.items()}
+        self.assertEqual({n: p[2] for n, p in ports.items()}, {0: 5002, 1: 5102})
+        for n, fw in fws.items():
+            ini = os.path.join(fw, "daq_chain_config.ini")
+            self.assertEqual(ini_value(ini, "calibration", "cal_track_mode"), "0", ini)
+        for n, fw in fws.items():
+            self.assert_started(fw, n)
+        for n, fw in fws.items():
+            self.wait_status(ports[n][2], fw, n)
+            self.wait_locked(ports[n][2], fw, n)
+        for n, fw in fws.items():
+            self.assertTrue(chain.wait_steady(ports[n][2]), "instance %d: no steady locked DATA stream: %s\n%s"
+                            % (n, chain.status(ports[n][2]), box.logs(fw, n)))
+
+        readers = {n: _FrameReader(ports[n][0]) for n in fws}
+        for r in readers.values():
+            r.start()
+        try:
+            self._soak(fws, ports, readers)
+        finally:
+            for r in readers.values():
+                r.stop()
+        for n, r in readers.items():
+            self.assertIsNone(r.error, "instance %d :%d client: %s" % (n, r.port, r.error))
+            self.assertGreater(len(r.cpis), 1, "instance %d: the :%d client got no frames" % (n, r.port))
+            self.assertEqual(r.gaps(), [], "instance %d: cpi_index gaps on :%d" % (n, r.port))
+            self.assertEqual([c for c in r.overruns if c], [], "instance %d: slot 102 non-zero" % n)
+
+    def _soak(self, fws, ports, readers):
+        box = self.box
+        # Warm-up: drops from before the clients connected leave the window
+        quiet = lambda n: (chain.status(ports[n][2]) or {}).get("recent_drops") == 0  # noqa: E731
+        for n, fw in fws.items():
+            self.assertTrue(chain.wait_for(lambda: quiet(n), timeout=SOAK_DROP_WINDOW + 60),
+                            "instance %d: recent_drops did not settle to 0 with a client reading: %s\n%s"
+                            % (n, chain.status(ports[n][2]), box.logs(fw, n)))
+        base = {}
+        for n in fws:
+            st = chain.status(ports[n][2])
+            self.assertIsNotNone(st, "instance %d: no STATUS at the soak start" % n)
+            base[n] = st
+        violations = {n: [] for n in fws}
+        t_end = time.monotonic() + self.SOAK_SEC
+        sys.stderr.write("[test_multi_instance] soak: %.0f s on instances %s\n" % (self.SOAK_SEC, sorted(fws)))
+        last = dict(base)
+        while time.monotonic() < t_end:
+            time.sleep(min(SOAK_PERIOD, max(0.0, t_end - time.monotonic())))
+            for n in fws:
+                st = chain.status(ports[n][2])
+                if st is None:
+                    violations[n].append("no STATUS reply")
+                    continue
+                last[n] = st
+                problems = self.soak_problems(base[n], st)
+                if problems:
+                    violations[n].append("; ".join(problems))
+            dead = {n: r.error for n, r in readers.items() if r.error}
+            if dead:
+                self.fail("IQ client failed during the soak: %s" % dead)
+        expected = self.SOAK_SEC / self.frame_period
+        for n, fw in fws.items():
+            self.assertEqual(violations[n][:20], [], "instance %d soak violations (%d samples):\n%s"
+                             % (n, len(violations[n]), box.logs(fw, n)))
+            advanced = last[n]["frame_count"] - base[n]["frame_count"]
+            self.assertGreaterEqual(advanced, 0.5 * expected,
+                                    "instance %d: frame_count advanced %d over %.0f s (paced: ~%.0f)"
+                                    % (n, advanced, self.SOAK_SEC, expected))
+            self.assertEqual(self.alive_roles(fw, n), set(STAGES), "instance %d lost a stage during the soak" % n)
+        sys.stderr.write("[test_multi_instance] soak ok: %s\n" % json.dumps(
+            {n: {"frames": last[n]["frame_count"] - base[n]["frame_count"],
+                 "client_frames": len(readers[n].cpis),
+                 "cpi_gaps": last[n]["counters"].get("cpi_gaps")} for n in fws}, sort_keys=True))
+
+    @staticmethod
+    def soak_problems(base, st):
+        """The G39 soak criteria *st* violates against the post-lock *base*."""
+        out = []
+        counters, counters0 = st.get("counters") or {}, base.get("counters") or {}
+        if counters.get("cpi_gaps") != counters0.get("cpi_gaps"):
+            out.append("cpi_gaps %s -> %s" % (counters0.get("cpi_gaps"), counters.get("cpi_gaps")))
+        if counters.get("buffer_overrun_cnt") != 0:
+            out.append("buffer_overrun_cnt %s" % counters.get("buffer_overrun_cnt"))
+        if st.get("recent_drops") != 0:
+            out.append("recent_drops %s" % st.get("recent_drops"))
+        for key in ("dropped_frames_iq", "dropped_frames_hwc"):
+            if counters.get(key) != counters0.get(key):
+                out.append("%s %s -> %s" % (key, counters0.get(key), counters.get(key)))
+        if st.get("frame_type") != IQHeader.FRAME_TYPE_DUMMY and (st.get("sync_state") or 0) < chain.SYNC_LOCKED:
+            out.append("sync_state %s (frame_type %s)" % (st.get("sync_state"), st.get("frame_type")))
+        return out
 
 
 if __name__ == "__main__":

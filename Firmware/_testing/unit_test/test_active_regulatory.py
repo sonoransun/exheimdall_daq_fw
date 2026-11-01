@@ -135,6 +135,34 @@ class TestBandCheck(unittest.TestCase):
         self.assertEqual(R.builtin_deny_hits(902e6, 928e6), [])
 
 
+class TestForbiddenMask(unittest.TestCase):
+    def test_bins(self):
+        f = [1520e6, 1524.5e6, 1525.5e6, 1530e6]
+        m = R.forbidden_mask(f, 0.1e6, "radiate", [(1500e6, 1524.6e6)], [])
+        self.assertEqual(list(m), [False, False, True, True])      # outside allow / built-in GNSS L1
+        # a bin straddling the allow-band edge is forbidden
+        self.assertTrue(R.forbidden_mask([1524.58e6], 0.1e6, "radiate", [(1500e6, 1524.6e6)], [])[0])
+        # configured deny band
+        m = R.forbidden_mask([1510e6, 1520e6], 1e3, "radiate", [(1500e6, 1524.6e6)], [(1515e6, 1525e6)])
+        self.assertEqual(list(m), [False, True])
+        # conducted override of the built-ins matches band_check
+        allow = [(1500e6, 1700e6)]
+        self.assertTrue(R.forbidden_mask([1575e6], 1e3, "dummy_load", allow, [])[0])
+        self.assertFalse(R.forbidden_mask([1575e6], 1e3, "dummy_load", allow, [], ignore_builtin=True)[0])
+        self.assertTrue(R.forbidden_mask([1575e6], 1e3, "radiate", allow, [], ignore_builtin=True)[0])
+        # empty allow list: everything is forbidden
+        self.assertTrue(all(R.forbidden_mask([915e6, 2400e6], 1e3, "dummy_load", [], [])))
+
+    def test_lo_image(self):
+        allow = [(900e6, 930e6)]
+        # bin at 920 MHz, fc 915 MHz, LO offset 10 MHz: images at 2*905-920 = 890 and 2*925-920 = 930
+        self.assertFalse(R.forbidden_mask([920e6], 1e3, "dummy_load", allow, [])[0])
+        self.assertTrue(R.forbidden_mask([920e6], 1e3, "dummy_load", allow, [], lo_offset_hz=10e6,
+                                         fc_hz=915e6)[0])
+        self.assertFalse(R.forbidden_mask([915e6], 1e3, "dummy_load", allow, [], lo_offset_hz=5e6,
+                                          fc_hz=915e6)[0])
+
+
 class TestMpe(unittest.TestCase):
     def test_limits(self):
         self.assertAlmostEqual(R.mpe_limit_w_m2(10e6), 18.0)

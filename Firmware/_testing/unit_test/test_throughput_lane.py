@@ -110,8 +110,7 @@ class LatencySampler(threading.Thread):
 class TestThroughputLane(unittest.TestCase):
 
     def setUp(self):
-        if chain.daq_pids():
-            self.skipTest("another DAQ chain is running on this host (the lane stops every chain)")
+        chain.refuse_running_chain()
         self.box = chain.Sandbox("throughput")
         mon = dict(chain.MONITORING, en_metrics="1", metrics_window_size=str(METRICS_WINDOW))
         chain.set_ini(self.box.ini, {"monitoring": mon,
@@ -133,6 +132,7 @@ class TestThroughputLane(unittest.TestCase):
         locked = chain.wait_for(lambda: (chain.sync_state(5002) or 0) >= chain.SYNC_LOCKED,
                                 timeout=chain.sync_timeout(150))
         self.assertTrue(locked, "no lock: %s\n%s" % (chain.status(5002), box.logs()))
+        self.assertTrue(chain.wait_steady(5002), "no steady locked DATA stream: %s" % chain.status(5002))
 
         sampler = LatencySampler(5002)
         sampler.start()

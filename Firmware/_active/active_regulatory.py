@@ -1,7 +1,8 @@
 """
     HeIMDALL "active" capability: regulatory frequency policy and RF exposure.
 
-    Pure functions (stdlib + numpy-free math) used by the TX safety controller:
+    Pure functions (stdlib math; ``forbidden_mask`` imports numpy lazily) used by
+    the TX safety controller:
 
       - ``BUILTIN_DENY_BANDS_HZ``: an immutable, conservative and NON-EXHAUSTIVE
         list of safety-of-life / navigation / radio-astronomy bands. It is
@@ -11,7 +12,8 @@
         touches - the occupied band, the LO leakage carrier and, with an LO
         offset, the image band;
       - ``band_check``: allow-list / deny-list evaluation (codes
-        ``FREQ_NOT_ALLOWED`` / ``FREQ_DENIED``);
+        ``FREQ_NOT_ALLOWED`` / ``FREQ_DENIED``); ``forbidden_mask`` applies the
+        same rule to spectral bins (the per-burst emission mask);
       - ``mpe_limit_w_m2`` / ``mpe_distance_m``: general-population maximum
         permissible exposure (FCC 47 CFR 1.1310 style) and the far-field
         exclusion distance;
@@ -178,6 +180,43 @@ def band_check(intervals, mode, allow_bands, deny_bands, ignore_builtin=False) -
             else:
                 issues.append(Issue("error", "FREQ_DENIED", msg, "BUILTIN_DENY_BANDS_HZ"))
     return issues
+
+
+def forbidden_mask(freqs_hz, bin_hz, mode, allow_bands, deny_bands, ignore_builtin=False,
+                   lo_offset_hz=0.0, fc_hz=None):
+    """Vectorized policy test for spectral bins (numpy, imported lazily).
+
+    Bin ``k`` covers ``[f_k - bin/2, f_k + bin/2]``; it is forbidden (True) when
+    that interval is not inside one allow band, or overlaps a configured deny
+    band, or overlaps a built-in deny band (unless ``ignore_builtin`` and a
+    conducted ``mode``: the same rule as ``band_check``). With ``lo_offset_hz
+    != 0`` the bin's IQ image about either LO candidate (``2*LO - f``, LO =
+    ``fc -/+ lo_offset``) must pass too (image rejection is not credited).
+    """
+    import numpy as np
+    f = np.asarray(freqs_hz, dtype=float).reshape(-1)
+    half = abs(float(bin_hz)) / 2.0
+    allow = [_band(b) for b in (allow_bands or ())]
+    deny = [_band(b) for b in (deny_bands or ())]
+    builtin = () if (ignore_builtin and mode in CONDUCTED_MODES) else BUILTIN_DENY_BANDS_HZ
+
+    def test(fr):
+        lo, hi = fr - half, fr + half
+        ok = np.zeros(fr.shape, dtype=bool)
+        for alo, ahi, _ in allow:
+            ok |= (alo <= lo) & (hi <= ahi)
+        bad = ~ok
+        for dlo, dhi, _ in list(deny) + [_band(b) for b in builtin]:
+            bad |= (lo < dhi) & (hi > dlo)
+        return bad
+
+    out = test(f)
+    off = float(lo_offset_hz or 0.0)
+    if off != 0.0 and fc_hz is not None:
+        fc = float(fc_hz)
+        for lo_c in (fc - off, fc + off):
+            out |= test(2.0 * lo_c - f)
+    return out
 
 
 def builtin_deny_hits(lo_hz, hi_hz) -> list:
