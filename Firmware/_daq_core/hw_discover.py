@@ -9,6 +9,11 @@
    Runnable standalone:  python3 hw_discover.py
    Outputs JSON to stdout.
 
+   python3 hw_discover.py --sdr  prints only the attached RTL2832U receivers
+   read from sysfs (no device is opened):
+       {"rtlsdr": {"count": n, "devices": [...], "sysfs": true|false}}
+   The start scripts do not pass --sdr, so hw_caps.json is unchanged.
+
    Project: HeIMDALL DAQ Firmware
    License: GNU GPL V3
 
@@ -391,6 +396,75 @@ def discover_rotator():
     return result
 
 
+#: USB ids of RTL2832U receivers (KrakenSDR / RTL-SDR); same rule as ini_checker
+RTLSDR_VENDOR_ID = '0bda'
+RTLSDR_PRODUCT_IDS = ('2838', '2832')
+DEFAULT_SYSFS_USB_ROOT = '/sys/bus/usb/devices'
+
+
+def _read_sysfs_attr(path):
+    try:
+        with open(path, 'r') as f:
+            return f.read().strip()
+    except (IOError, OSError, UnicodeDecodeError):
+        return None
+
+
+def _sysfs_int(path):
+    value = _read_sysfs_attr(path)
+    return int(value) if value is not None and value.isdigit() else None
+
+
+def discover_rtlsdr(sysfs_root=None):
+    """List the RTL2832U receivers attached to this host from sysfs.
+
+    Reads only sysfs attributes (idVendor, idProduct, busnum, devnum,
+    serial); no device is opened, so receivers claimed by a running chain
+    are listed too. Kept independent of ini_checker so this module stays
+    importable standalone.
+
+    Parameters
+    ----------
+    sysfs_root : str or None
+        USB device directory; defaults to $HEIMDALL_SYSFS_ROOT, else
+        /sys/bus/usb/devices.
+
+    Returns
+    -------
+    dict
+        Keys: count (int), devices (list of dicts with busnum, devnum,
+        path, serial (None when the attribute is missing), product_id),
+        sysfs (bool: False when the root does not exist, e.g. non-Linux;
+        count is then 0).
+    """
+    if sysfs_root is None:
+        sysfs_root = os.environ.get('HEIMDALL_SYSFS_ROOT') or DEFAULT_SYSFS_USB_ROOT
+    result = {'count': 0, 'devices': [], 'sysfs': False}
+    if not os.path.isdir(sysfs_root):
+        return result
+    try:
+        names = sorted(os.listdir(sysfs_root))
+    except OSError as e:
+        logger.debug("Cannot list %s: %s", sysfs_root, e)
+        return result
+    result['sysfs'] = True
+    for name in names:
+        path = os.path.join(sysfs_root, name)
+        vendor = (_read_sysfs_attr(os.path.join(path, 'idVendor')) or '').lower()
+        product = (_read_sysfs_attr(os.path.join(path, 'idProduct')) or '').lower()
+        if vendor != RTLSDR_VENDOR_ID or product not in RTLSDR_PRODUCT_IDS:
+            continue
+        result['devices'].append({
+            'busnum': _sysfs_int(os.path.join(path, 'busnum')),
+            'devnum': _sysfs_int(os.path.join(path, 'devnum')),
+            'path': path,
+            'serial': _read_sysfs_attr(os.path.join(path, 'serial')) or None,
+            'product_id': product,
+        })
+    result['count'] = len(result['devices'])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Recommendation engine
 # ---------------------------------------------------------------------------
@@ -479,5 +553,9 @@ def discover_hardware():
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    caps = discover_hardware()
-    print(json.dumps(caps, indent=2, default=str))
+    # Other arguments are ignored, as they always were
+    if '--sdr' in sys.argv[1:]:
+        print(json.dumps({'rtlsdr': discover_rtlsdr()}, indent=2))
+    else:
+        caps = discover_hardware()
+        print(json.dumps(caps, indent=2, default=str))

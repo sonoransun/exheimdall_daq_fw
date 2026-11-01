@@ -1,4 +1,63 @@
-from struct import pack
+from struct import pack, unpack_from
+
+# Every inter-module message is exactly MSG_LENGTH bytes (rtl_daq.c
+# struct hdaq_im_msg_struct): byte 0 = signed source module id, byte 1 =
+# command char, bytes 2..127 = parameters.
+MSG_LENGTH = 128
+PARAMS_OFFSET = 2
+# Per-channel u32/f32 lists must fit in the 126 parameter bytes.
+MAX_MSG_CHANNELS = 31
+_TOO_MANY_CHANNELS = "num_ch > 31 unsupported by the 128-byte message"
+
+
+def _check_channel_count(values):
+    """Raise ValueError when a per-channel list does not fit the message."""
+    if len(values) > MAX_MSG_CHANNELS:
+        raise ValueError(_TOO_MANY_CHANNELS)
+
+
+def unpack_msg(buf):
+    """
+        Decodes a 128-byte inter-module ZMQ message (mirror of the rtl_daq.c
+        receive path).
+
+        Parameters:
+        -----------
+            :param: buf: Received message
+            :type: buf: bytes-like, exactly 128 bytes
+
+        Return:
+        -------
+            (module_id, command, params): module_id is the signed source module
+            id (int), command the one-character command identifier (str),
+            params the 126 parameter bytes (bytes)
+
+        Raises ValueError when len(buf) != 128.
+    """
+    if len(buf) != MSG_LENGTH:
+        raise ValueError("inter-module message must be {0} bytes, got {1}".format(MSG_LENGTH, len(buf)))
+    buf = bytes(buf)
+    module_id = unpack_from("b", buf, 0)[0]
+    command = buf[1:2].decode("latin-1")
+    return module_id, command, buf[PARAMS_OFFSET:]
+
+
+def unpack_u32_params(params, count):
+    """
+        First `count` native-endian uint32 values of a parameter block
+        ('c' uses count=1, 'g' and 'b' use count=M, 'r' uses count=3).
+    """
+    if count < 0 or count * 4 > len(params):
+        raise ValueError("cannot read {0} uint32 values from {1} parameter bytes".format(count, len(params)))
+    return list(unpack_from("I" * count, params, 0))
+
+
+def unpack_f32_params(params, count):
+    """First `count` float32 values of a parameter block ('s' uses count=M)."""
+    if count < 0 or count * 4 > len(params):
+        raise ValueError("cannot read {0} float32 values from {1} parameter bytes".format(count, len(params)))
+    return list(unpack_from("f" * count, params, 0))
+
 
 def pack_msg_reconfiguration(module_identifier,center_frequency, sample_rate, gain):
     """
@@ -67,8 +126,11 @@ def pack_msg_set_gain(module_identifier, gains):
 
         Return:
         -------
-            Assembled message structure in byte array 
-    """    
+            Assembled message structure in byte array
+
+        Raises ValueError for more than 31 gain values.
+    """
+    _check_channel_count(gains)
     msg_length = 128 # Total message length 128 byte
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 'g'.encode('ascii') # 1 byte
@@ -140,7 +202,10 @@ def pack_msg_sample_freq_tune(module_identifier, fs_ppm_offsets):
         Return:
         -------
             Assembled message structure in byte array
-    """    
+
+        Raises ValueError for more than 31 offsets.
+    """
+    _check_channel_count(fs_ppm_offsets)
     msg_length = 128 # Total message length 128 byte
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 's'.encode('ascii') # 1 byte
@@ -166,7 +231,10 @@ def pack_msg_set_bias_tee(module_identifier, states):
         Return:
         -------
             Assembled 128-byte message structure in byte array
+
+        Raises ValueError for more than 31 states.
     """
+    _check_channel_count(states)
     msg_length = 128 # Total message length 128 byte
     msg_byte_array  = pack("b", module_identifier) # 1 byte
     msg_byte_array += 'b'.encode('ascii') # 1 byte

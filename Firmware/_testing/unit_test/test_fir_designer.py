@@ -8,10 +8,17 @@
     designer there as a subprocess (the live Firmware/daq_chain_config.ini is
     never touched).
 
+    TesterFirDesignerInstancePrefix covers the per-instance coefficient file
+    (spec B.2 / ledger L11): instance N != 0 writes
+    _data_control/inst<N>_fir_coeffs.txt; in a separate instance directory
+    (designer symlinked from elsewhere) a stale unprefixed file is removed,
+    in a shared working copy (designer in the cwd itself) it is kept.
+
     Project : HeIMDALL DAQ Firmware
     License : GNU GPL V3
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,7 +33,9 @@ root_path = dirname(dirname(current_path))
 DESIGNER = join(root_path, "fir_filter_designer.py")
 
 
-def write_config(tmpdir, decimation_ratio, fir_bw, tap_size, window):
+def write_config(tmpdir, decimation_ratio, fir_bw, tap_size, window,
+                 instance_id=None):
+    """instance_id=None writes no [federation] section (pre-federation INI)."""
     with open(join(tmpdir, "daq_chain_config.ini"), "w") as f:
         f.write(
             "[daq]\n"
@@ -39,6 +48,8 @@ def write_config(tmpdir, decimation_ratio, fir_bw, tap_size, window):
             "fir_tap_size = {:d}\n"
             "fir_window = {:s}\n".format(
                 decimation_ratio, fir_bw, tap_size, window))
+        if instance_id is not None:
+            f.write("\n[federation]\ninstance_id = {}\n".format(instance_id))
 
 
 class TesterFirFilterDesigner(unittest.TestCase):
@@ -137,6 +148,133 @@ class TesterFirFilterDesigner(unittest.TestCase):
         # No daq_chain_config.ini written in the temp cwd
         res = self._run()
         self.assertNotEqual(res.returncode, 0)
+
+
+class TesterFirDesignerInstancePrefix(unittest.TestCase):
+
+    STALE = "0.5\n0.5\n"
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="fir_designer_inst_")
+        os.makedirs(join(self.tmpdir, "_data_control"))
+        os.makedirs(join(self.tmpdir, "_logs"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _path(self, name):
+        return join(self.tmpdir, "_data_control", name)
+
+    def _run(self, script):
+        return subprocess.run([sys.executable, script],
+                              cwd=self.tmpdir, capture_output=True,
+                              text=True, timeout=120)
+
+    def _write_stale(self):
+        with open(self._path("fir_coeffs.txt"), "w") as f:
+            f.write(self.STALE)
+
+    def _run_installed_designer(self):
+        """Designer outside the cwd (absolute path into Firmware/)."""
+        return self._run(DESIGNER)
+
+    def _run_symlinked_designer(self):
+        """Instance-dir model (B.1): the cwd holds a symlink into the
+        install root, so realpath(__file__) is NOT the cwd."""
+        os.symlink(DESIGNER, join(self.tmpdir, "fir_filter_designer.py"))
+        return self._run("fir_filter_designer.py")
+
+    def _run_designer_in_cwd(self):
+        """Shared working copy: the designer lives in the cwd itself."""
+        shutil.copyfile(DESIGNER, join(self.tmpdir, "fir_filter_designer.py"))
+        return self._run("fir_filter_designer.py")
+
+    def test_instance_1_writes_prefixed_file(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id=1)
+        res = self._run_installed_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertTrue(os.path.exists(self._path("inst1_fir_coeffs.txt")))
+        self.assertFalse(os.path.exists(self._path("fir_coeffs.txt")))
+        coeffs = np.atleast_1d(np.loadtxt(self._path("inst1_fir_coeffs.txt")))
+        np.testing.assert_allclose(coeffs, signal.firwin(48, 0.8 / 4, window="hann"),
+                                   rtol=0, atol=1e-12)
+        self.assertIn("_data_control/inst1_fir_coeffs.txt", res.stdout)
+
+    def test_prefix_uses_instance_number(self):
+        write_config(self.tmpdir, 2, 1.0, 8, "hann", instance_id=12)
+        res = self._run_installed_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertTrue(os.path.exists(self._path("inst12_fir_coeffs.txt")))
+        self.assertEqual(os.listdir(join(self.tmpdir, "_data_control")),
+                         ["inst12_fir_coeffs.txt"])
+
+    def test_instance_0_writes_unprefixed_file(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id=0)
+        res = self._run_installed_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(os.listdir(join(self.tmpdir, "_data_control")),
+                         ["fir_coeffs.txt"])
+
+    def test_no_federation_section_writes_unprefixed_file(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann")
+        res = self._run_installed_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(os.listdir(join(self.tmpdir, "_data_control")),
+                         ["fir_coeffs.txt"])
+
+    def test_instance_0_and_1_files_are_identical(self):
+        write_config(self.tmpdir, 5, 0.9, 40, "blackmanharris", instance_id=0)
+        self.assertEqual(self._run_installed_designer().returncode, 0)
+        with open(self._path("fir_coeffs.txt"), "rb") as f:
+            ref = f.read()
+        os.remove(self._path("fir_coeffs.txt"))
+        write_config(self.tmpdir, 5, 0.9, 40, "blackmanharris", instance_id=1)
+        self.assertEqual(self._run_installed_designer().returncode, 0)
+        with open(self._path("inst1_fir_coeffs.txt"), "rb") as f:
+            self.assertEqual(f.read(), ref)
+
+    def test_instance_dir_removes_stale_unprefixed_file(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id=1)
+        self._write_stale()
+        res = self._run_symlinked_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(os.path.exists(self._path("fir_coeffs.txt")))
+        self.assertTrue(os.path.exists(self._path("inst1_fir_coeffs.txt")))
+        self.assertIn("removed stale unprefixed fir_coeffs.txt "
+                      "(instance 1 uses inst1_fir_coeffs.txt)", res.stdout)
+
+    def test_instance_dir_without_stale_file_prints_nothing(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id=1)
+        res = self._run_symlinked_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("removed stale", res.stdout)
+
+    def test_shared_working_copy_keeps_unprefixed_file(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id=1)
+        self._write_stale()
+        res = self._run_designer_in_cwd()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        with open(self._path("fir_coeffs.txt")) as f:
+            self.assertEqual(f.read(), self.STALE)
+        self.assertTrue(os.path.exists(self._path("inst1_fir_coeffs.txt")))
+        self.assertNotIn("removed stale", res.stdout)
+
+    def test_instance_0_never_removes_unprefixed_file(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id=0)
+        self._write_stale()
+        res = self._run_symlinked_designer()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        # Overwritten with fresh taps (instance 0 owns the unprefixed name)
+        coeffs = np.atleast_1d(np.loadtxt(self._path("fir_coeffs.txt")))
+        self.assertEqual(len(coeffs), 48)
+        self.assertNotIn("removed stale", res.stdout)
+
+    def test_non_integer_instance_id_fails(self):
+        write_config(self.tmpdir, 4, 0.8, 48, "hann", instance_id="one")
+        res = self._run_installed_designer()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("instance_id must be an integer", res.stdout)
+        self.assertEqual(os.listdir(join(self.tmpdir, "_data_control")), [])
 
 
 if __name__ == "__main__":

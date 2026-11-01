@@ -11,6 +11,7 @@
 *.gcda
 *.gcno
 Firmware/_daq_core/serial_test
+Firmware/_daq_core/device_map_probe
 Firmware/_fpga_gateware/build/
 
 # --- Vendored copy-in dependencies (copied into _daq_core before building,
@@ -34,6 +35,10 @@ dist/
 .venv/
 venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # --- Runtime state: logs (keep the 'logs' legend file), PID files, archives ---
 Firmware/_logs/*
@@ -48,6 +53,34 @@ Firmware/_data_control/*
 # --- Runtime state: BerkeleyDB telemetry ---
 Firmware/_db/*
 !Firmware/_db/.gitkeep
+
+# --- Runtime state of the active-array capability lives under the two
+# --- directories above (_data_control/active/, incl. the tx_arm.json arming
+# --- record, and _logs/active/) and is already ignored there.
+
+# --- Multi-instance provisioning: per-instance working copies created by
+# --- util/provision_instance.py at <install root>/instances/<N>
+/instances/
+
+# --- IQ captures (util recorder / iq_replay .hcap container + sidecar, and
+# --- legacy per-frame .iqf files the recorder writes into Firmware/_testing/)
+*.hcap
+*.hcap.json
+*.iqf
+
+# --- Generated cluster bundles (util/cluster_cfg_gen.py --out DIR): may hold
+# --- federation.ini files with an auth_token; keep them out of the repo.
+# --- Use a directory named cluster_out*/ (or anywhere outside the tree).
+cluster_out*/
+
+# --- GitHub Pages site (docs/): local Jekyll build output and caches
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/.sass-cache/
+docs/.bundle/
+docs/vendor/
+docs/Gemfile.lock
 
 # --- Editors / OS noise ---
 .DS_Store

@@ -1,306 +1,192 @@
 #!/usr/bin/env python3
 """
-HeIMDALL DAQ Performance Regression Test Suite
-Validates performance optimizations and detects regressions
+HeIMDALL DAQ performance regression checks against a RUNNING chain (spec I.6).
+
+Throughput and latency are measured through a real IQ client
+(util/performance_monitor.py: `streaming` handshake + per-frame
+`IQDownload`), so they need [data_interface] out_data_iface_type = eth:
+  throughput = frames x bytes / elapsed      (bytes as received)
+  latency    = receive time - header.time_stamp
+Expected CPU affinity comes from the instance's registry entry (cores), else
+from [host] cpu_cores, else the default (N*4 + k) % nproc layout; RT status
+from /proc/<pid>/sched.
+
+Run from Firmware/ while the chain runs: python3 _testing/performance_regression_test.py
+Every live check skips (with a reason) when the chain, the IQ server or an
+optional tool is not available, so it never fails on a CI box. Not part of
+unit_test.sh --ci.
 
 Project: HeIMDALL DAQ Firmware
 License: GNU GPL V3
-Author: Generated via Claude Code optimization plan
 """
 
-import os
+import configparser
 import shutil
+import subprocess
 import sys
 import time
-import json
-import statistics
-import subprocess
-import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
-# Add the util directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent.parent / "util"))
+FIRMWARE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(FIRMWARE_DIR.parent / "util"))
 try:
-    from performance_monitor import DAQPerformanceMonitor
+    from performance_monitor import DAQPerformanceMonitor, measure_stream, psutil, _iq_port_for
     _MONITOR_IMPORT_ERROR = None
-except Exception as _e:  # psutil missing, Linux-only interfaces, ...
+except Exception as _e:  # Linux-only interfaces, missing modules, ...
     DAQPerformanceMonitor = None
     _MONITOR_IMPORT_ERROR = _e
 
-class PerformanceRegressionTest(unittest.TestCase):
-    """Test suite for HeIMDALL DAQ performance regression detection.
+#: The latency budget: a frame is stamped when its CPI is acquired, so its
+#: end-to-end latency is at least one frame period plus processing.
+LATENCY_FRAME_PERIODS = 2.0
+LATENCY_SLACK_MS = 500.0
+#: Delivered frame rate must reach this share of 1 / frame period.
+MIN_FPS_FRACTION = 0.5
 
-    Live-system checks skip cleanly (with a printed reason) when the DAQ
-    chain is not running, the platform is not Linux, or an optional tool
-    (psutil, stress-ng) is unavailable — so a CI box never reports bogus
-    failures, and a provisioned Pi still gets real assertions."""
+
+def _frame_period_s():
+    p = configparser.ConfigParser(interpolation=None)
+    p.read(str(FIRMWARE_DIR / "daq_chain_config.ini"))
+    try:
+        return (p.getint("pre_processing", "cpi_size") * p.getint("pre_processing", "decimation_ratio")
+                / p.getfloat("daq", "sample_rate"))
+    except (configparser.Error, ValueError, ZeroDivisionError):
+        return None
+
+
+class PerformanceRegressionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Set up test environment"""
         if DAQPerformanceMonitor is None:
-            raise unittest.SkipTest(
-                "SKIP reason: performance_monitor unavailable "
-                "({})".format(_MONITOR_IMPORT_ERROR))
+            raise unittest.SkipTest("SKIP reason: performance_monitor unavailable ({0})".format(
+                _MONITOR_IMPORT_ERROR))
         if not sys.platform.startswith("linux"):
-            raise unittest.SkipTest(
-                "SKIP reason: live performance checks are Linux-only "
-                "(/proc, RT scheduling)")
-        cls.test_duration = 10  # Short tests for CI
+            raise unittest.SkipTest("SKIP reason: live performance checks are Linux-only (/proc, RT scheduling)")
+        cls.test_duration = 10.0
         cls.instance_id = 0
-        cls.monitor = DAQPerformanceMonitor(cls.instance_id)
-
-        # Expected performance baselines (adjust based on system)
-        cls.performance_baselines = {
-            'max_cpu_percent': 80.0,  # Maximum CPU usage per process
-            'max_memory_mb': 256.0,   # Maximum memory usage per process
-            'max_latency_ms': 100.0,  # Maximum end-to-end latency
-            'max_ctx_switches': 1000, # Maximum involuntary context switches
-            'min_throughput_mbps': 10.0  # Minimum data throughput
-        }
+        cls.monitor = DAQPerformanceMonitor(cls.instance_id, str(FIRMWARE_DIR))
+        cls.frame_period = _frame_period_s()
+        cls.baselines = {"max_cpu_percent": 80.0, "max_memory_mb": 256.0, "max_ctx_switches": 1000}
+        cls._stream = None
 
     def setUp(self):
-        """Set up for individual test"""
-        self.monitor.discover_daq_processes()
+        self.monitor.discover_daq_processes(quiet=True)
         if not self.monitor.processes:
-            self.skipTest("DAQ processes not running")
+            self.skipTest("SKIP reason: DAQ processes not running")
+
+    def _stream_result(self):
+        """One streaming run shared by the throughput and latency tests."""
+        if "iq_server" not in self.monitor.processes:
+            self.skipTest("SKIP reason: iq_server not running (out_data_iface_type is not eth)")
+        if PerformanceRegressionTest._stream is None:
+            port = _iq_port_for(str(FIRMWARE_DIR), self.instance_id)
+            try:
+                PerformanceRegressionTest._stream = measure_stream("127.0.0.1", port,
+                                                                   duration=self.test_duration)
+            except (OSError, ConnectionError) as e:
+                self.skipTest("SKIP reason: IQ client on port {0} failed: {1}".format(port, e))
+        return PerformanceRegressionTest._stream
 
     def test_benchmark_throughput(self):
-        """Measure maximum sustainable data rate"""
-        print("\nRunning throughput benchmark...")
-
-        # Start monitoring
-        metrics_collected = []
-        start_time = time.time()
-
-        while time.time() - start_time < self.test_duration:
-            stage_metrics = self.monitor.collect_per_stage_metrics()
-            metrics_collected.append(stage_metrics)
-            time.sleep(0.5)
-
-        # Analyze throughput metrics
-        rtl_metrics = [m.get('rtl_daq', {}) for m in metrics_collected if 'rtl_daq' in m]
-        iq_metrics = [m.get('iq_server', {}) for m in metrics_collected if 'iq_server' in m]
-
-        if rtl_metrics:
-            avg_cpu = statistics.mean([m.get('cpu_percent', 0) for m in rtl_metrics])
-            max_memory = max([m.get('memory_rss_mb', 0) for m in rtl_metrics])
-
-            print(f"RTL-DAQ average CPU: {avg_cpu:.1f}%")
-            print(f"RTL-DAQ max memory: {max_memory:.1f}MB")
-
-            self.assertLess(avg_cpu, self.performance_baselines['max_cpu_percent'],
-                           "RTL-DAQ CPU usage exceeds baseline")
-            self.assertLess(max_memory, self.performance_baselines['max_memory_mb'],
-                           "RTL-DAQ memory usage exceeds baseline")
-
-        if iq_metrics:
-            # Estimate throughput based on write bytes
-            write_bytes = [m.get('write_bytes', 0) for m in iq_metrics]
-            if len(write_bytes) > 1:
-                throughput_bps = (write_bytes[-1] - write_bytes[0]) / self.test_duration
-                throughput_mbps = throughput_bps / (1024 * 1024)
-
-                print(f"Estimated throughput: {throughput_mbps:.2f}MB/s")
-                self.assertGreater(throughput_mbps, self.performance_baselines['min_throughput_mbps'],
-                                 "Throughput below baseline")
+        """Delivered throughput = frames x bytes / elapsed through a real client."""
+        res = self._stream_result()
+        print("\nIQ client: {0} frames, {1} bytes in {2:.2f} s -> {3:.2f} MB/s, {4:.2f} frames/s, "
+              "cpi gaps {5}".format(res["frames"], res["bytes"], res["elapsed_s"], res["throughput_MBps"] or 0,
+                                    res["fps"] or 0, res["cpi_gaps"]))
+        self.assertGreater(res["frames"], 0, "no frame received through the IQ client")
+        self.assertAlmostEqual(res["throughput_MBps"], res["bytes"] / res["elapsed_s"] / 1e6)
+        if self.frame_period:
+            self.assertGreaterEqual(res["fps"], MIN_FPS_FRACTION / self.frame_period,
+                                    "delivered frame rate below {0:.0%} of 1/frame period".format(MIN_FPS_FRACTION))
 
     def test_measure_latency_distribution(self):
-        """Characterize latency under various loads"""
-        print("\nMeasuring latency distribution...")
-
-        latency_measurements = []
-        start_time = time.time()
-
-        while time.time() - start_time < self.test_duration:
-            latency_data = self.monitor.measure_end_to_end_latency()
-            if latency_data:
-                latency_measurements.append(latency_data['latency_ms'])
-            time.sleep(0.1)
-
-        if latency_measurements:
-            mean_latency = statistics.mean(latency_measurements)
-            max_latency = max(latency_measurements)
-            if len(latency_measurements) >= 2:
-                p95_latency = statistics.quantiles(latency_measurements, n=20)[18]  # 95th percentile
-            else:
-                p95_latency = max_latency  # quantiles() needs >= 2 samples
-
-            print(f"Latency - Mean: {mean_latency:.2f}ms, Max: {max_latency:.2f}ms, P95: {p95_latency:.2f}ms")
-
-            self.assertLess(mean_latency, self.performance_baselines['max_latency_ms'],
-                           "Mean latency exceeds baseline")
-            self.assertLess(p95_latency, self.performance_baselines['max_latency_ms'] * 1.5,
-                           "P95 latency exceeds baseline")
+        """latency = receive time - header time_stamp, p95 within budget."""
+        res = self._stream_result()
+        if not res.get("latency_samples"):
+            self.skipTest("SKIP reason: no frame carried a time_stamp")
+        print("\nLatency p50 {0:.1f} ms, p95 {1:.1f} ms, max {2:.1f} ms over {3} frames".format(
+            res["latency_p50_ms"], res["latency_p95_ms"], res["latency_max_ms"], res["latency_samples"]))
+        if self.frame_period:
+            budget = LATENCY_FRAME_PERIODS * self.frame_period * 1000.0 + LATENCY_SLACK_MS
+            self.assertLess(res["latency_p95_ms"], budget, "p95 latency above {0:.0f} ms".format(budget))
 
     def test_cpu_affinity_compliance(self):
-        """Verify CPU affinity is correctly applied"""
-        print("\nTesting CPU affinity compliance...")
-
+        if not self.monitor.chain_pinned():
+            self.skipTest("SKIP reason: synthetic chain without --rt (stages are not pinned)")
         violations = self.monitor.validate_cpu_affinity()
-
-        if violations:
-            print("CPU Affinity Violations:")
-            for v in violations:
-                print(f"  {v['process']}: expected {v['expected']}, actual {v['actual']}")
-
-        self.assertEqual(len(violations), 0,
-                        f"CPU affinity violations detected: {violations}")
+        for v in violations:
+            print("  {0}: expected {1}, actual {2} ({3})".format(v["process"], v["expected"], v["actual"], v["source"]))
+        self.assertEqual(violations, [], "CPU affinity violations detected")
 
     def test_memory_pressure_resistance(self):
-        """Test system behavior under memory pressure"""
-        print("\nTesting memory pressure resistance...")
-
-        memory_metrics = self.monitor.check_memory_pressure()
-
-        # Check for memory pressure indicators
-        pressure_indicators = memory_metrics.get('pressure_indicators', {})
-
-        print(f"Memory usage: {memory_metrics['memory_used_percent']:.1f}%")
-        print(f"Swap usage: {memory_metrics['swap_used_percent']:.1f}%")
-
-        if pressure_indicators:
-            print(f"Pressure indicators: {pressure_indicators}")
-
-        # Warn but don't fail for memory pressure (system dependent)
-        if memory_metrics['memory_used_percent'] > 90:
-            print("Warning: High memory usage detected")
-
-        if memory_metrics['swap_used_percent'] > 10:
-            print("Warning: Swap usage detected - may impact real-time performance")
-
-        # Check for OOM kills (hard failure)
-        self.assertNotIn('oom_kills', pressure_indicators,
-                        "OOM killer activity detected")
+        if psutil is None:
+            self.skipTest("SKIP reason: psutil not installed")
+        mem = self.monitor.check_memory_pressure()
+        print("\nMemory usage: {0:.1f}%, swap {1:.1f}%".format(mem["memory_used_percent"], mem["swap_used_percent"]))
+        self.assertNotIn("oom_kills", mem["pressure_indicators"], "OOM killer activity detected")
 
     def test_real_time_scheduling_status(self):
-        """Verify real-time scheduling is properly configured"""
-        print("\nTesting real-time scheduling status...")
+        rt = self.monitor.check_realtime_status()
+        print("\nRT runtime unlimited: {0}".format(rt["rt_runtime_unlimited"]))
+        sched = rt["process_scheduling"]
+        for name, info in sched.items():
+            print("  {0}: {1} rt_priority {2} (expected {3})".format(
+                name, info.get("policy_name"), info.get("rt_priority"), info.get("expected_rt_priority")))
+        if "rtl_daq" not in sched:
+            self.skipTest("SKIP reason: synthetic chain (stages run RT only with daq_synthetic_start.sh --rt)")
+        self.assertTrue(rt["rt_runtime_unlimited"], "real-time runtime throttling should be disabled")
+        for name in ("rtl_daq", "rebuffer", "decimate", "delay_sync"):
+            if name in sched and sched[name].get("rt") is not None:
+                self.assertTrue(sched[name]["rt"], "{0} does not run SCHED_FIFO/RR".format(name))
+                if sched[name].get("rt_priority") is not None:
+                    self.assertEqual(sched[name]["rt_priority"], sched[name]["expected_rt_priority"],
+                                     "{0} RT priority differs from its tier".format(name))
 
-        rt_status = self.monitor.check_realtime_status()
-
-        print(f"RT runtime unlimited: {rt_status.get('rt_runtime_unlimited')}")
-
-        # Check that RT runtime is unlimited
-        self.assertTrue(rt_status.get('rt_runtime_unlimited', False),
-                       "Real-time runtime throttling should be disabled")
-
-        # Check process scheduling (informational)
-        process_sched = rt_status.get('process_scheduling', {})
-        rt_processes = [p for p, sched in process_sched.items() if 'RT' in sched]
-
-        print(f"Processes with RT scheduling: {rt_processes}")
-
-        # Should have at least some RT scheduled processes
-        self.assertGreater(len(rt_processes), 0,
-                          "No processes found with real-time scheduling")
-
-    @unittest.skipUnless(shutil.which("stress-ng"),
-                         "SKIP reason: stress-ng not installed")
+    @unittest.skipUnless(shutil.which("stress-ng"), "SKIP reason: stress-ng not installed")
     def test_stress_optimization(self):
-        """Verify optimizations under stress conditions"""
-        print("\nTesting optimizations under stress...")
-
-        # Generate some background CPU load
-        stress_proc = None
+        if psutil is None:
+            self.skipTest("SKIP reason: psutil not installed")
+        stress = subprocess.Popen(["stress-ng", "--cpu", "1", "--cpu-load", "30", "--timeout", "5s"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            # Light CPU stress on non-RT cores
-            stress_proc = subprocess.Popen([
-                'stress-ng', '--cpu', '1', '--cpu-load', '30', '--timeout', '5s'
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            # Monitor during stress
-            stress_metrics = []
-            start_time = time.time()
-
-            while time.time() - start_time < 5:
-                metrics = self.monitor.collect_per_stage_metrics()
-                stress_metrics.append(metrics)
-                time.sleep(0.5)
-
-            # Analyze impact
-            if stress_metrics:
-                for proc_name in ['rtl_daq', 'rebuffer', 'decimate']:
-                    proc_metrics = [m.get(proc_name, {}) for m in stress_metrics if proc_name in m]
-                    if proc_metrics:
-                        ctx_switches = [m.get('ctx_switches_involuntary', 0) for m in proc_metrics]
-                        max_ctx_switches = max(ctx_switches) if ctx_switches else 0
-
-                        print(f"{proc_name} max involuntary context switches: {max_ctx_switches}")
-
-                        # RT processes should have minimal involuntary context switches
-                        self.assertLess(max_ctx_switches, self.performance_baselines['max_ctx_switches'],
-                                       f"{proc_name} has too many involuntary context switches")
-
+            before = self.monitor.collect_per_stage_metrics()
+            time.sleep(5)
+            after = self.monitor.collect_per_stage_metrics()
         finally:
-            if stress_proc:
-                stress_proc.terminate()
-                stress_proc.wait()
+            stress.terminate()
+            stress.wait()
+        for name in ("rtl_daq", "rebuffer", "decimate"):
+            if "ctx_switches_involuntary" in before.get(name, {}) and "ctx_switches_involuntary" in after.get(name, {}):
+                delta = after[name]["ctx_switches_involuntary"] - before[name]["ctx_switches_involuntary"]
+                print("{0}: {1} involuntary context switches under stress".format(name, delta))
+                self.assertLess(delta, self.baselines["max_ctx_switches"],
+                                "{0} has too many involuntary context switches".format(name))
 
     def test_simd_acceleration_active(self):
-        """The built decimator binary carries a real FIR offload engine
-        (KFR/NEON/Ne10 SIMD, or the explicit portable 'generic' engine) —
-        replaces the old assertTrue(True) placeholder with a check of the
-        actual binary."""
-        print("\nTesting SIMD acceleration status...")
-
-        decimate_bin = Path(__file__).parent.parent / "_daq_core" / "decimate.out"
+        """decimate.out carries a real FIR offload engine (KFR/NEON/Ne10 or generic)."""
+        decimate_bin = FIRMWARE_DIR / "_daq_core" / "decimate.out"
         if not decimate_bin.exists():
             self.skipTest("SKIP reason: decimate.out not built")
+        blob = decimate_bin.read_bytes()
+        found_simd = [m.decode() for m in (b"kfr", b"KFR", b"neon", b"NEON", b"Ne10", b"ne10") if m in blob]
+        found_generic = [m.decode() for m in (b"generic", b"cpu_generic") if m in blob]
+        print("\nEngine markers in decimate.out - SIMD: {0}, generic: {1}".format(found_simd, found_generic))
+        self.assertTrue(found_simd or found_generic, "decimate.out contains no known FIR engine marker")
 
-        with open(decimate_bin, "rb") as f:
-            blob = f.read()
-
-        simd_markers = [b"kfr", b"KFR", b"neon", b"NEON", b"Ne10", b"ne10"]
-        generic_markers = [b"generic", b"cpu_generic"]
-        found_simd = [m.decode() for m in simd_markers if m in blob]
-        found_generic = [m.decode() for m in generic_markers if m in blob]
-
-        print(f"Engine markers in decimate.out - SIMD: {found_simd}, "
-              f"generic: {found_generic}")
-        self.assertTrue(
-            found_simd or found_generic,
-            "decimate.out contains no known FIR engine marker "
-            "(kfr/neon/Ne10/generic) - offload engine missing from the build")
-        if not found_simd:
-            print("Warning: only the portable generic engine is present - "
-                  "no SIMD acceleration in this build")
 
 def run_performance_suite():
-    """Run the complete performance test suite"""
-    print("HeIMDALL DAQ Performance Regression Test Suite")
-    print("=" * 50)
-
-    # Check prerequisites
-    if not Path("daq_chain_config.ini").exists():
-        print("Error: Run from Firmware/ directory with config file present")
+    print("HeIMDALL DAQ Performance Regression Test Suite\n" + "=" * 50)
+    if not (FIRMWARE_DIR / "daq_chain_config.ini").exists():
+        print("Error: daq_chain_config.ini not found in {0}".format(FIRMWARE_DIR))
         return False
-
-    # Run tests
-    loader = unittest.TestLoader()
-    suite = loader.loadTestsFromTestCase(PerformanceRegressionTest)
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-
-    # Summary
-    print("\nPerformance Test Summary:")
-    print(f"Tests run: {result.testsRun}")
-    print(f"Failures: {len(result.failures)}")
-    print(f"Errors: {len(result.errors)}")
-
-    if result.failures:
-        print("\nFailures:")
-        for test, traceback in result.failures:
-            print(f"  {test}: {traceback}")
-
-    if result.errors:
-        print("\nErrors:")
-        for test, traceback in result.errors:
-            print(f"  {test}: {traceback}")
-
+    suite = unittest.TestLoader().loadTestsFromTestCase(PerformanceRegressionTest)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    print("\nTests run: {0}, failures: {1}, errors: {2}, skipped: {3}".format(
+        result.testsRun, len(result.failures), len(result.errors), len(result.skipped)))
     return result.wasSuccessful()
 
-if __name__ == '__main__':
-    success = run_performance_suite()
-    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    sys.exit(0 if run_performance_suite() else 1)

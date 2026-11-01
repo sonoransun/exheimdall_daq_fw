@@ -5,6 +5,10 @@
     License: GNU GPL V3
 """
 import unittest
+import inspect
+import json
+import os
+import socket
 import sys
 import struct
 import time
@@ -23,7 +27,10 @@ from daq_db_records import (
     CAL_EVENT_TRACK_LOCK, CAL_EVENT_FREQ_CHANGE,
     RecordVersionError
 )
-from daq_db import DAQDatabase
+import daq_db
+from daq_db import (DAQDatabase, resolve_db_dir, default_node_id, valid_node_id,
+                    INSTANCE_META_FILENAME)
+from unittest import mock
 
 
 class MockIQHeader:
@@ -282,6 +289,229 @@ except ImportError:
     pass
 
 
+# Key set of get_db_stats() before the instance-awareness options existed
+LEGACY_DB_STATS_KEYS = {"frame_metrics.db", "cal_history.db", "freq_scan.db",
+                        "hw_snapshots.db", "schedule_state.db",
+                        "write_queue_size", "read_errors"}
+META_KEYS = ["instance_id", "node_id", "hostname", "pid", "opened_ms",
+             "schema_generation"]
+
+
+class TestResolveDbDir(unittest.TestCase):
+    """B.2 effective database directory rule (pure, no berkeleydb needed)."""
+
+    def test_default_is_verbatim_for_every_instance(self):
+        for iid in (0, 1, 3, 250):
+            self.assertEqual(resolve_db_dir("_db", iid), "_db")
+            self.assertEqual(resolve_db_dir("/var/lib/x", iid, instance_subdir=False),
+                             "/var/lib/x")
+
+    def test_subdir_for_instance_above_zero(self):
+        self.assertEqual(resolve_db_dir("_db", 3, instance_subdir=True),
+                         os.path.join("_db", "inst3"))
+        self.assertEqual(resolve_db_dir("/data/db", 12, instance_subdir=1),
+                         os.path.join("/data/db", "inst12"))
+
+    def test_subdir_never_applies_to_instance_zero(self):
+        self.assertEqual(resolve_db_dir("_db", 0, instance_subdir=True), "_db")
+
+    def test_decimal_string_id_accepted(self):
+        self.assertEqual(resolve_db_dir("_db", " 4 ", instance_subdir=True),
+                         os.path.join("_db", "inst4"))
+
+    def test_bad_ids_rejected(self):
+        for bad in (-1, "-2", "x", 1.5, None, "", True, False, "+3", "\u0663",
+                    "3.0", "1e2"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                resolve_db_dir("_db", bad, instance_subdir=True)
+
+    def test_default_node_id(self):
+        host = socket.gethostname().split(".")[0].lower()
+        with mock.patch.object(daq_db.socket, "gethostname", return_value="KrakenSDR.lan"):
+            self.assertEqual(default_node_id(3), "krakensdr:3")
+        if valid_node_id(host + ":3"):
+            self.assertEqual(default_node_id(3), host + ":3")
+        self.assertTrue(valid_node_id(default_node_id(3)))
+
+    def test_default_node_id_sanitised_to_grammar(self):
+        cases = {
+            "": "localhost:5",
+            "-_.": "localhost:5",
+            "_rack a+b": "rack-a-b:5",
+            "h" * 60: "h" * 46 + ":5",
+        }
+        for host, expected in cases.items():
+            with mock.patch.object(daq_db.socket, "gethostname", return_value=host):
+                got = default_node_id(5)
+            self.assertEqual(got, expected, msg=repr(host))
+            self.assertTrue(valid_node_id(got), msg=repr(got))
+        with mock.patch.object(daq_db.socket, "gethostname", return_value="h" * 60):
+            self.assertEqual(len(default_node_id(123)), 48)
+        with self.assertRaises(ValueError):
+            default_node_id(-1)
+
+    def test_valid_node_id(self):
+        for good in ("a", "hosta:1", "rack-a_2.lab:12", "A" * 48):
+            self.assertTrue(valid_node_id(good), msg=good)
+        for bad in ("", ":3", "-a", "a b", "A" * 49, None, 3):
+            self.assertFalse(valid_node_id(bad), msg=repr(bad))
+
+
+class TestInstanceAwarenessNoBdb(unittest.TestCase):
+    """Constructor options and the meta sidecar writer, run with the
+    BerkeleyDB bindings forced absent so they execute on every CI host."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="daq_db_inst_")
+        patcher = mock.patch.object(daq_db, "bdb", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def _make(self, **kw):
+        with self.assertLogs("daq_db", level="ERROR"):
+            return DAQDatabase(**kw)
+
+    def test_signature_appends_new_kwargs_with_inert_defaults(self):
+        params = list(inspect.signature(DAQDatabase.__init__).parameters.values())
+        names = [p.name for p in params]
+        self.assertEqual(names[:8], ["self", "db_dir", "max_db_size_mb",
+                                     "rotation_max_age_hours", "write_batch_size",
+                                     "write_flush_interval_sec", "num_channels",
+                                     "read_only"])
+        defaults = {p.name: p.default for p in params[8:]}
+        self.assertEqual(defaults, {"instance_id": 0, "instance_subdir": False,
+                                    "write_meta": False, "node_id": None})
+
+    def test_default_db_dir_verbatim_for_instance_3(self):
+        db = self._make(db_dir=self.tmpdir, instance_id=3)
+        self.assertEqual(db.db_dir, self.tmpdir)
+        self.assertEqual(db.get_instance_info(),
+                         {"db_dir": self.tmpdir, "instance_id": 3})
+
+    def test_instance_subdir_for_instance_3(self):
+        db = self._make(db_dir=self.tmpdir, instance_id=3, instance_subdir=True)
+        expected = os.path.join(self.tmpdir, "inst3")
+        self.assertEqual(db.db_dir, expected)
+        self.assertEqual(db.get_instance_info(),
+                         {"db_dir": expected, "instance_id": 3})
+
+    def test_legacy_call_instance_info(self):
+        db = self._make(db_dir="_db")
+        self.assertEqual(db.get_instance_info(), {"db_dir": "_db", "instance_id": 0})
+        self.assertEqual(db.get_db_stats(), {})
+
+    def test_negative_instance_id_rejected(self):
+        with self.assertRaises(ValueError):
+            DAQDatabase(db_dir=self.tmpdir, instance_id=-1)
+
+    def test_node_id_default_and_override(self):
+        db = self._make(db_dir=self.tmpdir, instance_id=2)
+        self.assertEqual(db.node_id, default_node_id(2))
+        db = self._make(db_dir=self.tmpdir, instance_id=2, node_id="rack-a:2")
+        self.assertEqual(db.node_id, "rack-a:2")
+
+    def test_off_grammar_node_id_warned_and_kept(self):
+        with self.assertLogs("daq_db", level="WARNING") as cm:
+            db = DAQDatabase(db_dir=self.tmpdir, instance_id=2, node_id="bad id")
+        self.assertEqual(db.node_id, "bad id")
+        self.assertTrue(any("does not match the node_id grammar" in line
+                            for line in cm.output), cm.output)
+
+    def test_meta_writer_content_and_atomicity(self):
+        db = self._make(db_dir=self.tmpdir, instance_id=3, write_meta=True,
+                        node_id="krakenA:3")
+        before_ms = int(time.time() * 1000)
+        db._write_instance_meta()
+        after_ms = int(time.time() * 1000)
+        path = os.path.join(self.tmpdir, INSTANCE_META_FILENAME)
+        with open(path) as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith("\n"))
+        meta = json.loads(raw)
+        self.assertEqual(list(meta.keys()), META_KEYS)
+        self.assertEqual(meta["instance_id"], 3)
+        self.assertEqual(meta["node_id"], "krakenA:3")
+        self.assertEqual(meta["hostname"], socket.gethostname())
+        self.assertEqual(meta["pid"], os.getpid())
+        self.assertTrue(before_ms <= meta["opened_ms"] <= after_ms)
+        self.assertEqual(meta["schema_generation"], 2)
+        # Rewritten in place of the old file; no temp file left behind
+        db._write_instance_meta()
+        self.assertEqual(os.listdir(self.tmpdir), [INSTANCE_META_FILENAME])
+
+    def test_meta_writer_failure_is_logged_not_raised(self):
+        db = self._make(db_dir=os.path.join(self.tmpdir, "missing"), write_meta=True)
+        with self.assertLogs("daq_db", level="ERROR") as cm:
+            db._write_instance_meta()
+        self.assertIn(INSTANCE_META_FILENAME, cm.output[0])
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "missing")))
+
+
+@unittest.skipUnless(HAS_BDB, "berkeleydb not available")
+class TestDAQDatabaseInstanceIntegration(unittest.TestCase):
+    """B.2 against a real BerkeleyDB environment."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="daq_db_inst_bdb_")
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def _open(self, **kw):
+        db = DAQDatabase(num_channels=5, write_batch_size=1,
+                         write_flush_interval_sec=0.1, **kw)
+        self.addCleanup(db.close)
+        return db
+
+    def test_default_uses_db_dir_verbatim_and_writes_no_sidecar(self):
+        db = self._open(db_dir=self.tmpdir, instance_id=3)
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "frame_metrics.db")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "inst3")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, INSTANCE_META_FILENAME)))
+        self.assertEqual(set(db.get_db_stats().keys()), LEGACY_DB_STATS_KEYS)
+
+    def test_instance_subdir_creates_private_environment(self):
+        db = self._open(db_dir=self.tmpdir, instance_id=3, instance_subdir=True)
+        sub = os.path.join(self.tmpdir, "inst3")
+        self.assertTrue(os.path.exists(os.path.join(sub, "frame_metrics.db")))
+        self.assertTrue(os.path.exists(os.path.join(sub, "_schema_version")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "frame_metrics.db")))
+        self.assertEqual(db.get_instance_info(), {"db_dir": sub, "instance_id": 3})
+        stats = db.get_db_stats()
+        self.assertEqual(set(stats.keys()), LEGACY_DB_STATS_KEYS)
+        self.assertGreater(stats["frame_metrics.db"]["size_bytes"], 0)
+
+    def test_write_meta_at_read_write_open(self):
+        db = self._open(db_dir=self.tmpdir, instance_id=1, instance_subdir=True,
+                        write_meta=True, node_id="hosta:1")
+        path = os.path.join(self.tmpdir, "inst1", INSTANCE_META_FILENAME)
+        with open(path) as f:
+            meta = json.load(f)
+        self.assertEqual(list(meta.keys()), META_KEYS)
+        self.assertEqual(meta["instance_id"], 1)
+        self.assertEqual(meta["node_id"], "hosta:1")
+        self.assertEqual(meta["pid"], os.getpid())
+        self.assertEqual(meta["schema_generation"], 2)
+        self.assertEqual(set(db.get_db_stats().keys()), LEGACY_DB_STATS_KEYS)
+        # The schema-generation check never touches the sidecar
+        db.close()
+        db2 = self._open(db_dir=self.tmpdir, instance_id=1, instance_subdir=True)
+        self.assertTrue(os.path.exists(path))
+        db2.close()
+
+    def test_read_only_open_never_writes_meta(self):
+        sub = os.path.join(self.tmpdir, "inst2")
+        self._open(db_dir=self.tmpdir, instance_id=2, instance_subdir=True).close()
+        ro = self._open(db_dir=self.tmpdir, instance_id=2, instance_subdir=True,
+                        write_meta=True, read_only=True)
+        self.assertEqual(ro.db_dir, sub)
+        self.assertFalse(os.path.exists(os.path.join(sub, INSTANCE_META_FILENAME)))
+
+    def test_read_only_missing_subdir_raises(self):
+        with self.assertRaises(RuntimeError):
+            DAQDatabase(db_dir=self.tmpdir, instance_id=5, instance_subdir=True,
+                        read_only=True)
+
+
 @unittest.skipUnless(HAS_BDB, "berkeleydb not available")
 class TestDAQDatabaseIntegration(unittest.TestCase):
 
@@ -453,6 +683,7 @@ class TestDAQDatabaseIntegration(unittest.TestCase):
         self.assertIn("frame_metrics.db", stats)
         self.assertIn("write_queue_size", stats)
         self.assertIn("read_errors", stats)
+        self.assertEqual(set(stats.keys()), LEGACY_DB_STATS_KEYS)
 
     def test_frame_metrics_by_freq(self):
         """Query frame metrics by frequency via the secondary index"""

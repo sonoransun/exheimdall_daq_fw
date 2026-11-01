@@ -14,7 +14,7 @@ def parse_freq(s):
     val = float(m.group(1))
     suffix = m.group(2)
     mult = {"": 1, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
-    return int(val * mult.get(suffix, 1))
+    return int(round(val * mult.get(suffix, 1)))
 
 
 def format_freq(hz):
@@ -43,6 +43,60 @@ def duration_since_ms(since_str):
     """Convert a --since string to an epoch millisecond timestamp."""
     secs = parse_duration(since_str)
     return int((time.time() - secs) * 1000)
+
+
+def format_ts(ts):
+    """Unix seconds -> local ISO-8601 time with milliseconds."""
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return "-"
+    ms = int(round(ts * 1000))   # round once, so x.9996 carries into the next second
+    base = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ms // 1000))
+    return "{}.{:03d}".format(base, ms % 1000)
+
+
+def format_age(sec):
+    if sec is None:
+        return "-"
+    try:
+        return "{:.1f}s".format(float(sec))
+    except (TypeError, ValueError):
+        return "-"
+
+
+def format_ack(ack, elapsed_ms=None):
+    """One-line outcome of a mutating command (spec F.2).
+
+    ack: {"applied": True|False|None, "reason", "fsm", "legacy"} (parse_ack)."""
+    if ack.get("legacy"):
+        return "sent; server does not confirm application (legacy server)"
+    fsm = ack.get("fsm")
+    fsm_part = "fsm={}".format(fsm) if fsm else ""
+    applied = ack.get("applied")
+    reason = ack.get("reason")
+    if applied is True:
+        parts = [p for p in (fsm_part, "{:d} ms".format(int(elapsed_ms))
+                             if elapsed_ms is not None else "") if p]
+        return "applied" + (" ({})".format(", ".join(parts)) if parts else "")
+    suffix = " ({})".format(fsm_part) if fsm_part else ""
+    if applied is False:
+        return "NOT applied: {}{}".format(reason or "unknown", suffix)
+    if reason == "held_for_burst":
+        return "held until the calibration burst ends" + suffix
+    return "outcome unknown: {}{}".format(reason or "no confirmation", suffix)
+
+
+def ack_exit_code(ack):
+    """0 applied / held_for_burst / unconfirmed legacy; 1 applied:false or an
+    unknown outcome reported by an extended server (handler_timeout)."""
+    if ack.get("legacy"):
+        return 0
+    if ack.get("applied") is True:
+        return 0
+    if ack.get("applied") is None and ack.get("reason") == "held_for_burst":
+        return 0
+    return 1
 
 
 # ANSI color helpers
@@ -80,7 +134,7 @@ def print_json(data):
     print(json.dumps(data, indent=2, default=str))
 
 
-def print_table(headers, rows, color_mode="auto"):
+def print_table(headers, rows, color_mode="auto", separator=True):
     """Print a simple aligned table."""
     widths = [len(h) for h in headers]
     for row in rows:
@@ -88,10 +142,14 @@ def print_table(headers, rows, color_mode="auto"):
             widths[i] = max(widths[i], len(str(cell)))
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     header_line = fmt.format(*headers)
+    if not separator:  # compact form used by the newer subcommands
+        header_line = header_line.rstrip()
     if _use_color(color_mode):
         print(colorize(header_line, "bold", color_mode))
     else:
         print(header_line)
-    print("-" * len(header_line))
+    if separator:
+        print("-" * len(header_line))
     for row in rows:
-        print(fmt.format(*[str(c) for c in row]))
+        line = fmt.format(*[str(c) for c in row])
+        print(line if separator else line.rstrip())

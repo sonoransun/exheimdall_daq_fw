@@ -159,6 +159,7 @@ typedef struct {
     int num_ch;
     const char *hw_name;
     int hw_unit_id;
+    int hw_unit_id_auto;        /* [hw] unit_id = auto -> stamp [federation] instance_id */
     int ioo_type;
 
     /* [daq] section */
@@ -198,8 +199,10 @@ static int handler(void *conf_struct, const char *section, const char *name,
         pconfig->num_ch = atoi(value);
     else if (MATCH("hw", "name"))
         pconfig->hw_name = strdup(value);
-    else if (MATCH("hw", "unit_id"))
-        pconfig->hw_unit_id = atoi(value);
+    else if (MATCH("hw", "unit_id")) {
+        pconfig->hw_unit_id_auto = (strcmp(value, "auto") == 0);
+        pconfig->hw_unit_id = pconfig->hw_unit_id_auto ? 0 : atoi(value);
+    }
     else if (MATCH("hw", "ioo_type"))
         pconfig->ioo_type = atoi(value);
 
@@ -562,7 +565,7 @@ int main(int argc, char **argv)
     iq_header->header_version = 7;
     if (config.hw_name)
         strncpy(iq_header->hardware_id, config.hw_name, sizeof(iq_header->hardware_id) - 1);
-    iq_header->unit_id = config.hw_unit_id;
+    iq_header->unit_id = config.hw_unit_id_auto ? config.instance_id : config.hw_unit_id;
     iq_header->active_ant_chs = ch_no;
     iq_header->ioo_type = config.ioo_type;
     iq_header->rf_center_freq = (uint64_t)config.center_freq;

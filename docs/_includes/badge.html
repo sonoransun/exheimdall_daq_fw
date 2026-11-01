@@ -1,0 +1,1 @@
+{%- assign _p = site.data.packages | where: "id", include.wp | first -%}{%- if _p -%}<span class="badge badge-{{ _p.class }}" title="{{ _p.id }}: {{ _p.title | escape }} ({{ _p.state }})">{% if include.label %}{{ _p.id }} · {% endif %}{{ _p.badge }}</span>{%- else -%}<span class="badge badge-planned">{{ include.wp }}</span>{%- endif -%}

@@ -10,7 +10,12 @@
 """
 import os
 import fcntl
+import json
+import operator
+import re
+import socket
 import struct
+import tempfile
 import time
 import logging
 import threading
@@ -30,6 +35,68 @@ from daq_db_records import (
     DB_SCHEMA_VERSION, RecordVersionError
 )
 
+# Sidecar written by write_meta=True (file only, not part of the BDB schema)
+INSTANCE_META_FILENAME = "_instance_meta.json"
+
+# Spec C.1 node_id grammar
+NODE_ID_MAX_LEN = 48
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,47}$")
+_NODE_ID_BAD_CHAR_RE = re.compile(r"[^A-Za-z0-9_.:-]")
+_NODE_ID_LEAD_RE = re.compile(r"^[^A-Za-z0-9]+")
+_DECIMAL_ID_RE = re.compile(r"^[0-9]+$", re.ASCII)
+
+
+def _parse_instance_id(instance_id):
+    """int >= 0 from an int or a decimal-digit string; ValueError otherwise."""
+    if isinstance(instance_id, bool):
+        iid = -1
+    elif isinstance(instance_id, str):
+        text = instance_id.strip()
+        iid = int(text) if _DECIMAL_ID_RE.match(text) else -1
+    else:
+        try:
+            iid = int(operator.index(instance_id))
+        except TypeError:
+            iid = -1
+    if iid < 0:
+        raise ValueError("instance_id must be an integer >= 0, got {!r}".format(instance_id))
+    return iid
+
+
+def resolve_db_dir(db_dir, instance_id=0, instance_subdir=False):
+    """Effective database directory of an instance (spec B.2).
+
+    With instance_subdir enabled and instance_id > 0 the directory is
+    <db_dir>/inst<N>; otherwise db_dir is returned verbatim (today's rule for
+    every instance). Raises ValueError for a negative or non-integer id.
+    """
+    iid = _parse_instance_id(instance_id)
+    if instance_subdir and iid > 0:
+        return os.path.join(db_dir, "inst{:d}".format(iid))
+    return db_dir
+
+
+def default_node_id(instance_id):
+    """Spec C.1 default node_id: <short lower-case hostname>:<instance_id>.
+
+    The hostname part is sanitised to the C.1 grammar
+    (^[A-Za-z0-9][A-Za-z0-9_.:-]{0,47}$): characters outside the grammar
+    become '-', leading non-alphanumerics are dropped, an empty result falls
+    back to "localhost", and it is truncated so the whole id fits 48 chars.
+    """
+    suffix = ":{:d}".format(_parse_instance_id(instance_id))
+    host = socket.gethostname().split(".")[0].lower()
+    host = _NODE_ID_BAD_CHAR_RE.sub("-", host)
+    host = _NODE_ID_LEAD_RE.sub("", host)
+    if not host:
+        host = "localhost"
+    return host[:NODE_ID_MAX_LEN - len(suffix)] + suffix
+
+
+def valid_node_id(node_id):
+    """True when node_id matches the spec C.1 grammar."""
+    return isinstance(node_id, str) and bool(_NODE_ID_RE.match(node_id))
+
 
 class DAQDatabase:
     """
@@ -42,9 +109,22 @@ class DAQDatabase:
     def __init__(self, db_dir="_db", max_db_size_mb=500,
                  rotation_max_age_hours=168,
                  write_batch_size=50, write_flush_interval_sec=1.0,
-                 num_channels=5, read_only=False):
+                 num_channels=5, read_only=False, instance_id=0,
+                 instance_subdir=False, write_meta=False, node_id=None):
+        """instance_id / instance_subdir / write_meta / node_id are the
+        instance-awareness options of spec B.2 ([federation] instance_id,
+        [database] instance_subdir, [database] write_instance_meta,
+        [federation] node_id). With their defaults db_dir is used verbatim
+        and no sidecar is written, exactly as before they existed.
+        """
         self.logger = logging.getLogger(__name__)
-        self.db_dir = db_dir
+        self.instance_id = _parse_instance_id(instance_id)
+        self.db_dir = resolve_db_dir(db_dir, self.instance_id, instance_subdir)
+        self.write_meta = bool(write_meta)
+        self.node_id = node_id if node_id else default_node_id(self.instance_id)
+        if not valid_node_id(self.node_id):
+            self.logger.warning("node_id %r does not match the node_id grammar "
+                                "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,47}$", self.node_id)
         self.max_db_size_mb = max_db_size_mb
         self.rotation_max_age_hours = rotation_max_age_hours
         self.write_batch_size = write_batch_size
@@ -111,6 +191,9 @@ class DAQDatabase:
 
             # Run initial rotation
             self.rotate(self.rotation_max_age_hours)
+
+            if self.write_meta:
+                self._write_instance_meta()
         else:
             self._write_queue = None
             self._writer_thread = None
@@ -195,6 +278,42 @@ class DAQDatabase:
                 f.write("{:d}\n".format(DB_SCHEMA_VERSION))
         except OSError as e:
             self.logger.error("Failed to write schema marker: {:s}".format(str(e)))
+
+    def _write_instance_meta(self):
+        """Atomically (re)write <db_dir>/_instance_meta.json (spec B.2).
+
+        Advisory sidecar describing which instance opened the database last;
+        a failure is logged and never prevents the database from working.
+        """
+        meta = {
+            "instance_id": self.instance_id,
+            "node_id": self.node_id,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "opened_ms": int(time.time() * 1000),
+            "schema_generation": DB_SCHEMA_VERSION,
+        }
+        final_path = os.path.join(self.db_dir, INSTANCE_META_FILENAME)
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="." + INSTANCE_META_FILENAME + ".",
+                                            suffix=".tmp", dir=self.db_dir)
+            with os.fdopen(fd, "w") as f:
+                json.dump(meta, f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, final_path)
+            tmp_path = None
+        except OSError as e:
+            self.logger.error("Failed to write {:s}: {:s}".format(final_path, str(e)))
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _open_db(self, filename, dbtype):
         d = bdb.DB(self._env)
@@ -659,6 +778,14 @@ class DAQDatabase:
         stats["write_queue_size"] = self._write_queue.qsize() if self._write_queue else 0
         stats["read_errors"] = self._read_errors
         return stats
+
+    def get_instance_info(self):
+        """Effective database directory and owning instance (spec B.2).
+
+        Kept separate from get_db_stats(), whose key set is unchanged; the
+        status server adds these keys to DB_STATS only under status_extended.
+        """
+        return {"db_dir": self.db_dir, "instance_id": self.instance_id}
 
     def close(self):
         """Close all databases and the environment"""

@@ -40,6 +40,26 @@
 #define IQH_RSV_AGG_POWER_MDB      101 /* aggregate channel power, milli-dB (scan objective) */
 #define IQH_RSV_BUFFER_OVERRUN_CNT 102 /* cumulative USB ring-buffer overrun events since start,
                                           stamped by rtl_daq; 0 = none/unsupported */
+
+/* Scaling / clustering telemetry slots (still header_version 8). Every slot
+ * below is zero unless its own opt-in key or flag is set; a header produced
+ * with no new key or flag keeps all of them 0. Byte offset of slot k inside
+ * the 1024-byte header = 252 + 4*k. */
+#define IQH_RSV_ROUTER_SEQ         103 /* IQ router per-source forwarded-frame counter, u32
+                                          wraps (federation_iq_router --stamp-seq) */
+#define IQH_RSV_ROUTER_RX_TS_LO    104 /* router receive time, Unix ms, low 32 bits  (--stamp-rx-ts) */
+#define IQH_RSV_ROUTER_RX_TS_HI    105 /* router receive time, Unix ms, high 32 bits (--stamp-rx-ts) */
+#define IQH_RSV_SOURCE_INSTANCE    106 /* source instance_id + 1; 0 = untagged (router --tag-mode node) */
+#define IQH_RSV_SOURCE_KEY_CRC32   107 /* crc32 of the source node key "host:N" (router --tag-mode node) */
+#define IQH_RSV_NODE_ID_CRC32      108 /* crc32 of [federation] node_id (delay_sync,
+                                          [federation] stamp_node_id = 1) */
+#define IQH_RSV_DECIMATOR_DROP_CNT 109 /* cumulative decimator output frames dropped (decimate.out,
+                                          [monitoring] stamp_decimator_drops = 1) */
+#define IQH_RSV_CAL_QUALITY_MDB    110 /* calibration quality, milli-dB, SIGNED two's complement
+                                          (delay_sync, [monitoring] stamp_cal_telemetry = 1) */
+#define IQH_RSV_IQ_COMP_CNT        111 /* IQ (amplitude/phase) compensation count (stamp_cal_telemetry) */
+#define IQH_RSV_SAMPLE_COMP_CNT    112 /* sample-delay compensation count (stamp_cal_telemetry) */
+#define IQH_RSV_RECAL_GEN          113 /* recalibration generation (stamp_cal_telemetry) */
 struct iq_frame_struct 
 {
 	struct iq_header_struct* header;
@@ -90,6 +110,8 @@ _Static_assert(offsetof(struct iq_header_struct, reserved) == 252,
                "IQ header ABI broken: reserved[] must start at byte offset 252");
 _Static_assert(offsetof(struct iq_header_struct, header_version) == 1020,
                "IQ header ABI broken: header_version must be at byte offset 1020");
+_Static_assert((size_t)IQH_RSV_RECAL_GEN < sizeof(((struct iq_header_struct *)0)->reserved) / sizeof(uint32_t),
+               "IQ header ABI broken: a named reserved slot lies outside reserved[]");
 
 void dump_iq_header(struct iq_header_struct* iq_header);
 int check_sync_word(struct iq_header_struct* iq_header);

@@ -25,11 +25,14 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
+import io
 import json
 import logging
 import os
 import re
+import stat
 import sys
+import tempfile
 from configparser import ConfigParser
 
 logger = logging.getLogger(__name__)
@@ -110,8 +113,9 @@ def auto_configure(caps_file, config_file):
                 "Targeted config rewrite applied %d/%d change(s); "
                 "falling back to full rewrite (comments will be lost)",
                 applied, len(changes))
-            with open(config_file, 'w') as f:
-                config.write(f)
+            buf = io.StringIO()
+            config.write(buf)
+            write_file_atomic(config_file, buf.getvalue())
         logger.info("Updated %d field(s) in %s", len(changes), config_file)
     else:
         logger.info("No fields set to 'auto' -- config unchanged")
@@ -161,9 +165,57 @@ def _apply_targeted_updates(config_file, changes):
         out_lines.append(line)
 
     if applied:
-        with open(config_file, 'w') as f:
-            f.writelines(out_lines)
+        write_file_atomic(config_file, ''.join(out_lines))
     return applied
+
+
+def write_file_atomic(path, text):
+    """Replace *path* with *text* atomically.
+
+    The text goes to a temporary file in the same directory, is flushed to
+    disk and then renamed over the target (``os.replace``), so a reader --
+    or a crash mid-write -- never sees a truncated INI. The target's mode and,
+    when permitted, owner and group are kept. A symbolic link is followed:
+    the file it points to is replaced and the link stays.
+
+    When the directory does not allow creating the temporary file but the
+    target itself is writable (what the historic in-place rewrite needed),
+    the target is rewritten in place and a warning says the write is not
+    atomic; if that fails too the error propagates.
+    """
+    target = os.path.realpath(path)
+    st = os.stat(target)
+    directory = os.path.dirname(target)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory,
+                                   prefix='.' + os.path.basename(target) + '.',
+                                   suffix='.tmp')
+    except OSError as e:
+        logger.warning("Cannot create a temporary file in %s (%s); rewriting %s in place "
+                       "(not atomic)", directory, e.strerror or e, target)
+        with open(target, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        return
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        if hasattr(os, 'chown'):
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except OSError:
+                pass  # not permitted for this user: the file keeps our ownership
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,9 @@
 
     Every pack_msg_* is asserted to produce exactly 128 bytes with fields
     recoverable at the same offsets rtl_daq.c reads them from, and all-zero
-    padding after the payload.
+    padding after the payload. unpack_msg (the decoder used by the synthetic
+    source) round-trips every packer, and the per-channel packers refuse more
+    than 31 values.
 
     Project : HeIMDALL DAQ Firmware
     License : GNU GPL V3
@@ -129,6 +131,80 @@ class TesterInterModuleMessages(unittest.TestCase):
         ]
         for msg in samples:
             self.assertEqual(len(msg), MSG_LEN)
+
+    # ---- decoder (unpack_msg) and the 31-channel ceiling ----
+
+    def test_unpack_msg_round_trip_every_packer(self):
+        """unpack_msg recovers module id, command char and the parameter
+        block of every packer, mirroring the rtl_daq.c receive path."""
+        cases = [
+            (imm.pack_msg_reconfiguration(4, 433920000, 2400000, 158), 4, "r"),
+            (imm.pack_msg_rf_tune(6, 868000000), 6, "c"),
+            (imm.pack_msg_set_gain(6, [0, 87, 297]), 6, "g"),
+            (imm.pack_msg_enable_agc(-1), -1, "a"),
+            (imm.pack_msg_noise_source_ctr(6, True), 6, "n"),
+            (imm.pack_msg_noise_source_ctr(6, False), 6, "n"),
+            (imm.pack_msg_sample_freq_tune(2, [0.0, 2.5e-5]), 2, "s"),
+            (imm.pack_msg_set_bias_tee(6, [1, 0, 1]), 6, "b"),
+        ]
+        for msg, module_id, cmd in cases:
+            got_id, got_cmd, params = imm.unpack_msg(msg)
+            self.assertEqual(got_id, module_id)
+            self.assertEqual(got_cmd, cmd)
+            self.assertIsInstance(params, bytes)
+            self.assertEqual(len(params), MSG_LEN - PARAMS_OFFSET)
+            self.assertEqual(params, msg[PARAMS_OFFSET:])
+
+    def test_unpack_msg_parameter_values(self):
+        """Typed parameter readers recover the packed values."""
+        _, _, p = imm.unpack_msg(imm.pack_msg_reconfiguration(1, 433920000, 2400000, 158))
+        self.assertEqual(imm.unpack_u32_params(p, 3), [433920000, 2400000, 158])
+        _, _, p = imm.unpack_msg(imm.pack_msg_rf_tune(1, 2**32 - 1))
+        self.assertEqual(imm.unpack_u32_params(p, 1), [2**32 - 1])
+        gains = list(range(0, 31 * 10, 10))
+        _, _, p = imm.unpack_msg(imm.pack_msg_set_gain(1, gains))
+        self.assertEqual(imm.unpack_u32_params(p, 31), gains)
+        offsets = [0.0, -1.25, 3.5, 0.0078125]
+        _, _, p = imm.unpack_msg(imm.pack_msg_sample_freq_tune(1, offsets))
+        self.assertEqual(imm.unpack_f32_params(p, 4), offsets)
+        _, _, p = imm.unpack_msg(imm.pack_msg_set_bias_tee(1, [1, 0, 7]))
+        self.assertEqual(imm.unpack_u32_params(p, 3), [1, 0, 1])
+        _, _, p = imm.unpack_msg(imm.pack_msg_noise_source_ctr(1, True))
+        self.assertEqual(p[0], 1)
+
+    def test_unpack_msg_accepts_bytearray_and_memoryview(self):
+        msg = imm.pack_msg_rf_tune(3, 100000000)
+        for buf in (bytearray(msg), memoryview(msg)):
+            self.assertEqual(imm.unpack_msg(buf), imm.unpack_msg(msg))
+
+    def test_unpack_msg_rejects_wrong_length(self):
+        msg = imm.pack_msg_enable_agc(1)
+        for bad in (b"", msg[:127], msg + b"\x00", msg * 2):
+            with self.assertRaises(ValueError):
+                imm.unpack_msg(bad)
+
+    def test_param_readers_reject_overrun(self):
+        _, _, p = imm.unpack_msg(imm.pack_msg_enable_agc(1))
+        with self.assertRaises(ValueError):
+            imm.unpack_u32_params(p, 32)
+        with self.assertRaises(ValueError):
+            imm.unpack_f32_params(p, 32)
+        with self.assertRaises(ValueError):
+            imm.unpack_u32_params(p, -1)
+
+    def test_per_channel_packers_reject_32_values(self):
+        """More than 31 per-channel values cannot fit the 126 parameter
+        bytes; the packers raise instead of building an oversized frame."""
+        packers = (imm.pack_msg_set_gain, imm.pack_msg_sample_freq_tune,
+                   imm.pack_msg_set_bias_tee)
+        for packer in packers:
+            self.assertEqual(len(packer(1, [0] * 31)), MSG_LEN)
+            with self.assertRaises(ValueError) as ctx:
+                packer(1, [0] * 32)
+            self.assertEqual(str(ctx.exception),
+                             "num_ch > 31 unsupported by the 128-byte message")
+        self.assertEqual(imm.MAX_MSG_CHANNELS, 31)
+        self.assertEqual(imm.MSG_LENGTH, MSG_LEN)
 
 
 if __name__ == "__main__":

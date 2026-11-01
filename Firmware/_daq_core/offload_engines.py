@@ -21,7 +21,12 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 import logging
+import os
 import numpy as np
+
+#: Worker count of FFTEngine/CorrelationEngine when nothing is configured
+#: ([offload] fft_workers / xcorr_workers absent).
+DEFAULT_WORKERS = 4
 
 # Lazy-loaded optional dependencies
 _scipy_fft = None
@@ -46,6 +51,40 @@ def _get_gpu_engine_cls():
     return _gpu_engine_cls
 
 
+def resolve_workers(value, cores=None, default=DEFAULT_WORKERS):
+    """Resolve an ``[offload] fft_workers`` / ``xcorr_workers`` value.
+
+    ``None``/empty -> *default* (4 = the constructors' defaults, so an absent
+    key is byte-identical to today). ``auto`` -> the number of cores in
+    *cores* (``[host] delay_sync_cores``) when given, else the size of this
+    process's CPU affinity mask (``os.cpu_count()`` where
+    ``sched_getaffinity`` does not exist). Otherwise an integer >= 1.
+
+    Raises ValueError for anything else. The worker count only splits
+    independent transforms across threads (pocketfft), so results are
+    bit-identical for every value.
+    """
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text == "auto":
+        if cores:
+            return max(1, len(set(cores)))
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except AttributeError:
+            return max(1, os.cpu_count() or 1)
+    try:
+        n = int(text)
+    except ValueError:
+        raise ValueError("bad worker count '{}' (expected an integer >= 1 or auto)".format(value))
+    if n < 1:
+        raise ValueError("bad worker count '{}' (expected an integer >= 1 or auto)".format(value))
+    return n
+
+
 # ---------------------------------------------------------------------------
 # FFT Engine
 # ---------------------------------------------------------------------------
@@ -61,7 +100,7 @@ class FFTEngine:
 
     _VALID_ENGINES = ('cpu_scipy', 'gpu', 'fpga')
 
-    def __init__(self, engine_type='cpu_scipy', fft_size=None, workers=4):
+    def __init__(self, engine_type='cpu_scipy', fft_size=None, workers=DEFAULT_WORKERS):
         self.logger = logging.getLogger(__name__)
         self.engine_type = engine_type
         self.fft_size = fft_size
@@ -126,7 +165,7 @@ class CorrelationEngine:
 
     _VALID_ENGINES = ('cpu_numpy', 'gpu', 'fpga')
 
-    def __init__(self, engine_type='cpu_numpy', N_proc=None, workers=4):
+    def __init__(self, engine_type='cpu_numpy', N_proc=None, workers=DEFAULT_WORKERS):
         self.logger = logging.getLogger(__name__)
         self.engine_type = engine_type
         self.N_proc = N_proc

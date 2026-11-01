@@ -1,0 +1,55 @@
+# HeIMDALL DAQ — project site (GitHub Pages, plain Jekyll, no plugins).
+#
+# Publishing: Settings -> Pages -> Build and deployment -> "Deploy from a branch",
+# branch "main", folder "/docs". See docs/README.md.
+
+title: HeIMDALL DAQ
+tagline: Coherent multichannel acquisition for KrakenSDR
+description: >-
+  HeIMDALL DAQ is the coherent data-acquisition chain behind KrakenSDR: five
+  RTL-SDR tuners on one clock, calibrated into a single phase-coherent receiver.
+as_of: "2026-11-01"
+
+# baseurl: left unset (YAML null) on purpose. On GitHub Pages the
+# jekyll-github-metadata plugin then fills it in: "/<repo>" for a project site
+# (https://<owner>.github.io/<repo>/), "" for a user site or a custom domain.
+# An explicit empty string ("") switches that detection off and breaks every
+# link on a project site, so do not write baseurl: "".
+# Override it only when the detection is wrong, for example:
+#   baseurl: "/exheimdall"
+# For a local preview of a project site, pass --baseurl /exheimdall to jekyll.
+# Every link and asset goes through the relative_url filter.
+baseurl:
+
+# repo_url: base URL of the source repository, used for the footer and for
+# links that point outside Documentation/ (for example ../CHANGELOG.md in a
+# guide page). Empty means those links render as plain code text.
+# Set it before publishing, for example:
+#   repo_url: "https://github.com/<owner>/exheimdall"
+repo_url: ""
+repo_branch: main
+
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+  auto_ids: true
+
+defaults:
+  - scope:
+      path: "guide"
+    values:
+      layout: guide
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - README.md
+  - _tools
+  - Gemfile
+  - Gemfile.lock
+  - vendor

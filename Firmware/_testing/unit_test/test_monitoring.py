@@ -508,5 +508,469 @@ class TestStatusServerDBProxy(unittest.TestCase):
         self.assertIn("error", resp)
 
 
+
+# ======================================================================
+# Extended status grammar ([monitoring] status_extended, spec G.1/G.2/G.7)
+# and event identity (G.4) — WP-06
+# ======================================================================
+
+import daq_events  # noqa: E402
+import daq_status_server  # noqa: E402
+
+# Replies recorded from the pre-extension status server (byte for byte):
+# with status_extended = 0 every one of them must stay identical.
+_LEGACY_UNKNOWN = (b'{"error": "unknown command", "valid": ["PING", "STATUS", "METRICS", '
+                   b'"EVENTS", "EVENTS_DROPPED", "DB_STATS", "SCAN_SUMMARY", "CAL_HISTORY"]}\n')
+_LEGACY_FIXTURES_NO_DB = {
+    b"PEERS": _LEGACY_UNKNOWN,
+    b"HWC": _LEGACY_UNKNOWN,
+    b"HW_SNAPSHOTS": _LEGACY_UNKNOWN,
+    b"HW_SNAPSHOTS 0 5": _LEGACY_UNKNOWN,
+    b"FOO": _LEGACY_UNKNOWN,
+    b"CAL_HISTORY 1 2 3": b'{"error": "database not enabled"}\n',
+    b"CAL_HISTORY - 0 10": b'{"error": "database not enabled"}\n',
+    b"CAL_HISTORY x": b'{"error": "database not enabled"}\n',
+    b"DB_STATS": b'{"error": "database not enabled"}\n',
+    b"EVENTS": b'{"error": "event bus not enabled"}\n',
+    b"METRICS": b'{"error": "metrics not enabled"}\n',
+}
+_LEGACY_FIXTURES_DB = {
+    b"PEERS": _LEGACY_UNKNOWN,
+    b"HWC": _LEGACY_UNKNOWN,
+    b"HW_SNAPSHOTS": _LEGACY_UNKNOWN,
+    b"HW_SNAPSHOTS 0 5": _LEGACY_UNKNOWN,
+    b"FOO": _LEGACY_UNKNOWN,
+    b"CAL_HISTORY 1 2 3": b'{"error": "usage: CAL_HISTORY [rf_center_freq_hz]"}\n',
+    b"CAL_HISTORY - 0 10": b'{"error": "usage: CAL_HISTORY [rf_center_freq_hz]"}\n',
+    b"CAL_HISTORY x": b'{"error": "usage: CAL_HISTORY [rf_center_freq_hz]"}\n',
+    b"DB_STATS": b'{"frame_metrics.db": {"size_bytes": 123}, "read_errors": 0}\n',
+}
+# STATUS keys the server adds to the delay_sync snapshot (pre-extension)
+_LEGACY_STATUS_ADDED = {"timestamp", "uptime_sec", "recent_drops", "drop_window_sec",
+                        "pipeline_health"}
+
+
+class _FakeDB:
+    """DB stand-in recording the read-API calls."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_db_stats(self):
+        return {"frame_metrics.db": {"size_bytes": 123}, "read_errors": 0}
+
+    def get_instance_info(self):
+        return {"db_dir": "_db/inst2", "instance_id": 2}
+
+    def get_freq_scan_summary(self, freq=None):
+        return []
+
+    def get_cal_history(self, start_ts_ms=0, end_ts_ms=None, rf_center_freq=None, limit=1000):
+        self.calls.append(("cal_history", start_ts_ms, rf_center_freq, limit))
+
+        class R:
+            pass
+        r = R()
+        r.timestamp_ms = start_ts_ms + 1
+        r.rf_center_freq = rf_center_freq or 0
+        return [r]
+
+    def get_hw_snapshots(self, start_ts_ms=0, end_ts_ms=None, limit=1000):
+        self.calls.append(("hw_snapshots", start_ts_ms, limit))
+
+        class R:
+            pass
+        r = R()
+        r.timestamp_ms = start_ts_ms + 2
+        r.overdrive_events = 0
+        return [r]
+
+
+def _raw_query(port, cmd, timeout=3.0):
+    """Send one command line, return the raw reply bytes (up to '\n' or EOF)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        s.sendall(cmd + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data
+    finally:
+        s.close()
+
+
+class _ServerCase(unittest.TestCase):
+    """Starts a StatusServer per test (free port, torn down afterwards)."""
+
+    def start_server(self, **kwargs):
+        port = _free_port()
+        server = StatusServer(port=port, **kwargs)
+        server.start()
+        self.assertTrue(_wait_listening(port), "StatusServer did not come up")
+        self.addCleanup(server.close)
+        return server, port
+
+    def query(self, port, cmd):
+        return json.loads(_raw_query(port, cmd.encode()).decode())
+
+    def start_capped_server(self, **kwargs):
+        """start_server, then wait until the _wait_listening probe is fully
+        handled: one answered PING (the accept loop is FIFO, so the probe
+        was accepted before it), then every client and busy-replier slot
+        free again. Otherwise the probe can be accepted late and count as
+        a rejected client in the cap tests."""
+        server, port = self.start_server(**kwargs)
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                if "ok" in self.query(port, "PING"):
+                    break
+            except (OSError, ValueError):
+                pass
+            self.assertLess(time.monotonic(), deadline, "StatusServer never answered PING")
+            time.sleep(0.02)
+        sems = [server._client_sem, server._busy_sem]
+        for sem in sems:
+            for _ in range(server._max_clients):
+                self.assertTrue(sem.acquire(timeout=10.0))
+            for _ in range(server._max_clients):
+                sem.release()
+        return server, port
+
+
+class TestStatusLegacyBytes(_ServerCase):
+    """status_extended = 0: every reply is today's, byte for byte."""
+
+    def test_legacy_replies_without_db(self):
+        _server, port = self.start_server()
+        for cmd, want in _LEGACY_FIXTURES_NO_DB.items():
+            self.assertEqual(_raw_query(port, cmd), want, cmd)
+
+    def test_legacy_replies_with_db(self):
+        _server, port = self.start_server(db=_FakeDB())
+        for cmd, want in _LEGACY_FIXTURES_DB.items():
+            self.assertEqual(_raw_query(port, cmd), want, cmd)
+
+    def test_legacy_status_key_set(self):
+        server, port = self.start_server()
+        snap = {"sync_state": 6, "current_frequency_hz": 433000000, "frame_count": 7,
+                "aggregate_power_db": 0.0, "calibration_status": "locked",
+                "counters": {"dropped_frames_iq": 0, "dropped_frames_hwc": 0}}
+        server.update_status(snap)
+        resp = self.query(port, "STATUS")
+        self.assertEqual(set(resp), set(snap) | _LEGACY_STATUS_ADDED)
+        self.assertEqual(resp["counters"], snap["counters"])
+
+    def test_legacy_never_stale_and_ignores_extended_options(self):
+        """Extended-only options are inert without extended=True."""
+        clock = [100.0]
+        server, port = self.start_server(stale_after_sec=1.0, max_clients=1,
+                                         _clock=lambda: clock[0])
+        server.update_status({"sync_state": 6, "counters": {}})
+        clock[0] += 1000.0
+        resp = self.query(port, "STATUS")
+        self.assertEqual(resp["pipeline_health"], "ok")
+        self.assertNotIn("snapshot_age_sec", resp)
+        self.assertNotIn("status_protocol", resp)
+        self.assertEqual(server._max_clients, StatusServer.MAX_CLIENTS)
+
+    def test_legacy_client_cap_closes_silently(self):
+        server, port = self.start_capped_server()
+        for _ in range(StatusServer.MAX_CLIENTS):
+            self.assertTrue(server._client_sem.acquire(timeout=5.0))
+        try:
+            try:
+                reply = _raw_query(port, b"PING")
+            except ConnectionResetError:   # closed without reading the request
+                reply = b""
+            self.assertEqual(reply, b"")
+        finally:
+            for _ in range(StatusServer.MAX_CLIENTS):
+                server._client_sem.release()
+
+
+class TestStatusExtended(_ServerCase):
+
+    def _snapshot(self, sync_state=6):
+        return {"sync_state": sync_state, "counters": {"dropped_frames_iq": 0,
+                                                       "dropped_frames_hwc": 0}}
+
+    def test_documented_keys(self):
+        server, port = self.start_server(extended=True, frame_period_sec=0.437,
+                                         update_interval_frames=100)
+        server.update_status(self._snapshot())
+        resp = self.query(port, "STATUS")
+        self.assertEqual(resp["status_protocol"], 2)
+        self.assertIn("snapshot_age_sec", resp)
+        # auto threshold: 3 * 100 * 0.437 + 1 = 132.1 s
+        self.assertAlmostEqual(resp["stale_after_sec"], 132.1, places=3)
+        self.assertEqual(resp["pipeline_health"], "ok")
+        self.assertNotIn("federation", resp)   # no provider -> absent
+        self.assertNotIn("hwc", resp)
+
+    def test_auto_stale_formula(self):
+        f = daq_status_server.auto_stale_after_sec
+        self.assertAlmostEqual(f(100, 0.437), 132.1)
+        self.assertAlmostEqual(f(10, 0.437), 14.11)
+        self.assertAlmostEqual(f(10, 2**22 / 2.4e6), 3 * 10 * 2**22 / 2.4e6 + 1.0)
+        self.assertAlmostEqual(f(0, 1.0), 4.0)     # k_eff = max(1, k)
+        self.assertIsNone(f(10, None))
+
+    def test_snapshot_age_and_stale(self):
+        clock = [1000.0]
+        server, port = self.start_server(extended=True, frame_period_sec=0.5,
+                                         update_interval_frames=2, _clock=lambda: clock[0])
+        server.update_status(self._snapshot())
+        self.assertAlmostEqual(server.stale_after_sec, 4.0)  # 3*2*0.5 + 1
+        clock[0] += 1.5
+        resp = self.query(port, "STATUS")
+        self.assertAlmostEqual(resp["snapshot_age_sec"], 1.5, places=3)
+        self.assertEqual(resp["pipeline_health"], "ok")
+        clock[0] += 3.0                                      # age 4.5 > 4.0
+        resp = self.query(port, "STATUS")
+        self.assertAlmostEqual(resp["snapshot_age_sec"], 4.5, places=3)
+        self.assertEqual(resp["pipeline_health"], "stale")
+        self.assertEqual(server.get_pipeline_health(), "stale")
+        server.update_status(self._snapshot())               # fresh again
+        self.assertEqual(self.query(port, "STATUS")["pipeline_health"], "ok")
+
+    def test_explicit_stale_after_overrides_auto(self):
+        server, _port = self.start_server(extended=True, stale_after_sec=7.5,
+                                          frame_period_sec=0.437, update_interval_frames=100)
+        self.assertEqual(server.stale_after_sec, 7.5)
+
+    def test_busy_reply_at_client_cap(self):
+        server, port = self.start_capped_server(extended=True, max_clients=2)
+        for _ in range(2):
+            self.assertTrue(server._client_sem.acquire(timeout=5.0))
+        try:
+            self.assertEqual(json.loads(_raw_query(port, b"PING").decode()),
+                             {"error": "busy"})
+        finally:
+            for _ in range(2):
+                server._client_sem.release()
+        self.assertTrue(self.query(port, "PING")["ok"])
+
+    def test_busy_repliers_are_bounded(self):
+        """With every busy-replier slot in use, a rejected client is closed
+        silently instead of getting one more thread."""
+        server, port = self.start_capped_server(extended=True, max_clients=2)
+        for sem in (server._client_sem, server._busy_sem):
+            for _ in range(2):
+                self.assertTrue(sem.acquire(timeout=5.0))
+        try:
+            try:
+                reply = _raw_query(port, b"PING")
+            except ConnectionResetError:   # closed without reading the request
+                reply = b""
+            self.assertEqual(reply, b"")    # no busy reply: no replier thread ran
+        finally:
+            for sem in (server._busy_sem, server._client_sem):
+                for _ in range(2):
+                    sem.release()
+        self.assertTrue(self.query(port, "PING")["ok"])
+
+    def test_busy_replier_slot_released(self):
+        server, port = self.start_capped_server(extended=True, max_clients=1)
+        self.assertTrue(server._client_sem.acquire(timeout=5.0))
+        try:
+            for _ in range(3):      # more rejects than busy slots: each slot is returned
+                self.assertEqual(json.loads(_raw_query(port, b"PING").decode()),
+                                 {"error": "busy"})
+                deadline = time.monotonic() + 5.0
+                while not server._busy_sem.acquire(blocking=False):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                server._busy_sem.release()
+        finally:
+            server._client_sem.release()
+
+    def test_thread_exhaustion_keeps_accept_loop(self):
+        server, port = self.start_capped_server(extended=True, max_clients=2)
+        real_start = threading.Thread.start
+        failing = {"on": True}
+
+        def start(thread):
+            if failing["on"] and thread.name == "StatusClient":
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+        with patch.object(threading.Thread, "start", start):
+            try:
+                reply = _raw_query(port, b"PING")
+            except ConnectionResetError:
+                reply = b""
+            self.assertEqual(reply, b"")
+            failing["on"] = False
+            self.assertTrue(self.query(port, "PING")["ok"])
+        # The failed start returned its client slot
+        for _ in range(2):
+            self.assertTrue(server._client_sem.acquire(timeout=5.0))
+        for _ in range(2):
+            server._client_sem.release()
+
+    def test_unknown_verb_lists_new_verbs(self):
+        _server, port = self.start_server(extended=True)
+        resp = self.query(port, "FOO")
+        self.assertEqual(resp["error"], "unknown command")
+        self.assertEqual(resp["valid"][:8], ["PING", "STATUS", "METRICS", "EVENTS",
+                                             "EVENTS_DROPPED", "DB_STATS", "SCAN_SUMMARY",
+                                             "CAL_HISTORY"])
+        self.assertEqual(resp["valid"][8:], ["PEERS", "HWC", "HW_SNAPSHOTS"])
+
+    def test_peers(self):
+        _server, port = self.start_server(extended=True)
+        self.assertEqual(self.query(port, "PEERS"), {"error": "federation not enabled"})
+        block = {"instance_id": 1, "node_id": "hosta:1", "cluster_id": "default",
+                 "health_mode": "mesh", "coordinator": {"endpoint": None},
+                 "advisory_leader": 0, "peers": {"hostb:0": {"alive": True}}}
+        server2, port2 = self.start_server(extended=True, federation_provider=lambda: block)
+        self.assertEqual(self.query(port2, "PEERS"),
+                         {"instance_id": 1, "node_id": "hosta:1", "advisory_leader": 0,
+                          "peers": {"hostb:0": {"alive": True}}})
+        server2.update_status(self._snapshot())
+        self.assertEqual(self.query(port2, "STATUS")["federation"], block)
+
+    def test_hwc(self):
+        _server, port = self.start_server(extended=True)
+        self.assertEqual(self.query(port, "HWC"), {"error": "hwc relay not enabled"})
+        state = {"view": None, "error": "hwc state unreadable"}
+        server2, port2 = self.start_server(
+            extended=True, hwc_provider=lambda: (state["view"], state["error"]))
+        server2.update_status(self._snapshot())
+        self.assertEqual(self.query(port2, "HWC"), {"error": "hwc state unreadable"})
+        resp = self.query(port2, "STATUS")
+        self.assertIsNone(resp["hwc"])
+        self.assertEqual(resp["hwc_error"], "hwc state unreadable")
+        state["view"] = {"v": 1, "fsm": "IQ_CAL", "age_sec": 0.2}
+        self.assertEqual(self.query(port2, "HWC"), state["view"])
+        resp = self.query(port2, "STATUS")
+        self.assertEqual(resp["hwc"], state["view"])
+        self.assertNotIn("hwc_error", resp)
+
+    def test_cal_history_forms(self):
+        db = _FakeDB()
+        _server, port = self.start_server(extended=True, db=db)
+        # bare and one-argument forms are today's, incl. the old usage text
+        self.assertEqual(len(self.query(port, "CAL_HISTORY")["cal_history"]), 1)
+        self.assertEqual(self.query(port, "CAL_HISTORY x"),
+                         {"error": "usage: CAL_HISTORY [rf_center_freq_hz]"})
+        # new 2/3-argument forms
+        resp = self.query(port, "CAL_HISTORY - 1000 5")
+        self.assertEqual(resp["cal_history"][0]["timestamp_ms"], 1001)
+        self.assertEqual(db.calls[-1], ("cal_history", 1000, None, 5))
+        self.query(port, "CAL_HISTORY 433000000 7")
+        self.assertEqual(db.calls[-1], ("cal_history", 7, 433000000, 100))
+        usage = {"error": "usage: CAL_HISTORY [rf_center_freq_hz|-] [since_ms] [limit]"}
+        for bad in ("CAL_HISTORY - x", "CAL_HISTORY - 0 0", "CAL_HISTORY - 0 1001",
+                    "CAL_HISTORY a 0", "CAL_HISTORY - 0 5 9", "CAL_HISTORY - -1"):
+            self.assertEqual(self.query(port, bad), usage, bad)
+
+    def test_hw_snapshots(self):
+        _server, port = self.start_server(extended=True)
+        self.assertEqual(self.query(port, "HW_SNAPSHOTS"), {"error": "database not enabled"})
+        db = _FakeDB()
+        _server2, port2 = self.start_server(extended=True, db=db)
+        resp = self.query(port2, "HW_SNAPSHOTS")
+        self.assertEqual(resp["hw_snapshots"][0]["timestamp_ms"], 2)
+        self.assertEqual(db.calls[-1], ("hw_snapshots", 0, 100))
+        self.query(port2, "HW_SNAPSHOTS 500 3")
+        self.assertEqual(db.calls[-1], ("hw_snapshots", 500, 3))
+        usage = {"error": "usage: HW_SNAPSHOTS [since_ms] [limit]"}
+        for bad in ("HW_SNAPSHOTS x", "HW_SNAPSHOTS 0 0", "HW_SNAPSHOTS 0 2000",
+                    "HW_SNAPSHOTS 1 2 3"):
+            self.assertEqual(self.query(port2, bad), usage, bad)
+
+    def test_db_stats_additive_keys(self):
+        _server, port = self.start_server(extended=True, db=_FakeDB())
+        resp = self.query(port, "DB_STATS")
+        self.assertEqual(resp["frame_metrics.db"], {"size_bytes": 123})
+        self.assertEqual(resp["read_errors"], 0)
+        self.assertEqual(resp["db_dir"], "_db/inst2")
+        self.assertEqual(resp["instance_id"], 2)
+
+
+class TestEventIdentity(unittest.TestCase):
+
+    def test_untagged_json_is_todays_asdict(self):
+        evt = DAQEvent(timestamp=1.5, severity="info", module="delay_sync",
+                       event_type=EVT_SYNC_LOCK, payload={"freq": 1})
+        want = {"timestamp": 1.5, "severity": "info", "module": "delay_sync",
+                "event_type": "sync_lock", "payload": {"freq": 1}}
+        self.assertEqual(evt.to_dict(), want)
+        self.assertEqual(list(evt.to_dict()), list(want))
+        self.assertEqual(evt.to_json(), json.dumps(want))
+
+    def test_tagged_bus_sets_source(self):
+        source = {"instance_id": 2, "node_id": "hosta:2", "host": "hosta",
+                  "cluster_id": "lab"}
+        bus = EventBus(enabled=True, ring_size=10, source=source)
+        received = []
+        bus.register_handler(received.append)
+        bus.emit(DAQEvent(severity="info", module="t", event_type=EVT_HEARTBEAT))
+        bus.close()
+        self.assertEqual(received[0].source, source)
+        d = received[0].to_dict()
+        self.assertEqual(d["source"], source)
+        self.assertEqual(list(d)[-1], "source")
+
+    def test_untagged_bus_leaves_source_none(self):
+        bus = EventBus(enabled=True, ring_size=10)
+        received = []
+        bus.register_handler(received.append)
+        bus.emit(DAQEvent(severity="info", module="t", event_type=EVT_HEARTBEAT))
+        bus.close()
+        self.assertIsNone(received[0].source)
+        self.assertNotIn("source", received[0].to_dict())
+
+    def test_new_event_constants(self):
+        self.assertEqual(daq_events.EVT_PEER_RECOVERED, "peer_recovered")
+        self.assertEqual(daq_events.EVT_PEER_FLAPPING, "peer_flapping")
+        self.assertEqual(daq_events.EVT_RECAL_REQUESTED, "recal_requested")
+        self.assertEqual(daq_events.EVT_CAL_STALLED, "cal_stalled")
+        self.assertEqual(daq_events.EVT_COORDINATOR_COMMAND, "coordinator_command")
+        self.assertEqual(daq_events.EVT_NODE_KEY_COLLISION, "node_key_collision")
+        self.assertEqual(daq_events.EVT_SCHEDULE_RECONCILE_FAILED, "schedule_reconcile_failed")
+        self.assertEqual(daq_events.EVT_CAL_TIMEOUT, "cal_timeout")
+
+
+class TestZMQTopicPrefix(unittest.TestCase):
+
+    def _publish_and_receive(self, **handler_kwargs):
+        try:
+            import zmq
+        except ImportError:
+            self.skipTest("pyzmq not installed")
+        port = _free_port()
+        handler = ZMQPubHandler(port=port, listen_address="127.0.0.1", **handler_kwargs)
+        self.addCleanup(handler.close)
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        self.addCleanup(sub.close, 0)
+        sub.setsockopt(zmq.SUBSCRIBE, b"")
+        sub.setsockopt(zmq.RCVTIMEO, 200)
+        sub.connect("tcp://127.0.0.1:{}".format(port))
+        evt = DAQEvent(timestamp=1.0, severity="info", module="t", event_type=EVT_HEARTBEAT)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:      # PUB/SUB slow joiner: resend until received
+            handler(evt)
+            try:
+                return sub.recv_multipart()
+            except zmq.Again:
+                continue
+        self.fail("no event received on the PUB socket")
+
+    def test_default_topic_is_event_type(self):
+        topic, data = self._publish_and_receive()
+        self.assertEqual(topic, b"heartbeat")
+        self.assertNotIn("source", json.loads(data.decode()))
+
+    def test_prefixed_topic(self):
+        topic, _data = self._publish_and_receive(topic_prefix="inst3.")
+        self.assertEqual(topic, b"inst3.heartbeat")
+
+
 if __name__ == "__main__":
     unittest.main()

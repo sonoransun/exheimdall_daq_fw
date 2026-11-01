@@ -1,0 +1,1 @@
+{%- if site.repo_url and site.repo_url != "" -%}{%- assign _kind = "blob" -%}{%- assign _last = include.path | slice: -1, 1 -%}{%- if _last == "/" -%}{%- assign _kind = "tree" -%}{%- endif -%}<a href="{{ site.repo_url }}/{{ _kind }}/{{ site.repo_branch | default: "main" }}/{{ include.path }}">{{ include.text }}</a>{%- else -%}<code>{{ include.path }}</code>{%- endif -%}

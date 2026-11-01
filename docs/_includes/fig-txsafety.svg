@@ -1,0 +1,49 @@
+<svg class="fig fig-wide has-tall fig-w800" viewBox="0 0 800 312" role="img" aria-labelledby="tx-t tx-d">
+<title id="tx-t">Transmit safety state machine of the active track</title>
+<desc id="tx-d">A process starts DISABLED when transmit is not enabled or the mode is receive-only, and then can never transmit. With transmit enabled and a tx or trx mode it starts SAFE. Arming runs fifteen ordered checks and moves to ARMED. Each burst needs a permit that is checked against the final buffer; the burst moves the state to TRANSMITTING and back to ARMED. Disarm, expiry, retune or heartbeat loss return ARMED to SAFE. Any trip, from SAFE, ARMED or TRANSMITTING, latches FAULT after a fail-safe shutdown, and only an operator reset returns FAULT to SAFE, never directly to ARMED.</desc>
+<defs>
+<marker id="txa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow"/></marker>
+<marker id="txc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-ctl"/></marker>
+<marker id="txr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-risk"/></marker>
+<marker id="txg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-thin"/></marker>
+</defs>
+<circle cx="30" cy="160" r="7" class="fig-num"/>
+<path d="M30 152 V80" class="fig-thin" marker-end="url(#txg)"/>
+<text x="40" y="112" class="fig-s">en_tx = 0</text>
+<text x="40" y="126" class="fig-s">or mode rx</text>
+<path d="M38 160 H96" class="fig-thin" marker-end="url(#txg)"/>
+<text x="40" y="178" class="fig-s">en_tx = 1</text>
+<text x="40" y="192" class="fig-s">tx | trx</text>
+<rect x="14" y="20" width="230" height="56" rx="10" class="fig-box fig-soft"/>
+<text x="129" y="44" class="fig-t" text-anchor="middle">DISABLED</text>
+<text x="129" y="62" class="fig-s" text-anchor="middle">no TX streamer, ever</text>
+<rect x="100" y="132" width="130" height="56" rx="10" class="fig-box fig-ok"/>
+<text x="165" y="158" class="fig-t" text-anchor="middle">SAFE</text>
+<text x="165" y="175" class="fig-s" text-anchor="middle">PA off</text>
+<rect x="330" y="132" width="140" height="56" rx="10" class="fig-box fig-ctlbox"/>
+<text x="400" y="158" class="fig-t" text-anchor="middle">ARMED</text>
+<text x="400" y="175" class="fig-s" text-anchor="middle">session, expiry</text>
+<rect x="570" y="132" width="200" height="56" rx="10" class="fig-box fig-tx"/>
+<text x="670" y="158" class="fig-t" text-anchor="middle">TRANSMITTING</text>
+<text x="670" y="175" class="fig-s" text-anchor="middle">one permitted burst</text>
+<path d="M232 148 H326" class="fig-flow" marker-end="url(#txa)"/>
+<text x="279" y="140" class="fig-m" text-anchor="middle">arm · 15 checks</text>
+<path d="M328 174 H234" class="fig-ctl-solid" marker-end="url(#txc)"/>
+<text x="279" y="200" class="fig-s" text-anchor="middle">disarm · expiry</text>
+<text x="279" y="214" class="fig-s" text-anchor="middle">retune · heartbeat</text>
+<path d="M472 148 H566" class="fig-flow" marker-end="url(#txa)"/>
+<text x="519" y="140" class="fig-m" text-anchor="middle">permit</text>
+<path d="M568 174 H474" class="fig-ctl-solid" marker-end="url(#txc)"/>
+<text x="519" y="200" class="fig-s" text-anchor="middle">burst done</text>
+<rect x="330" y="244" width="140" height="56" rx="10" class="fig-box fig-risk"/>
+<text x="400" y="269" class="fig-t" text-anchor="middle">FAULT</text>
+<text x="400" y="286" class="fig-s" text-anchor="middle">latched, RF shut down</text>
+<path d="M400 190 V240" class="fig-risk-line" marker-end="url(#txr)"/>
+<path d="M670 190 V272 H474" class="fig-risk-line" marker-end="url(#txr)"/>
+<path d="M200 190 V258 H326" class="fig-risk-line" marker-end="url(#txr)"/>
+<text x="484" y="262" class="fig-s fig-risk-t">any trip</text>
+<path d="M330 290 H150 V192" class="fig-ctl" marker-end="url(#txc)"/>
+<text x="40" y="306" class="fig-s">operator reset → SAFE, never ARMED</text>
+<text x="570" y="108" class="fig-s">every burst re-checked</text>
+<text x="570" y="122" class="fig-s">on the final buffer</text>
+</svg>

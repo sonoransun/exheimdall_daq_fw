@@ -1,0 +1,51 @@
+<svg class="fig fig-wide has-tall fig-w900" viewBox="0 0 900 410" role="img" aria-labelledby="cl-t cl-d">
+<title id="cl-t">Instances, hosts, the coordinator and the IQ router</title>
+<desc id="cl-d">Host A runs instance 0 on base ports and instance 1 on ports offset by 100 with the inst1_ prefix. Host B runs one instance. A coordinator on port 6000, driven by heimdall-ctl fleet, polls each instance's status port and sends commands to its control port. An IQ router reads each instance's IQ stream and serves one multi-client output on port 7000 to consumers. Channels are coherent within an instance, never across instances.</desc>
+<defs>
+<marker id="cla" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow"/></marker>
+<marker id="clc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-ctl"/></marker>
+</defs>
+<rect x="20" y="24" width="440" height="206" rx="14" class="fig-box fig-dash"/>
+<text x="38" y="48" class="fig-h">HOST A</text>
+<rect x="500" y="24" width="260" height="206" rx="14" class="fig-box fig-dash"/>
+<text x="518" y="48" class="fig-h">HOST B</text>
+<rect x="40" y="66" width="190" height="136" rx="10" class="fig-box fig-hot"/>
+<text x="135" y="92" class="fig-t" text-anchor="middle">instance 0</text>
+<path d="M95 108 h80 M95 116 h80 M95 124 h80 M95 132 h80 M95 140 h80" class="fig-lanes"/>
+<text x="135" y="166" class="fig-s" text-anchor="middle">1130 · 5000–5003</text>
+<text x="135" y="182" class="fig-s" text-anchor="middle">unprefixed names</text>
+<rect x="250" y="66" width="190" height="136" rx="10" class="fig-box fig-hot"/>
+<text x="345" y="92" class="fig-t" text-anchor="middle">instance 1</text>
+<path d="M305 108 h80 M305 116 h80 M305 124 h80 M305 132 h80 M305 140 h80" class="fig-lanes"/>
+<text x="345" y="166" class="fig-s" text-anchor="middle">1230 · 5100–5103</text>
+<text x="345" y="182" class="fig-s" text-anchor="middle">prefix inst1_</text>
+<rect x="535" y="66" width="190" height="136" rx="10" class="fig-box fig-hot"/>
+<text x="630" y="92" class="fig-t" text-anchor="middle">instance 0</text>
+<path d="M590 108 h80 M590 116 h80 M590 124 h80 M590 132 h80 M590 140 h80" class="fig-lanes"/>
+<text x="630" y="166" class="fig-s" text-anchor="middle">1130 · 5000–5003</text>
+<text x="630" y="182" class="fig-s" text-anchor="middle">own receivers, by serial</text>
+<path d="M105 262 V206" class="fig-ctl" marker-end="url(#clc)"/>
+<path d="M315 262 V206" class="fig-ctl" marker-end="url(#clc)"/>
+<path d="M600 262 V206" class="fig-ctl" marker-end="url(#clc)"/>
+<path d="M105 262 H600" class="fig-ctl"/>
+<path d="M300 262 V311" class="fig-ctl"/>
+<path d="M165 204 V286 H660 V307" class="fig-flow" marker-end="url(#cla)"/>
+<path d="M375 204 V286" class="fig-flow"/>
+<path d="M660 204 V286" class="fig-flow"/>
+<text x="418" y="254" class="fig-s">polls :5002 · commands :5001</text>
+<text x="418" y="304" class="fig-m">IQ streams :5000 + N × 100</text>
+<rect x="20" y="315" width="150" height="56" rx="10" class="fig-box fig-soft"/>
+<text x="95" y="339" class="fig-t" text-anchor="middle">heimdall-ctl</text>
+<text x="95" y="356" class="fig-s" text-anchor="middle">fleet · router</text>
+<path d="M172 343 H196" class="fig-ctl" marker-end="url(#clc)"/>
+<rect x="200" y="315" width="200" height="56" rx="10" class="fig-box fig-ctlbox"/>
+<text x="300" y="339" class="fig-t" text-anchor="middle">coordinator</text>
+<text x="300" y="356" class="fig-s" text-anchor="middle">:6000 · lease election</text>
+<rect x="560" y="311" width="200" height="60" rx="10" class="fig-box"/>
+<text x="660" y="337" class="fig-t" text-anchor="middle">IQ router</text>
+<text x="660" y="355" class="fig-s" text-anchor="middle">:7000 out · :7001 stats</text>
+<path d="M762 341 H786" class="fig-flow" marker-end="url(#cla)"/>
+<rect x="790" y="311" width="100" height="60" rx="10" class="fig-box fig-soft"/>
+<text x="840" y="345" class="fig-t" text-anchor="middle">consumers</text>
+<text x="20" y="400" class="fig-s">Channels are phase-coherent within an instance, never across instances.</text>
+</svg>

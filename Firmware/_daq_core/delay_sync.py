@@ -24,9 +24,13 @@
         Mikko Laakso, "Multichannel coherent receiver on the RTL-SDR" 2019
 """
 # Import built-in modules
+import hashlib
 import logging
+import os
+import socket
 import sys
 import time
+import zlib
 from struct import pack
 from time import sleep
 from os.path import join
@@ -57,11 +61,229 @@ except ImportError:
 from iq_header import IQHeader
 from shmemIface import outShmemIface, inShmemIface, TERMINATE
 from transportIface import TransportProducer, TransportConsumer
-from offload_engines import FFTEngine, CorrelationEngine
+from offload_engines import FFTEngine, CorrelationEngine, resolve_workers, DEFAULT_WORKERS
 import inter_module_messages
 from daq_db_records import (CAL_EVENT_CAL_START, CAL_EVENT_SAMPLE_CAL_DONE,
                             CAL_EVENT_IQ_CAL_DONE, CAL_EVENT_TRACK_LOCK,
                             CAL_EVENT_TRACK_LOST, CAL_EVENT_FREQ_CHANGE)
+try:
+    from version import FW_VERSION
+except ImportError:
+    FW_VERSION = None
+
+#: Cal-history event code of a calibration timeout ([calibration]
+#: cal_timeout_frames). daq_db_records defines codes 0-8; the record field is
+#: an unsigned int, so a new code needs no schema change.
+CAL_EVENT_CAL_TIMEOUT = 9
+
+#: FSM states in which a calibration is in progress (sync_state 2-4).
+CALIBRATION_STATES = ("STATE_SAMPLE_CAL", "STATE_SYNC_WAIT", "STATE_FRAC_SAMPLE_CAL",
+                      "STATE_FRAC_SYNC_WAIT", "STATE_IQ_CAL")
+
+#: The hw_controller relay files are polled every this many frames.
+RELAY_POLL_FRAMES = 5
+
+#: File descriptor on which the start scripts hand the instance lock down
+#: (spec B.3.3, [host] instance_registry = 1).
+INSTANCE_LOCK_FD = 9
+INSTANCE_LOCK_REFUSED_EXIT = 3
+
+AMPLITUDE_TOLERANCE_MODES = ("legacy", "symmetric")
+HEALTH_MODES = ("mesh", "hub", "off")
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (module level so tests and the closed-loop model import them)
+# ---------------------------------------------------------------------------
+
+def int_fs_tune_gain(delay, gain_table):
+    """Tune gain of an integer sample delay from the [limits] [gains] table."""
+    return (gain_table[1, (gain_table[0, :] <= abs(delay))])[0]
+
+
+def int_fs_ppm_offsets(delays, gain_table, min_ppm, max_ppm):
+    """Sampling-rate offsets for measured integer sample delays (STATE_SAMPLE_CAL).
+
+    ``fs_ppm[m] = -delays[m] * gain(|delays[m]|) * min_ppm``, clipped to
+    ``+-max_ppm``; computed for every entry of *delays* (a zero delay gives 0).
+    """
+    fs_ppm_offsets = [0] * len(delays)
+    for m in range(len(delays)):
+        fs_tune_gain_m = int_fs_tune_gain(delays[m], gain_table)
+        fs_ppm_offsets[m] = -1 * delays[m] * fs_tune_gain_m * min_ppm
+        if abs(fs_ppm_offsets[m]) > max_ppm:
+            fs_ppm_offsets[m] = np.sign(fs_ppm_offsets[m]) * max_ppm
+    return fs_ppm_offsets
+
+
+def frac_fs_ppm_offsets(taus, channel_list, M, tol, gain, min_ppm):
+    """Sampling-rate offsets for fractional delays (STATE_FRAC_SAMPLE_CAL).
+
+    *taus* are ordered as *channel_list*; channels whose ``|tau| <= tol``
+    (and the reference channel) get 0.
+    """
+    fs_ppm_offsets = [0] * M
+    for i, m in enumerate(channel_list):
+        if abs(taus[i]) > tol:
+            fs_ppm_offsets[m] = np.sign(taus[i]) * np.abs(taus[i] * gain) * min_ppm
+    return fs_ppm_offsets
+
+
+def amplitude_out_of_tolerance(ratios, tol_ratio, tol_db, mode="legacy"):
+    """Amplitude tolerance test of [calibration] amplitude_tolerance_mode.
+
+    legacy    : ``(abs(r) > tol_ratio).any()`` (one-sided, today's test)
+    symmetric : ``(abs(20*log10(abs(r))) > tol_db).any()``
+    """
+    if mode == "symmetric":
+        with np.errstate(divide="ignore"):
+            return bool((np.abs(20 * np.log10(np.abs(ratios))) > tol_db).any())
+    return (abs(ratios) > tol_ratio).any()
+
+
+def _check_inherited_lock(path, fd=INSTANCE_LOCK_FD):
+    """Did this process inherit the instance lock on *fd*? (spec B.3.3)
+
+    ``"ok"`` when *fd* is open on the same file as *path*, ``"missing"`` when
+    *fd* is not open, ``"mismatch"`` when it is open on another file or
+    *path* cannot be stat'ed.
+    """
+    try:
+        fd_stat = os.fstat(fd)
+    except OSError:
+        return "missing"
+    try:
+        path_stat = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return "mismatch"
+    if (fd_stat.st_ino, fd_stat.st_dev) == (path_stat.st_ino, path_stat.st_dev):
+        return "ok"
+    return "mismatch"
+
+
+def enforce_instance_lock(config_filename="daq_chain_config.ini", environ=None,
+                          logger=None, fd=INSTANCE_LOCK_FD):
+    """Defence-in-depth lock check, active only with HEIMDALL_INSTANCE_GUARD=refuse.
+
+    Returns 0 (proceed) or INSTANCE_LOCK_REFUSED_EXIT after logging
+    ``instance <N> started without its instance lock; refusing``. Must run
+    before any shared-memory interface is opened.
+    """
+    if environ is None:
+        environ = os.environ
+    if environ.get("HEIMDALL_INSTANCE_GUARD") != "refuse":
+        return 0
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    lock_path = environ.get("HEIMDALL_INSTANCE_LOCK", "")
+    result = _check_inherited_lock(lock_path, fd) if lock_path else "missing"
+    if result == "ok":
+        return 0
+    parser = ConfigParser()
+    instance_id = 0
+    try:
+        if parser.read([config_filename]):
+            instance_id = parser.getint('federation', 'instance_id', fallback=0)
+    except Exception:
+        pass
+    logger.critical("instance %d started without its instance lock; refusing", instance_id)
+    logger.critical("lock check result: %s (fd %d, HEIMDALL_INSTANCE_LOCK=%r)",
+                    result, fd, lock_path)
+    return INSTANCE_LOCK_REFUSED_EXIT
+
+
+def _parse_core_list(text):
+    """``[host] delay_sync_cores`` ("2,3") -> sorted list of distinct ints."""
+    cores = set()
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        value = int(item)
+        if value < 0:
+            raise ValueError(item)
+        cores.add(value)
+    return sorted(cores)
+
+
+def _local_default_node_id(instance_id):
+    """Fallback for federation_common.default_node_id (same rule)."""
+    try:
+        from federation_common import default_node_id
+        return default_node_id(instance_id)
+    except Exception:
+        host = socket.gethostname().split(".", 1)[0].lower() or "host"
+        return "{}:{}".format(host, int(instance_id))
+
+
+def _strip_state(state):
+    """FSM name on the wire: the state without its ``STATE_`` prefix."""
+    return state[6:] if state.startswith("STATE_") else state
+
+
+class _OptionReader(object):
+    """Defensive reader for the opt-in keys: a missing key gives its default
+    (today's behaviour); a malformed one gives the default and one WARNING."""
+
+    def __init__(self, parser, logger):
+        self.parser = parser
+        self.logger = logger
+
+    def has(self, section, key):
+        return self.parser.has_option(section, key)
+
+    def raw(self, section, key, default=""):
+        if not self.parser.has_option(section, key):
+            return default
+        return self.parser.get(section, key).strip()
+
+    def _bad(self, section, key, value, default, expected):
+        self.logger.warning("[%s] %s = %r is invalid (expected %s); using %r",
+                            section, key, value, expected, default)
+        return default
+
+    def int(self, section, key, default, minimum=None, maximum=None):
+        if not self.parser.has_option(section, key):
+            return default
+        value = self.parser.get(section, key).strip()
+        try:
+            n = int(value)
+        except ValueError:
+            return self._bad(section, key, value, default, "an integer")
+        if (minimum is not None and n < minimum) or (maximum is not None and n > maximum):
+            return self._bad(section, key, value, default,
+                             "an integer in [{}, {}]".format(minimum, maximum))
+        return n
+
+    def float(self, section, key, default, minimum=None, maximum=None):
+        if not self.parser.has_option(section, key):
+            return default
+        value = self.parser.get(section, key).strip()
+        try:
+            x = float(value)
+        except ValueError:
+            return self._bad(section, key, value, default, "a number")
+        if x != x or (minimum is not None and x < minimum) or (maximum is not None and x > maximum):
+            return self._bad(section, key, value, default,
+                             "a number in [{}, {}]".format(minimum, maximum))
+        return x
+
+    def flag(self, section, key, default=False):
+        if not self.parser.has_option(section, key):
+            return default
+        value = self.parser.get(section, key).strip()
+        if value in ("0", "1"):
+            return value == "1"
+        return self._bad(section, key, value, default, "0 or 1")
+
+    def choice(self, section, key, default, choices):
+        if not self.parser.has_option(section, key):
+            return default
+        value = self.parser.get(section, key).strip().lower()
+        if value in choices:
+            return value
+        return self._bad(section, key, value, default, " | ".join(choices))
+
 
 class delaySynchronizer():
     
@@ -176,6 +398,10 @@ class delaySynchronizer():
         self.transport_type = 'shm'
         self.fft_engine_type = 'cpu_scipy'
 
+        # Opt-in extensions (status, relays, federation, stamping, levers);
+        # every default reproduces the behaviour without the new keys
+        self._init_extension_state()
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
 
@@ -184,8 +410,14 @@ class delaySynchronizer():
         float_formatter = "{:.2f}".format
         np.set_printoptions(formatter={'float_kind':float_formatter})
 
-        # Initialize compute engines
-        self.fft_engine = FFTEngine(engine_type=self.fft_engine_type)
+        # Initialize compute engines ([offload] fft_workers / xcorr_workers;
+        # both default to the engines' own default of 4 workers)
+        self.fft_engine = FFTEngine(engine_type=self.fft_engine_type, workers=self.fft_workers)
+        if self.xcorr_workers == self.fft_workers:
+            self.xcorr_engine = self.fft_engine
+        else:
+            self.xcorr_engine = FFTEngine(engine_type=self.fft_engine_type,
+                                          workers=self.xcorr_workers)
         self.logger.info("FFT engine: {:s}".format(self.fft_engine_type))
 
         self.iq_header = IQHeader()
@@ -210,7 +442,173 @@ class delaySynchronizer():
         self.iq_diff_ref = np.ones(self.M, dtype=np.complex64) # Reference IQ difference vector used in the tracking mode
         
         self.logger.info("Delay synchronizer initialized")
-    
+
+    def _init_extension_state(self):
+        """Defaults of every opt-in extension (design spec B.3.3, C.3, E.4,
+        G.1-G.7, I.4, I.8). Each default is the behaviour without the key."""
+        self.config_sha256 = None
+        self.ini_version = None
+        self.sample_rate = 0
+        self.amp_diff_tolerance_db = 20 * np.log10(self.amp_diff_tolerance)
+
+        # [federation] identity
+        self.node_id = None
+        self.cluster_id = "default"
+        self.advertise_host = ""
+        self._node_id_crc32 = 0
+        self._stamp_node_id = False
+
+        # [monitoring] extensions
+        self._status_extended = False
+        self._status_update_interval = 0
+        self._status_counter = 0
+        self._last_status_key = None
+        self._stale_after_sec = 0.0
+        self._en_hwc_state_relay = False
+        self._event_tag_identity = False
+        self._event_topic_prefix = False
+        self._stamp_cal_telemetry = False
+        self._stamp_decimator_drops = False
+
+        # [calibration] extensions
+        self._en_wire_recal = False
+        self._track_decimation = 1
+        self._track_check_counter = 0
+        self._track_last_flags = (True, True)
+        self.amplitude_tolerance_mode = "legacy"
+        self._cal_timeout_frames = 0
+        self._cal_timeout_count = 0
+        self._invalidate_on_overrun = False
+        self._frames_after_overrun = 1
+        self._overrun_invalidate_left = 0
+        self._overrun_invalidated_frames = 0
+
+        # [offload] throughput levers
+        self.fft_workers = DEFAULT_WORKERS
+        self.xcorr_workers = DEFAULT_WORKERS
+        self._skip_copy_on_drop = False
+        self.xcorr_engine = None
+
+        # Input-header continuity (extended STATUS, overrun invalidation)
+        self._track_continuity = False
+        self._prev_cpi_index = None
+        self._prev_daq_block_index = None
+        self._prev_overrun_cnt = None
+        self._overrun_increased = False
+        self._cpi_gaps = 0
+        self._daq_block_gaps = 0
+        self._last_sync_state = 0
+        self._iq_samples = None
+
+        # hw_controller relays (G.3, G.5)
+        self._hwc_watcher = None
+        self._hwc_doc = None
+        self._recal_watcher = None
+        self._recal_generation = 0
+        self._relay_counter = 0
+
+        # Federation wiring (C.3)
+        self._fed_info = None
+        self._fed_members = []
+        self._register_meta = None
+        self._process_start_ms = int(time.time() * 1000)
+
+    def _read_extension_config(self, reader, config_filename):
+        """Parse the opt-in keys. Missing keys keep the defaults set by
+        _init_extension_state(); malformed values fall back with a WARNING."""
+        try:
+            with open(config_filename, "rb") as f:
+                self.config_sha256 = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            self.config_sha256 = None
+        version = reader.raw('meta', 'ini_version', None)
+        if version is not None:
+            self.ini_version = int(version) if version.isdigit() else version
+        self.sample_rate = reader.int('daq', 'sample_rate', 0, minimum=0)
+
+        # Identity ([federation]): node_id defaults to <short host>:<N>
+        node_id = reader.raw('federation', 'node_id', "")
+        self.node_id = node_id if node_id else _local_default_node_id(self.instance_id)
+        self.cluster_id = reader.raw('federation', 'cluster_id', "") or "default"
+        self.advertise_host = reader.raw('federation', 'advertise_host', "")
+        self._stamp_node_id = reader.flag('federation', 'stamp_node_id')
+        self._node_id_crc32 = zlib.crc32(self.node_id.encode()) & 0xFFFFFFFF
+
+        # [monitoring]
+        self._status_extended = reader.flag('monitoring', 'status_extended')
+        self._status_update_interval = reader.int('monitoring', 'status_update_interval', 0,
+                                                  minimum=0)
+        self._stale_after_sec = reader.float('monitoring', 'stale_after_sec', 0.0, minimum=0.0)
+        self._en_hwc_state_relay = reader.flag('monitoring', 'en_hwc_state_relay')
+        self._event_tag_identity = reader.flag('monitoring', 'event_tag_identity')
+        self._event_topic_prefix = reader.flag('monitoring', 'event_topic_prefix')
+        self._stamp_cal_telemetry = reader.flag('monitoring', 'stamp_cal_telemetry')
+        self._stamp_decimator_drops = reader.flag('monitoring', 'stamp_decimator_drops')
+
+        # [calibration]
+        self._en_wire_recal = reader.flag('calibration', 'en_wire_recal')
+        self._track_decimation = reader.int('calibration', 'track_decimation', 1, minimum=1)
+        self.amplitude_tolerance_mode = reader.choice('calibration', 'amplitude_tolerance_mode',
+                                                      "legacy", AMPLITUDE_TOLERANCE_MODES)
+        self._cal_timeout_frames = reader.int('calibration', 'cal_timeout_frames', 0, minimum=0)
+        self._invalidate_on_overrun = reader.flag('calibration', 'invalidate_on_overrun')
+        self._frames_after_overrun = reader.int('calibration', 'frames_after_overrun', 1,
+                                                minimum=0)
+
+        # [offload] throughput levers; [host] delay_sync_cores feeds "auto"
+        cores = None
+        cores_text = reader.raw('host', 'delay_sync_cores', "")
+        if cores_text:
+            try:
+                cores = _parse_core_list(cores_text)
+            except ValueError:
+                reader._bad('host', 'delay_sync_cores', cores_text, "", "comma-separated core ids")
+        for key in ('fft_workers', 'xcorr_workers'):
+            value = reader.raw('offload', key, None)
+            try:
+                workers = resolve_workers(value, cores)
+            except ValueError:
+                workers = reader._bad('offload', key, value, DEFAULT_WORKERS,
+                                      "an integer >= 1 or auto")
+            setattr(self, key, workers)
+        self._skip_copy_on_drop = reader.flag('offload', 'skip_copy_on_drop')
+
+        self._track_continuity = self._status_extended or self._invalidate_on_overrun
+        if self._status_extended:
+            self.logger.info("Extended STATUS enabled (status_protocol 2)")
+
+        # hw_controller relays: baseline at start, never replay a leftover file
+        prefix = "" if self.instance_id == 0 else "inst{:d}_".format(self.instance_id)
+        if self._en_hwc_state_relay or self._en_wire_recal:
+            try:
+                import hwc_relay
+            except ImportError as e:
+                self.logger.error("hw_controller relays unavailable (hwc_relay: %s)", e)
+            else:
+                if self._en_hwc_state_relay:
+                    self._hwc_watcher = hwc_relay.HwcStateWatcher(hwc_relay.hwc_state_path(prefix))
+                    self._hwc_doc = hwc_relay.read_hwc_state(self._hwc_watcher.path)
+                if self._en_wire_recal:
+                    self._recal_watcher = hwc_relay.RecalWatcher(
+                        hwc_relay.recal_request_path(prefix))
+
+    @property
+    def frame_period_sec(self):
+        """``cpi_size * decimation_ratio / sample_rate`` [s], None when unknown."""
+        if self.sample_rate <= 0:
+            return None
+        return self.N * self.R / float(self.sample_rate)
+
+    def _event_source(self):
+        """EventBus identity tag ([monitoring] event_tag_identity = 1)."""
+        try:
+            from federation_common import self_host
+            host = self_host(self.advertise_host or None)
+        except Exception:
+            host = socket.gethostname().split(".", 1)[0].lower()
+        return {"instance_id": self.instance_id, "node_id": self.node_id,
+                "host": host, "cluster_id": self.cluster_id}
+
     def _read_config_file(self, config_filename):
         """
             Configures the internal parameters of the processing module based 
@@ -253,7 +651,9 @@ class delaySynchronizer():
         # (status server, ZMQ event PUB). Default: all interfaces.
         self.listen_address = parser.get('daq', 'listen_address', fallback='0.0.0.0').strip() or '0.0.0.0'
 
-        # Convert to voltage ratio
+        # Convert to voltage ratio (the dB value is kept for the symmetric
+        # amplitude tolerance test, [calibration] amplitude_tolerance_mode)
+        self.amp_diff_tolerance_db = self.amp_diff_tolerance
         self.amp_diff_tolerance = 10**(self.amp_diff_tolerance/20)
         
         # External IQ calibration adjustment
@@ -298,7 +698,7 @@ class delaySynchronizer():
             if self._en_db:
                 try:
                     from daq_db import DAQDatabase
-                    self.db = DAQDatabase(
+                    db_kwargs = dict(
                         db_dir=parser.get('database', 'db_dir', fallback='_db'),
                         max_db_size_mb=parser.getint('database', 'max_db_size_mb', fallback=500),
                         rotation_max_age_hours=parser.getint('database', 'rotation_max_age_hours', fallback=168),
@@ -306,17 +706,30 @@ class delaySynchronizer():
                         write_flush_interval_sec=parser.getfloat('database', 'write_flush_interval_sec', fallback=1.0),
                         num_channels=self.M
                     )
+                    # Instance awareness (spec B.2); the defaults keep db_dir
+                    # verbatim. An older DAQDatabase without these keywords
+                    # is constructed exactly as before.
+                    db_reader = _OptionReader(parser, self.logger)
+                    instance_kwargs = dict(
+                        instance_id=parser.getint('federation', 'instance_id', fallback=0),
+                        instance_subdir=db_reader.flag('database', 'instance_subdir'),
+                        write_meta=db_reader.flag('database', 'write_instance_meta'))
+                    node_id_cfg = parser.get('federation', 'node_id', fallback='').strip()
+                    if node_id_cfg:
+                        instance_kwargs["node_id"] = node_id_cfg
+                    try:
+                        self.db = DAQDatabase(**db_kwargs, **instance_kwargs)
+                    except TypeError:
+                        self.db = DAQDatabase(**db_kwargs)
                     self.logger.info("DAQ database enabled")
                 except Exception as e:
                     self.logger.error("Failed to initialize DAQ database: {:s}".format(str(e)))
                     self.db = None
 
         # Federation configuration (read early so instance_id is available for port offsets).
-        # The peer list is only collected here - the FederationHealth monitor is
-        # constructed AFTER the [monitoring] section below, so it receives the
-        # event bus (previously it was always handed event_bus=None because the
-        # bus did not exist yet) and the configured status base port.
-        federation_peers = []
+        # The FederationHealth monitor is constructed AFTER the [monitoring]
+        # section below (_build_federation), so it receives the event bus and
+        # the configured status base port.
         if parser.has_section('federation'):
             self.instance_id = parser.getint('federation', 'instance_id', fallback=0)
             self.port_stride = parser.getint('federation', 'port_stride', fallback=100)
@@ -324,10 +737,9 @@ class delaySynchronizer():
                 self.logger.info("Federation instance_id={:d}, port_stride={:d}".format(
                     self.instance_id, self.port_stride))
 
-            en_federation = parser.getint('federation', 'en_federation', fallback=0) == 1
-            if en_federation:
-                peer_list_str = parser.get('federation', 'peer_list', fallback='')
-                federation_peers = [p.strip() for p in peer_list_str.split(',') if p.strip()]
+        # Opt-in extension keys (identity, extended status, relays, stamping,
+        # calibration robustness, throughput levers)
+        self._read_extension_config(_OptionReader(parser, self.logger), config_filename)
 
         # Monitoring configuration
         if parser.has_section('monitoring'):
@@ -336,7 +748,11 @@ class delaySynchronizer():
                 try:
                     from daq_events import (EventBus, LoggingHandler, SysLogEventHandler, ZMQPubHandler)
                     ring_size = parser.getint('monitoring', 'event_ring_size', fallback=500)
-                    self.event_bus = EventBus(enabled=True, ring_size=ring_size)
+                    if self._event_tag_identity:
+                        self.event_bus = EventBus(enabled=True, ring_size=ring_size,
+                                                  source=self._event_source())
+                    else:
+                        self.event_bus = EventBus(enabled=True, ring_size=ring_size)
                     self.event_bus.register_handler(LoggingHandler())
 
                     if parser.getint('monitoring', 'en_syslog', fallback=0) == 1:
@@ -350,8 +766,13 @@ class delaySynchronizer():
                     if parser.getint('monitoring', 'en_zmq_pub', fallback=0) == 1:
                         zmq_port = parser.getint('monitoring', 'zmq_pub_port', fallback=5003)
                         zmq_port += self.instance_id * self.port_stride
-                        self.event_bus.register_handler(
-                            ZMQPubHandler(port=zmq_port, listen_address=self.listen_address))
+                        if self._event_topic_prefix:
+                            self.event_bus.register_handler(
+                                ZMQPubHandler(port=zmq_port, listen_address=self.listen_address,
+                                              topic_prefix="inst{:d}.".format(self.instance_id)))
+                        else:
+                            self.event_bus.register_handler(
+                                ZMQPubHandler(port=zmq_port, listen_address=self.listen_address))
 
                     self.logger.info("Event bus enabled")
                 except Exception as e:
@@ -377,7 +798,7 @@ class delaySynchronizer():
                     from daq_status_server import StatusServer
                     port = parser.getint('monitoring', 'status_server_port', fallback=5002)
                     port += self.instance_id * self.port_stride
-                    self.status_server = StatusServer(
+                    status_kwargs = dict(
                         port=port, metrics=self.metrics,
                         event_bus=self.event_bus,
                         db=self.db,
@@ -385,6 +806,19 @@ class delaySynchronizer():
                         listen_address=self.listen_address,
                         drop_window_sec=parser.getfloat('monitoring', 'drop_window_sec',
                                                         fallback=60.0))
+                    if self._status_extended:
+                        # Extended grammar and freshness (spec G.1, G.2, G.7)
+                        status_kwargs.update(
+                            extended=True,
+                            stale_after_sec=self._stale_after_sec,
+                            frame_period_sec=self.frame_period_sec,
+                            update_interval_frames=self._effective_status_interval(),
+                            max_clients=_OptionReader(parser, self.logger).int(
+                                'monitoring', 'status_max_clients', StatusServer.MAX_CLIENTS,
+                                minimum=1, maximum=1024),
+                            hwc_provider=self._hwc_status if self._en_hwc_state_relay else None,
+                            federation_provider=self._federation_status)
+                    self.status_server = StatusServer(**status_kwargs)
                     self.logger.info("Status server configured on port {:d}".format(port))
                 except Exception as e:
                     self.logger.error("Failed to initialize status server: {:s}".format(str(e)))
@@ -397,23 +831,7 @@ class delaySynchronizer():
 
         # Deferred federation health monitor construction (see the [federation]
         # block above): by now the event bus and the monitoring config exist.
-        if federation_peers:
-            try:
-                from federation_health import FederationHealth
-                status_base_port = parser.getint('monitoring', 'status_server_port',
-                                                 fallback=5002)
-                self.federation_health = FederationHealth(
-                    instance_id=self.instance_id,
-                    peer_addresses=federation_peers,
-                    event_bus=self.event_bus,
-                    status_base_port=status_base_port,
-                    port_stride=self.port_stride
-                )
-                self.logger.info("Federation health monitor configured with {:d} peers".format(
-                    len(federation_peers)))
-            except Exception as e:
-                self.logger.error("Failed to initialize federation health: {:s}".format(str(e)))
-                self.federation_health = None
+        self.federation_health = self._build_federation(parser, self.event_bus)
 
         # Offload / transport configuration
         if parser.has_section('offload'):
@@ -450,6 +868,485 @@ class delaySynchronizer():
             self.logger.info("RF front-end / orientation telemetry stamping enabled (v8 header)")
 
         return 0
+
+    # ------------------------------------------------------------------
+    # Federation wiring (spec C.2, C.3, C.5)
+    # ------------------------------------------------------------------
+
+    def _build_federation(self, parser, bus):
+        """FederationHealth construction gate and wiring.
+
+        Constructed iff ``en_federation = 1`` and (``peer_list`` or
+        ``cluster_members`` non-empty or ``register_with_coordinator = 1``).
+        With only ``peer_list`` and none of the new keys the constructor call
+        is the pre-extension one. New keyword arguments are passed only when
+        their keys are present; an older FederationHealth that rejects them
+        (TypeError) is constructed the old way and coordinator registration
+        is reported unavailable. Returns the monitor (not started) or None.
+        """
+        self._fed_info = None
+        self._fed_members = []
+        if not parser.has_section('federation'):
+            return None
+        if parser.getint('federation', 'en_federation', fallback=0) != 1:
+            return None
+        reader = _OptionReader(parser, self.logger)
+        peer_list_str = parser.get('federation', 'peer_list', fallback='')
+        federation_peers = [p.strip() for p in peer_list_str.split(',') if p.strip()]
+        members_str = reader.raw('federation', 'cluster_members', "")
+        register_on = reader.flag('federation', 'register_with_coordinator')
+        if not (federation_peers or members_str or register_on):
+            return None
+
+        status_base_port = parser.getint('monitoring', 'status_server_port', fallback=5002)
+        health_mode = reader.choice('federation', 'health_mode', "mesh", HEALTH_MODES)
+
+        # Instance-side mesh peers: peer_list (legacy form, today's meaning)
+        # when non-empty, else cluster_members minus the self entry
+        members = None
+        if not federation_peers and members_str:
+            members = self._mesh_members(members_str, status_base_port)
+            self._fed_members = members
+
+        legacy_kwargs = {}
+        if reader.has('federation', 'health_poll_interval'):
+            legacy_kwargs["poll_interval"] = reader.float('federation', 'health_poll_interval',
+                                                          5.0, 0.2, 300.0)
+        new_kwargs = {}
+        for key, kwarg, kind, default, lo, hi in (
+                ('peer_timeout', 'peer_timeout', float, 2.0, 0.1, 30.0),
+                ('peer_up_successes', 'up_successes', int, 1, 1, 10),
+                ('peer_down_misses', 'down_misses', int, None, 1, 20),
+                ('peer_flap_window_sec', 'flap_window_sec', float, 0.0, 0.0, None),
+                ('peer_flap_threshold', 'flap_threshold', int, 0, 0, None),
+                ('health_workers', 'max_workers', int, 1, 1, 64)):
+            if reader.has('federation', key):
+                read = reader.float if kind is float else reader.int
+                value = read('federation', key, default, lo, hi)
+                if value is not None:
+                    new_kwargs[kwarg] = value
+        if reader.has('federation', 'emit_peer_health_events'):
+            new_kwargs["emit_health_events"] = reader.flag('federation', 'emit_peer_health_events')
+        if reader.has('federation', 'node_id'):
+            new_kwargs["node_id"] = self.node_id
+        if reader.has('federation', 'cluster_id'):
+            new_kwargs["cluster_id"] = self.cluster_id
+        auth_token = reader.raw('federation', 'auth_token', "")
+        if auth_token:
+            new_kwargs["auth_token"] = auth_token
+        if reader.has('host', 'health_thread_sched_other'):
+            new_kwargs["sched_other"] = reader.flag('host', 'health_thread_sched_other')
+
+        if health_mode == "mesh":
+            peer_addresses = federation_peers
+            if members is not None:
+                new_kwargs["members"] = members
+        else:
+            # hub: the peer table comes from the REGISTER ack; off: no polling
+            peer_addresses = []
+        register = self._register_config(reader, status_base_port, health_mode) if register_on else None
+        if register is not None:
+            new_kwargs["register"] = register
+
+        try:
+            from federation_health import FederationHealth
+        except ImportError as e:
+            self.logger.error("Failed to initialize federation health: {:s}".format(str(e)))
+            return None
+        base_kwargs = dict(instance_id=self.instance_id, peer_addresses=peer_addresses,
+                           event_bus=bus, status_base_port=status_base_port,
+                           port_stride=self.port_stride, **legacy_kwargs)
+        try:
+            if new_kwargs:
+                try:
+                    fh = FederationHealth(**base_kwargs, **new_kwargs)
+                except TypeError as e:
+                    self.logger.warning(
+                        "FederationHealth does not accept the configured [federation] options "
+                        "(%s); using the legacy constructor%s", e,
+                        "; coordinator registration is unavailable" if register else "")
+                    if "members" in new_kwargs:
+                        base_kwargs["peer_addresses"] = [
+                            "{}:{}".format("[{}]".format(m["host"]) if ":" in m["host"] else m["host"],
+                                           m["instance_id"]) for m in members]
+                    fh = FederationHealth(**base_kwargs)
+                    register = None
+            else:
+                fh = FederationHealth(**base_kwargs)
+        except Exception as e:
+            self.logger.error("Failed to initialize federation health: {:s}".format(str(e)))
+            return None
+        polled = len(members) if (members is not None and health_mode == "mesh") else len(peer_addresses)
+        self.logger.info("Federation health monitor configured with {:d} peers".format(polled))
+
+        endpoint = None
+        if register is not None:
+            endpoint = "{}:{}".format(*register["endpoints"][0])
+        else:
+            host = reader.raw('federation', 'coordinator_host', "")
+            if host:
+                endpoint = "{}:{}".format(host, reader.int('federation', 'coordinator_port',
+                                                           6000, 1, 65535))
+        self._fed_info = {"health_mode": health_mode,
+                          "members_from": "cluster_members" if members is not None else
+                                          ("peer_list" if federation_peers else None),
+                          "registering": register is not None,
+                          "endpoint": endpoint}
+        return fh
+
+    def _mesh_members(self, members_str, status_base_port):
+        """``cluster_members`` minus this instance's self entry (spec C.2).
+
+        The self entry has ``instance_id == N`` and a host that is local or
+        equals ``self_host(advertise_host)``. When no entry matches, every
+        entry is polled (and a warning is logged).
+        """
+        try:
+            from federation_common import parse_member_list, is_local_host, self_host
+            parsed = parse_member_list(members_str, default_stride=self.port_stride,
+                                       status_base_port=status_base_port)
+        except (ImportError, ValueError) as e:
+            self.logger.error("[federation] cluster_members is unusable: %s", e)
+            return []
+        try:
+            own_host = self_host(self.advertise_host or None)
+        except ValueError:
+            own_host = None
+
+        def is_self(member):
+            if member["instance_id"] != self.instance_id:
+                return False
+            host = member["host"].lower()
+            return host == own_host or is_local_host(host)
+
+        if not any(is_self(m) for m in parsed):
+            self.logger.warning("cluster_members does not contain this instance (expected "
+                                "%s:%d); polling every entry", own_host, self.instance_id)
+            return parsed
+        return [m for m in parsed if not is_self(m)]
+
+    def _register_config(self, reader, status_base_port, health_mode):
+        """The FederationHealth ``register=`` dict (spec C.3), or None."""
+        endpoints = []
+        for item in reader.raw('federation', 'coordinator_candidates', "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            host, _, port = item.rpartition(":")
+            try:
+                port = int(port)
+                if not host or not 1 <= port <= 65535:
+                    raise ValueError(item)
+            except ValueError:
+                self.logger.warning("[federation] coordinator_candidates entry %r ignored "
+                                    "(expected host:port)", item)
+                continue
+            endpoints.append((host.strip("[]"), port))
+        if not endpoints:
+            host = reader.raw('federation', 'coordinator_host', "")
+            if host:
+                endpoints.append((host, reader.int('federation', 'coordinator_port',
+                                                   6000, 1, 65535)))
+        if not endpoints:
+            self.logger.error("register_with_coordinator = 1 but no coordinator endpoint is "
+                              "configured (coordinator_candidates or coordinator_host); "
+                              "registration disabled")
+            return None
+        self._register_meta = {
+            "status_base_port": status_base_port,
+            "zmq_pub_port": reader.int('monitoring', 'zmq_pub_port', 5003, 1, 65535),
+            "want_peers": health_mode == "hub",
+        }
+        return {"endpoints": endpoints,
+                "interval": reader.float('federation', 'register_interval_sec', 5.0, 0.5, 300.0),
+                "body_fn": self._register_body,
+                "want_peers": health_mode == "hub"}
+
+    def _register_body(self):
+        """REGISTER body (spec C.3); called by the registrar thread."""
+        from federation_common import compute_ports, node_key, self_host
+        meta = self._register_meta
+        host = self_host(self.advertise_host or None)
+        ports = compute_ports(self.instance_id, self.port_stride, meta["status_base_port"])
+        ports["events"] = meta["zmq_pub_port"] + self.instance_id * self.port_stride
+        health = None
+        if self.status_server is not None:
+            health = self.status_server.get_pipeline_health()
+        return {"node_key": node_key(host, self.instance_id),
+                "node_id": self.node_id,
+                "cluster_id": self.cluster_id,
+                "instance_id": self.instance_id,
+                "advertise_host": host,
+                "port_stride": self.port_stride,
+                "ports": ports,
+                "nonce": "{}-{}-{}".format(os.getpid(), self._process_start_ms,
+                                           (self.config_sha256 or "")[:12]),
+                "fw_version": FW_VERSION,
+                "config_sha256": self.config_sha256,
+                "health": health,
+                "want_peers": meta["want_peers"]}
+
+    def _federation_status(self):
+        """STATUS ``federation`` block / PEERS source (None without FederationHealth)."""
+        fh = self.federation_health
+        if fh is None:
+            return None
+        info = self._fed_info or {}
+        coordinator = {"endpoint": info.get("endpoint"), "role": None, "term": None,
+                       "registered": False, "last_register_ok_age_sec": None,
+                       "last_error": None}
+        status_fn = getattr(fh, "get_coordinator_status", None)
+        if info.get("registering") and callable(status_fn):
+            reg = status_fn()
+            if isinstance(reg, dict):
+                coordinator.update({k: reg[k] for k in coordinator if k in reg})
+                if "endpoints" in reg:
+                    coordinator["endpoints"] = reg["endpoints"]
+        leader = fh.get_coordinator_id()
+        block = {"instance_id": self.instance_id,
+                 "node_id": self.node_id,
+                 "cluster_id": self.cluster_id,
+                 "health_mode": info.get("health_mode", "mesh"),
+                 "coordinator": coordinator,
+                 "advisory_leader": leader,
+                 "peers": fh.get_peer_table()}
+        if info.get("members_from") == "cluster_members":
+            block["advisory_leader_node_key"] = self._leader_node_key(leader)
+        return block
+
+    def _leader_node_key(self, leader):
+        """Node key of the advisory leader when membership is cluster_members."""
+        if leader == self.instance_id:
+            try:
+                from federation_common import node_key, self_host
+                return node_key(self_host(self.advertise_host or None), self.instance_id)
+            except (ImportError, ValueError):
+                return None
+        matches = [m["node_key"] for m in self._fed_members if m["instance_id"] == leader]
+        return matches[0] if len(matches) == 1 else None
+
+    # ------------------------------------------------------------------
+    # hw_controller relays (spec G.3, G.5)
+    # ------------------------------------------------------------------
+
+    def _tick_relays(self):
+        """Poll the relay files every RELAY_POLL_FRAMES frames."""
+        self._relay_counter += 1
+        if self._relay_counter >= RELAY_POLL_FRAMES:
+            self._relay_counter = 0
+            self._poll_relays()
+
+    def _poll_relays(self):
+        """Read the hwc_state document (re-emitting new hw_controller events
+        on this bus, deduped by (epoch, seq)) and act on a new recal request."""
+        if self._hwc_watcher is not None:
+            doc, events = self._hwc_watcher.poll()
+            self._hwc_doc = doc
+            if events and self.event_bus is not None:
+                self._reemit_hwc_events(events)
+        if self._recal_watcher is not None:
+            request = self._recal_watcher.poll()
+            if request is not None:
+                self._apply_wire_recal(request)
+
+    def _reemit_hwc_events(self, events):
+        from daq_events import DAQEvent
+        for ev in events:
+            payload = ev.get("payload")
+            payload = dict(payload) if isinstance(payload, dict) else {"value": payload}
+            payload["relayed"] = True
+            try:
+                timestamp = float(ev.get("timestamp") or 0.0)
+            except (TypeError, ValueError):
+                timestamp = 0.0
+            self.event_bus.emit(DAQEvent(timestamp=timestamp,
+                                         severity=str(ev.get("severity") or "info"),
+                                         module=str(ev.get("module") or "hw_controller"),
+                                         event_type=str(ev.get("event_type") or ""),
+                                         payload=payload))
+
+    def _apply_wire_recal(self, request):
+        """RECL from the wire: restart the calibration from STATE_INIT."""
+        epoch, gen, _ts_ms, reason = request
+        self.logger.info("Recalibration request (%s, epoch %s, generation %d): "
+                         "re-entering STATE_INIT", reason, epoch, gen)
+        self.current_state = "STATE_INIT"
+        self.sync_failed_cntr = 0
+        self._cal_timeout_count = 0
+        self._recal_generation = gen
+        if self.event_bus is not None:
+            from daq_events import DAQEvent, EVT_CAL_START
+            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                                         event_type=EVT_CAL_START,
+                                         payload={"reason": reason, "generation": gen}))
+        if self.db is not None:
+            self.db.put_cal_event(CAL_EVENT_CAL_START, self.iq_header,
+                                  sync_state_before=self._last_sync_state, sync_state_after=1)
+
+    def _hwc_status(self):
+        """hwc provider of the status server: ``(view, error)``."""
+        doc = self._hwc_doc
+        if doc is None:
+            return None, "hwc state unreadable (missing or torn {})".format(
+                self._hwc_watcher.path if self._hwc_watcher is not None else "file")
+        import hwc_relay
+        return hwc_relay.hwc_status_view(doc), None
+
+    # ------------------------------------------------------------------
+    # Extended STATUS (spec G.1, G.2)
+    # ------------------------------------------------------------------
+
+    def _effective_status_interval(self):
+        """k_eff: frames between snapshot refreshes."""
+        if self._status_update_interval > 0:
+            return self._status_update_interval
+        return self._heartbeat_interval
+
+    def _update_continuity(self, header):
+        """Continuity counters over consecutive input headers and the
+        slot-102 overrun detection of [calibration] invalidate_on_overrun."""
+        cpi = header.cpi_index
+        block = header.daq_block_index
+        overruns = header.get_buffer_overrun_cnt()
+        if self._prev_cpi_index is not None and cpi != self._prev_cpi_index + 1:
+            self._cpi_gaps += 1
+        if self._prev_daq_block_index is not None and block < self._prev_daq_block_index:
+            self._daq_block_gaps += 1
+        self._overrun_increased = (self._prev_overrun_cnt is not None
+                                   and overruns > self._prev_overrun_cnt)
+        self._prev_cpi_index = cpi
+        self._prev_daq_block_index = block
+        self._prev_overrun_cnt = overruns
+        if self._invalidate_on_overrun and self._overrun_increased:
+            self._overrun_invalidate_left = 1 + self._frames_after_overrun
+
+    def _extended_counters(self):
+        counters = {"buffer_overrun_cnt": self.iq_header.get_buffer_overrun_cnt(),
+                    "cpi_gaps": self._cpi_gaps,
+                    "daq_block_gaps": self._daq_block_gaps,
+                    "overrun_invalidated_frames": self._overrun_invalidated_frames}
+        if self._stamp_decimator_drops:
+            counters["decimator_drops"] = self.iq_header.get_decimator_drop_cnt()
+        if self._hwc_watcher is not None:
+            counters["hwc_relay_errors"] = self._hwc_watcher.errors
+        return counters
+
+    def _build_extended_status(self):
+        """Additive top-level STATUS keys of status_extended = 1."""
+        header = self.iq_header
+        period = self.frame_period_sec
+        quality = self._cal_quality
+        return {
+            "node_id": self.node_id,
+            "cluster_id": self.cluster_id,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "fw_version": FW_VERSION,
+            "ini_version": self.ini_version,
+            "config_sha256": self.config_sha256,
+            "num_channels": self.M,
+            "sampling_freq_hz": self.sample_rate,
+            "cpi_length": self.N,
+            "decimation_ratio": self.R,
+            "frame_period_sec": None if period is None else round(period, 6),
+            "frame_type": header.frame_type,
+            "cpi_index": header.cpi_index,
+            "last_frame_ts_ms": header.time_stamp,
+            "fsm_state": _strip_state(self.current_state),
+            "cal": {"quality_db": round(quality, 3) if np.isfinite(quality) else None,
+                    "iq_compensations": self.iq_compensation_cntr,
+                    "sample_compensations": self.sample_compensation_cntr,
+                    "track_mode": self.cal_track_mode,
+                    "recal_generation": self._recal_generation},
+        }
+
+    # ------------------------------------------------------------------
+    # Per-frame helpers of the FSM / outbound header
+    # ------------------------------------------------------------------
+
+    def _compute_corr_functions(self, iq_samples):
+        """|IFFT(conj(X) Y)|^2 of every channel against the reference
+        (STATE_SAMPLE_CAL), on the xcorr FFT engine, into self.corr_functions."""
+        engine = self.xcorr_engine if self.xcorr_engine is not None else self.fft_engine
+        np_zeros = np.zeros(self.N_proc, dtype=np.complex64)
+        x_padd = np.concatenate([iq_samples[self.std_ch_ind, 0:self.N_proc], np_zeros])
+        x_fft = engine.forward(x_padd, overwrite_x=True)
+
+        for m in self.channel_list:
+            y_padd = np.concatenate([np_zeros, iq_samples[m, 0:self.N_proc]])
+            y_fft = engine.forward(y_padd, overwrite_x=True)
+            self.corr_functions[m,:] = np.abs(engine.inverse(x_fft.conj() * y_fft, overwrite_x=True))**2
+
+    def _amplitude_out_of_tolerance(self, ratios):
+        return amplitude_out_of_tolerance(ratios, self.amp_diff_tolerance,
+                                          self.amp_diff_tolerance_db,
+                                          self.amplitude_tolerance_mode)
+
+    def _track_cal_timeout(self, state_before, sync_state):
+        """[calibration] cal_timeout_frames: count consecutive CAL frames
+        processed in the calibration states; warn once per calibration run."""
+        if (self.current_state not in CALIBRATION_STATES
+                or state_before not in CALIBRATION_STATES):
+            # Outside the calibration states, or entering them from outside
+            # (STATE_INIT after start-up, a frequency change or a wire
+            # recalibration): the next CAL frame starts a new run
+            self._cal_timeout_count = 0
+            return
+        if self.iq_header.frame_type != IQHeader.FRAME_TYPE_CAL:
+            return
+        self._cal_timeout_count += 1
+        if self._cal_timeout_count != self._cal_timeout_frames:
+            return
+        state = _strip_state(state_before)
+        self.logger.warning("Calibration timeout: %d consecutive calibration frames in "
+                            "the calibration states (state %s, sync_state %d)",
+                            self._cal_timeout_count, state, sync_state)
+        if self.event_bus is not None:
+            from daq_events import DAQEvent, EVT_CAL_TIMEOUT
+            self.event_bus.emit(DAQEvent(severity="warning", module="delay_sync",
+                                         event_type=EVT_CAL_TIMEOUT,
+                                         payload={"state": state,
+                                                  "frames": self._cal_timeout_count}))
+        if self.db is not None:
+            self.db.put_cal_event(CAL_EVENT_CAL_TIMEOUT, self.iq_header,
+                                  sync_state_before=sync_state, sync_state_after=sync_state)
+
+    def _finalize_header(self, sample_sync_flag, iq_sync_flag, sync_state):
+        """Sync flags, sync state and the opt-in reserved-slot telemetry of
+        the outbound header (slots 108, 110-113; slot 109 and every other
+        input slot are carried through by the decode/encode round trip)."""
+        if sample_sync_flag:
+            self.iq_header.delay_sync_flag=1
+        else:
+            self.iq_header.delay_sync_flag=0
+        if iq_sync_flag:
+            self.iq_header.iq_sync_flag=1
+        else:
+            self.iq_header.iq_sync_flag=0
+
+        # [calibration] invalidate_on_overrun: no sync claim on the frame
+        # that saw a USB ring overrun and the next frames_after_overrun ones
+        if self._overrun_invalidate_left > 0:
+            self._overrun_invalidate_left -= 1
+            self._overrun_invalidated_frames += 1
+            self.iq_header.delay_sync_flag = 0
+            self.iq_header.iq_sync_flag = 0
+
+        self.iq_header.sync_state = sync_state
+        self._last_sync_state = sync_state
+
+        # -> Stamp RF front-end + orientation telemetry into the reserved region (v8)
+        if self._en_frontend_telemetry:
+            self._stamp_frontend_telemetry()
+
+        # -> Calibration telemetry (slots 110-113) and node attribution (108)
+        if self._stamp_cal_telemetry:
+            self.iq_header.set_cal_quality_mdb(self._cal_quality * 1000)
+            self.iq_header.set_iq_comp_cnt(self.iq_compensation_cntr)
+            self.iq_header.set_sample_comp_cnt(self.sample_compensation_cntr)
+            self.iq_header.set_recal_gen(self._recal_generation)
+        if self._stamp_node_id:
+            self.iq_header.set_node_id_crc32(self._node_id_crc32)
 
     def _stamp_frontend_telemetry(self):
         """Populate the v8 reserved-region telemetry on the outbound header:
@@ -812,9 +1709,6 @@ class delaySynchronizer():
             Start the main processing loop
         """
         while True:
-            sample_sync_flag = False
-            iq_sync_flag     = False
-            sync_state       = 0
             ch_powers        = None # Per-channel power estimate for the metrics DB
 
             #############################################
@@ -856,392 +1750,21 @@ class delaySynchronizer():
                     self.iq_header.frame_type, 
                     self.iq_header.cpi_index, 
                     self.current_state))
+
+            # -> Input-header continuity / overrun tracking (opt-in)
+            if self._track_continuity:
+                self._update_continuity(self.iq_header)
+            # -> hw_controller relays: state document and wire recalibration (opt-in)
+            if self._hwc_watcher is not None or self._recal_watcher is not None:
+                self._tick_relays()
+
             #############################################
             #  Delay Synchronizer Finite State Machine  #
             #############################################
 
-            if (self.iq_header.frame_type != IQHeader.FRAME_TYPE_DUMMY):  # Check frame type
-
-                # -> IQ Preprocessing <-
-                # TODO: Check payload size
-                if incoming_payload_size > 0:
-                    if active_buffer_index_iq in (0, 1):
-                        iq_frame_buffer_out = (self.out_shmem_iface_iq.buffers[active_buffer_index_iq]).view(dtype=np.complex64)
-                        # IQ header offset:1 sample -> 8 byte, 1024 byte length header -> 128 "sample"
-                        iq_samples_out = iq_frame_buffer_out[128:128+self.iq_header.cpi_length*self.iq_header.active_ant_chs].reshape(self.iq_header.active_ant_chs, self.iq_header.cpi_length)
-
-                        if self.en_iq_cal:
-                            iq_samples_out = correct_iq(iq_samples_in, iq_samples_out, self.iq_corrections, self.M)
-                        else:
-                            iq_samples_out = copy_iq(iq_samples_in, iq_samples_out, self.M)
-                    else:
-                        # IQ output buffer dropped - process into a reusable
-                        # scratch frame instead of allocating one per drop
-                        scratch_shape = (self.iq_header.active_ant_chs, self.iq_header.cpi_length)
-                        if self._drop_scratch is None or self._drop_scratch.shape != scratch_shape:
-                            self._drop_scratch = np.empty(scratch_shape, dtype=np.complex64)
-                        iq_samples_out = self._drop_scratch
-                        if self.en_iq_cal:
-                            iq_samples_out = correct_iq(iq_samples_in, iq_samples_out, self.iq_corrections, self.M)
-                        else:
-                            iq_samples_out = copy_iq(iq_samples_in, iq_samples_out, self.M)
-
-                    # Truncate IQ sample matrix for further processing
-                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
-                        iq_samples = iq_samples_out[:,:] # payload size must be N_proc
-                    elif self.N >= self.N_proc: iq_samples = iq_samples_out[:,0:self.N_proc] # Normal truncation
-                    else: iq_samples = iq_samples_out[:,:] # Only N sample is availabe in data frames
-
-                    # -> Aggregate received power for the scan-and-peak objective (v8 telemetry)
-                    if self._en_frontend_telemetry and self.iq_header.frame_type == IQHeader.FRAME_TYPE_DATA:
-                        p_lin = float(np.real(np.vdot(iq_samples, iq_samples))) / max(iq_samples.size, 1)
-                        self._agg_power_mdb = int(round(10.0 * np.log10(p_lin + 1e-20) * 1000.0))
-
-                    # -> Per-channel power estimates for the frame-metrics
-                    #    database record (only computed when the DB is enabled)
-                    if self.db is not None:
-                        ch_powers = np.einsum('ij,ij->i', iq_samples,
-                                              iq_samples.conj()).real / max(iq_samples.shape[1], 1)
-                #
-                #------------------------------------------>
-                #            
-                if self.current_state == "STATE_INIT": 
-                    sync_state = 1
-                    # Recalculate IQ adjustment for the RF center frequency
-                    daq_rf           = self.iq_header.rf_center_freq # Read RF center frequency for phase offset calculation
-                    if self.iq_adjust_source == "explicit-time-delay":
-                        iq_adjust_phase  = self.iq_adjust_time*daq_rf*2*np.pi  # Convert time delay to phase         
-
-                        self.iq_adjust = self.iq_adjust_amplitude * np.exp(1j*iq_adjust_phase) # Assemble IQ adjustment vector
-                        self.iq_adjust = np.insert(self.iq_adjust, self.std_ch_ind, 1+0j)
-                    elif self.iq_adjust_source == "touchstone":
-                        self.iq_adjust = self.iq_adjust_table[np.argmin(abs(self.iq_adjust_table[:,0]-daq_rf)),1::]
-
-                        self.logger.debug(f"IQ adjustment vector: abs:{abs(self.iq_adjust)}")
-                        self.logger.debug(f"IQ adjustment vector: phase:{np.rad2deg(np.angle(self.iq_adjust))}")
-                    
-                    self.iq_adjust /= self.iq_adjust[self.std_ch_ind]
-                    # Reset IQ corrections
-                    self.iq_corrections    = np.ones(self.M, dtype=np.complex64) 
-                    self.iq_corrections[:] = self.iq_adjust[:]
-                    # Calibration frame
-                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
-                        self.current_state = "STATE_SAMPLE_CAL"
-                        self._cal_start_frame = self.iq_header.cpi_index
-                        if self.db is not None:
-                            self.db.put_cal_event(CAL_EVENT_CAL_START, self.iq_header,
-                                                  sync_state_before=1, sync_state_after=2)
-                        if self.event_bus is not None:
-                            from daq_events import DAQEvent, EVT_CAL_START
-                            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
-                                event_type=EVT_CAL_START, payload={"freq": self.iq_header.rf_center_freq}))
-                        
-                #
-                #------------------------------------------>
-                #
-                elif self.current_state == "STATE_SAMPLE_CAL":
-                    sync_state        = 2
-                    sample_sync_flag  = True
-                    delay_update_flag = 0
-                    fs_ppm_offsets=[0]*self.M 
-
-                    # ->  Calculate correlation functions            
-                    np_zeros = np.zeros(self.N_proc, dtype=np.complex64)
-                    x_padd = np.concatenate([iq_samples[self.std_ch_ind, 0:self.N_proc], np_zeros])
-                    x_fft = self.fft_engine.forward(x_padd, overwrite_x=True)
-
-                    for m in self.channel_list:
-                        y_padd = np.concatenate([np_zeros, iq_samples[m, 0:self.N_proc]])
-                        y_fft = self.fft_engine.forward(y_padd, overwrite_x=True)
-                        self.corr_functions[m,:] = np.abs(self.fft_engine.inverse(x_fft.conj() * y_fft, overwrite_x=True))**2
-                    # ->  Calculate sample delays, check dynamic range
-                    # WARNING: This dynamic range checking assumes dirac like coorelation peak                    
-                    for m in self.channel_list:
-                        peak_index = np.argmax(self.corr_functions[m, :])
-
-                        # Check dynamic range. The sidelobe sample is taken with a
-                        # wrapped index so a peak within corr_peak_offset samples of
-                        # the end (badly desynced channel) cannot over-index, and
-                        # degenerate (all-zero) correlations are treated as
-                        # insufficient dynamic range instead of dividing by zero.
-                        peak_val     = self.corr_functions[m, peak_index]
-                        sidelobe_val = self.corr_functions[m, (peak_index+self.corr_peak_offset) % (2*self.N_proc)]
-                        if peak_val > 0 and sidelobe_val > 0:
-                            dyn_range = 10*np.log10(peak_val / sidelobe_val)
-                        else:
-                            dyn_range = 0.0
-                        if dyn_range < self.min_corr_peak_dyn_range:
-                            self.logger.warning("Correlation peak dynamic range is insufficient to perform calibration")
-                            self.logger.warning("Real value: {:.2f}, minimum: {:.2f}".format(dyn_range, self.min_corr_peak_dyn_range))
-                            delay_update_flag = 0
-                            sample_sync_flag = False # Sync can not be checked properly
-                            break
-                        
-                        # Calculate sample offset
-                        self.delays[m] = (self.N_proc - peak_index)                              
-                        fs_tune_gain_m = (self.INT_FS_TUNE_GAIN[1,(self.INT_FS_TUNE_GAIN[0,:] <= abs(self.delays[m]))])[0]      
-                        fs_ppm_offsets[m] = -1*self.delays[m] * fs_tune_gain_m * self.MIN_FS_PPM_OFFSET                        
-                        if abs(fs_ppm_offsets[m]) > self.MAX_FS_PPM_OFFSET:
-                            fs_ppm_offsets[m] = np.sign(fs_ppm_offsets[m])*self.MAX_FS_PPM_OFFSET                        
-
-                        if np.abs(self.delays[m]) >= 1:
-                            sample_sync_flag = False # Misalling detected
-                            delay_update_flag=1
-                        self.logger.debug("Channel {:d}, delay: {:d}, tune gain: {:d} ppm-offset: {:.7f}, ".format(m, self.delays[m], fs_tune_gain_m, fs_ppm_offsets[m]))
-
-                    # Set time delay
-                    if delay_update_flag:
-                        msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
-                        if self._rtl_daq_transaction(msg_byte_array) is not None:
-                            self.last_update_ind=self.iq_header.cpi_index
-                            self.current_state = "STATE_SYNC_WAIT"
-                        # On a failed transaction stay in this state and retry
-                        
-                    if sample_sync_flag:
-                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far
-                        self.current_state = "STATE_FRAC_SAMPLE_CAL"
-                        if self.db is not None:
-                            self.db.put_cal_event(CAL_EVENT_SAMPLE_CAL_DONE, self.iq_header,
-                                                  delays=self.delays,
-                                                  sync_state_before=2, sync_state_after=3)
-                #
-                #------------------------------------------>
-                #
-                elif self.current_state == "STATE_SYNC_WAIT":
-                    sync_state = 3                    
-                    
-                    # Hold this state until the first summy frame arrives
-                    if self.last_update_ind+1 == self.iq_header.cpi_index:
-                        self.last_update_ind += 1
-                #
-                #------------------------------------------>
-                #                
-                elif self.current_state == "STATE_FRAC_SAMPLE_CAL":
-                    sync_state          = 3
-                    # TODO: Change sync state -> changes have to take effect in the HWC module as well
-                    # Calculate fractional delays (truncate the SAMPLE axis to N_proc)
-                    taus = self.estimate_frac_delays(iq_samples[:, 0:self.N_proc])
-                    self.logger.debug(f"Fractional delays: {taus}")
-
-                    # Determine and set tune values
-                    frac_delay_update_flag = False
-                    fs_ppm_offsets=[0]*self.M
-
-                    # taus are ordered as self.channel_list (all channels
-                    # except the reference channel self.std_ch_ind)
-                    for i, m in enumerate(self.channel_list):
-                        if abs(taus[i]) > self.frac_delay_tolerance:
-                            fs_ppm_offsets[m] = np.sign(taus[i]) * np.abs(taus[i] * self.FRAC_FS_TUNE_GAIN) * self.MIN_FS_PPM_OFFSET
-                            frac_delay_update_flag = True
-
-                    if frac_delay_update_flag:
-                        self.logger.debug(f"Sending ppm offsets: {fs_ppm_offsets}")
-                        msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
-                        if self._rtl_daq_transaction(msg_byte_array) is not None:
-                            self.last_update_ind=self.iq_header.cpi_index
-                            self.current_state = "STATE_FRAC_SYNC_WAIT"
-                        # On a failed transaction stay in this state and retry
-                    else:
-                        self.current_state = "STATE_IQ_CAL"
-                #
-                #------------------------------------------>
-                #
-                elif self.current_state == "STATE_FRAC_SYNC_WAIT":
-                    sync_state          = 3
-                
-                    # Hold this state until the first summy frame arrives
-                    if self.last_update_ind+1 == self.iq_header.cpi_index:
-                        self.last_update_ind += 1                           
-                #
-                #------------------------------------------>
-                #
-                elif self.current_state == "STATE_IQ_CAL":
-                    sync_state          = 4
-                    iq_corr_update_flag = False
-                    sample_sync_flag    = True
-                    iq_sync_flag        = True                
-                    
-                    if self.en_iq_cal:
-                        dyn_ranges, iq_diffs = self.calc_iq_sync(iq_samples)
-                        iq_diffs *= self.iq_adjust[:]
-                        if dyn_ranges.size:
-                            self._cal_quality = float(np.min(dyn_ranges))
-
-                        if (dyn_ranges < self.min_corr_peak_dyn_range).any():
-                            self.logger.warning("Correlation peak dynamic range is insufficient to perform calibration")
-                            for m in range(self.M-1):                        
-                                self.logger.warning("Real value: {:.2f}, minimum: {:.2f}".format(dyn_ranges[m], self.min_corr_peak_dyn_range))                        
-                            
-                            sample_sync_flag = False # It seems that the sample sync has lost
-                            iq_sync_flag = False
-                            iq_corr_update_flag = False                            
-                           
-                        # Check IQ calibration necessity (over ALL channels)
-                        elif (abs(np.rad2deg(np.angle(iq_diffs))) > self.phase_diff_tolerance).any() or \
-                             (abs(iq_diffs) > self.amp_diff_tolerance).any():
-                            iq_corr_update_flag = True
-                            self.logger.debug("Amplitude or phase differenceas are out of tolerance")
-                        
-                        # Update correction values if needed                
-                        if iq_corr_update_flag:
-                            iq_sync_flag = False
-                            self.iq_compensation_cntr+=1  # Used to track how many iq compensations have we issued so far
-                            self.logger.info("Updating IQ correction values")                                        
-                            self.iq_corrections *= iq_diffs
-                            self.logger.info("Amplitude differences: {0}".format(20*np.log10(np.abs(iq_diffs))))
-                            self.logger.info("Phase differernces: {0}".format(np.rad2deg(np.angle(iq_diffs))))
-                    
-                    if not sample_sync_flag:
-                        self.current_state = "STATE_SAMPLE_CAL"
-                    
-                    if sample_sync_flag and iq_sync_flag:
-                        self.current_state = "STATE_TRACK_LOCK"
-                        if self.db is not None:
-                            self.db.put_cal_event(CAL_EVENT_IQ_CAL_DONE, self.iq_header,
-                                                  iq_corrections=self.iq_corrections,
-                                                  sync_state_before=4, sync_state_after=5)
-                            self.db.put_cal_event(CAL_EVENT_TRACK_LOCK, self.iq_header,
-                                                  iq_corrections=self.iq_corrections,
-                                                  sync_state_before=4, sync_state_after=5)
-                            # Per-frequency scan aggregate: successful calibration
-                            self.db.update_freq_scan(self.iq_header.rf_center_freq,
-                                                     cal_success=True,
-                                                     cal_quality=self._cal_quality,
-                                                     iq_corrections=self.iq_corrections,
-                                                     delays=self.delays,
-                                                     num_channels=self.M)
-                        if self.event_bus is not None:
-                            from daq_events import DAQEvent, EVT_SYNC_LOCK
-                            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
-                                event_type=EVT_SYNC_LOCK, payload={"freq": self.iq_header.rf_center_freq}))
-                        if self.metrics is not None:
-                            convergence = self.iq_header.cpi_index - self._cal_start_frame
-                            self.metrics.record("cal_convergence_frames", float(convergence))
-                        if self.cal_track_mode == 2 and self.en_iq_cal:
-                            self.iq_diff_ref[:] = iq_diffs[:]
-                #
-                #------------------------------------------>
-                #
-                elif self.current_state == "STATE_TRACK_LOCK":
-                    sync_state       = 5
-                    sample_sync_flag = True
-                    iq_sync_flag     = True
-                    # Wait here until the calibration frame is turned off
-                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_DATA: # Normal data frame
-                        dyn_ranges, iq_diffs = self.calc_iq_sync(iq_samples)
-                        iq_diffs *= self.iq_adjust[:]
-                        if dyn_ranges.size:
-                            self._cal_quality = float(np.min(dyn_ranges))
-
-                        if self.cal_track_mode == 1:
-                            self.iq_diff_ref[:] = iq_diffs[:]
-                        self.current_state = "STATE_TRACK"
-                        self.last_rf = self.iq_header.rf_center_freq
-                        
-                #
-                #------------------------------------------>
-                #
-                elif self.current_state == "STATE_TRACK":
-                    sync_state = 6
-                    # Caltrack mode 0: Calibration tracking is disabled
-                    # Caltrack mode 1: Normal continous tracking
-                    # Caltrack mode 2: Track only on calibration frames
-
-                    if self.cal_track_mode == 1 or \
-                       (self.cal_track_mode == 2 and self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL):
-
-                        dyn_ranges, iq_diffs = self.calc_iq_sync(iq_samples)
-                        iq_diffs *= self.iq_adjust[:]
-                        if dyn_ranges.size:
-                            self._cal_quality = float(np.min(dyn_ranges))
-                        # Check sample sync loss
-                        if (dyn_ranges < self.min_corr_peak_dyn_range).any():
-                            self.logger.warning("Sample sync may lost")
-                            sample_sync_flag = False
-                        else:
-                            sample_sync_flag = True
-
-                        if self.en_iq_cal:
-                            # Check IQ sync loss
-                            if (abs(np.rad2deg(np.angle(iq_diffs/self.iq_diff_ref))) > self.phase_diff_tolerance).any() or \
-                               (abs(iq_diffs/self.iq_diff_ref) > self.amp_diff_tolerance).any():
-                                   iq_sync_flag = False
-                                   self.logger.warning("IQ sync may lost")
-                                   for m in range(self.M):
-                                       self.logger.debug("Differences: Amplitude {:.2f}, Phase: {:.2f}".format(
-                                               20*np.log10((abs(iq_diffs[m]/self.iq_diff_ref[m]))), 
-                                               (abs(np.rad2deg(np.angle(iq_diffs[m]/self.iq_diff_ref[m]))))))
-                            else:
-                                iq_sync_flag = True
-
-                        # Track loss control
-                        if (not sample_sync_flag) or (self.en_iq_cal and (not iq_sync_flag)):
-                            self.sync_failed_cntr +=1
-                            self.sync_failed_cntr_total+=1
-                        else:
-                            self.sync_failed_cntr -=1                       
-                        if self.sync_failed_cntr == self.max_sync_fails:
-                            self.current_state = "STATE_INIT"
-                            self.sync_failed_cntr = 0
-                            if self.db is not None:
-                                self.db.put_cal_event(CAL_EVENT_TRACK_LOST, self.iq_header,
-                                                      iq_corrections=self.iq_corrections,
-                                                      sync_state_before=6, sync_state_after=1)
-                                # Per-frequency scan aggregate: calibration lost
-                                self.db.update_freq_scan(self.iq_header.rf_center_freq,
-                                                         cal_success=False,
-                                                         cal_quality=self._cal_quality,
-                                                         num_channels=self.M)
-                            if self.event_bus is not None:
-                                from daq_events import DAQEvent, EVT_SYNC_LOST
-                                self.event_bus.emit(DAQEvent(severity="warning", module="delay_sync",
-                                    event_type=EVT_SYNC_LOST, payload={"total_fails": self.sync_failed_cntr_total}))
-                        elif self.sync_failed_cntr < 0: # Sync tracking holds
-                            self.sync_failed_cntr = 0
-
-                    else:
-                        self.logger.debug("Sync flags are set")
-                        sample_sync_flag = True
-                        iq_sync_flag = True
-                    
-                    # Has the RF center frequency changed?
-                    if self.last_rf != self.iq_header.rf_center_freq:
-                        self.logger.info("Center frequency changed, initiating recalibration")
-                        sample_sync_flag = False
-                        iq_sync_flag = False
-                        self.sync_failed_cntr = 0
-                        self.current_state = "STATE_INIT"
-                        if self.db is not None:
-                            self.db.put_cal_event(CAL_EVENT_FREQ_CHANGE, self.iq_header,
-                                                  iq_corrections=self.iq_corrections,
-                                                  sync_state_before=6, sync_state_after=1)
-                        if self.event_bus is not None:
-                            from daq_events import DAQEvent, EVT_FREQ_CHANGE
-                            self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
-                                event_type=EVT_FREQ_CHANGE, payload={
-                                    "old_freq": self.last_rf,
-                                    "new_freq": self.iq_header.rf_center_freq}))
-    
-                # Per-frame statistic - DEBUG level to keep string formatting
-                # and log I/O out of the hot loop at the default INFO level
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug("Delay track statistic [sync fails ,sample, iq, total][{:d},{:d},{:d}/{:d}]".format(
-                                     self.sync_failed_cntr_total,
-                                     self.sample_compensation_cntr,
-                                     self.iq_compensation_cntr,
-                                     self.iq_header.daq_block_index))
-            
-            elif (self.iq_header.frame_type == IQHeader.FRAME_TYPE_DUMMY): 
-                # Reset instantaneous sync failed counter (New noise burst will start)
-                self.sync_failed_cntr = 0
-
-                # To speed up the calibration, this first call frame will be checked immediatly
-                if self.current_state == "STATE_SYNC_WAIT":
-                    self.current_state = "STATE_SAMPLE_CAL"
-                elif self.current_state == "STATE_FRAC_SYNC_WAIT":
-                    self.current_state = "STATE_FRAC_SAMPLE_CAL"
-                    
-
+            if (self.iq_header.frame_type != IQHeader.FRAME_TYPE_DUMMY) and incoming_payload_size > 0:
+                ch_powers = self._preprocess_frame(iq_samples_in, active_buffer_index_iq)
+            sample_sync_flag, iq_sync_flag, sync_state = self._fsm_step()
 
             #############################################
             #        DATABASE: FRAME METRICS            #
@@ -1253,21 +1776,8 @@ class delaySynchronizer():
             #############################################
             #         SEND PROCESSED DATA BLOCK         #
             #############################################
-            # -> Update header field
-            if sample_sync_flag: 
-                self.iq_header.delay_sync_flag=1
-            else:
-                self.iq_header.delay_sync_flag=0
-            if iq_sync_flag:
-                self.iq_header.iq_sync_flag=1
-            else:
-                self.iq_header.iq_sync_flag=0
-            
-            self.iq_header.sync_state = sync_state
-
-            # -> Stamp RF front-end + orientation telemetry into the reserved region (v8)
-            if self._en_frontend_telemetry:
-                self._stamp_frontend_telemetry()
+            # -> Update header fields (flags, sync state, reserved-slot telemetry)
+            self._finalize_header(sample_sync_flag, iq_sync_flag, sync_state)
 
             # -> Send IQ frame toward the iq server
             header_uint8 = np.frombuffer(self.iq_header.encode_header(), dtype=np.uint8)
@@ -1313,33 +1823,495 @@ class delaySynchronizer():
                 self._prev_dropped_hwc = _drops_hwc
 
             # -> Periodic heartbeat and status update
-            if self._heartbeat_interval > 0:
-                self._heartbeat_counter += 1
-                if self._heartbeat_counter >= self._heartbeat_interval:
-                    self._heartbeat_counter = 0
-                    if self.event_bus is not None:
-                        from daq_events import DAQEvent, EVT_HEARTBEAT
-                        self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
-                            event_type=EVT_HEARTBEAT, payload={"cpi_index": self.iq_header.cpi_index,
-                                "sync_state": sync_state}))
-                    if self.status_server is not None:
-                        self.status_server.update_status({
-                            "sync_state": sync_state,
-                            "current_frequency_hz": self.iq_header.rf_center_freq,
-                            "frame_count": self.iq_header.cpi_index,
-                            "aggregate_power_db": self._agg_power_mdb / 1000.0,
-                            "calibration_status": "locked" if sync_state >= 5 else ("calibrating" if sync_state >= 2 else "lost"),
-                            "counters": {
-                                "dropped_frames_iq": self.out_shmem_iface_iq.dropped_frame_cntr,
-                                "dropped_frames_hwc": self.out_shmem_iface_hwc.dropped_frame_cntr,
-                                "sync_fails_total": self.sync_failed_cntr_total,
-                                "sample_compensations": self.sample_compensation_cntr,
-                                "iq_compensations": self.iq_compensation_cntr,
-                            },
-                        })
+            self._heartbeat_and_status(sync_state)
 
             # -> Inform the preceeding block that we have finished the processing
             self.in_shmem_iface.send_ctr_buff_ready(active_buff_index_dec)
+
+    def _heartbeat_and_status(self, sync_state):
+        """Heartbeat event every heartbeat_interval frames and STATUS
+        snapshot refresh (spec G.2).
+
+        status_update_interval = 0 (default): the snapshot is refreshed with
+        the heartbeat, as before. k > 0: every k frames, independently of the
+        heartbeat. With status_extended = 1 it is also refreshed whenever
+        sync_state, frame_type or rf_center_freq changes.
+        """
+        heartbeat_fired = False
+        if self._heartbeat_interval > 0:
+            self._heartbeat_counter += 1
+            if self._heartbeat_counter >= self._heartbeat_interval:
+                self._heartbeat_counter = 0
+                heartbeat_fired = True
+                if self.event_bus is not None:
+                    from daq_events import DAQEvent, EVT_HEARTBEAT
+                    self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                        event_type=EVT_HEARTBEAT, payload={"cpi_index": self.iq_header.cpi_index,
+                            "sync_state": sync_state}))
+        if self.status_server is None:
+            return
+        if self._status_update_interval > 0:
+            self._status_counter += 1
+            refresh = self._status_counter >= self._status_update_interval
+            if refresh:
+                self._status_counter = 0
+        else:
+            refresh = heartbeat_fired
+        if self._status_extended:
+            key = (sync_state, self.iq_header.frame_type, self.iq_header.rf_center_freq)
+            if key != self._last_status_key:
+                self._last_status_key = key
+                refresh = True
+        if refresh:
+            self.status_server.update_status(self._build_status_snapshot(sync_state))
+
+    def _build_status_snapshot(self, sync_state):
+        """The STATUS snapshot; additive extended keys only with status_extended = 1."""
+        snapshot = {
+            "sync_state": sync_state,
+            "current_frequency_hz": self.iq_header.rf_center_freq,
+            "frame_count": self.iq_header.cpi_index,
+            "aggregate_power_db": self._agg_power_mdb / 1000.0,
+            "calibration_status": "locked" if sync_state >= 5 else ("calibrating" if sync_state >= 2 else "lost"),
+            "counters": {
+                "dropped_frames_iq": self.out_shmem_iface_iq.dropped_frame_cntr,
+                "dropped_frames_hwc": self.out_shmem_iface_hwc.dropped_frame_cntr,
+                "sync_fails_total": self.sync_failed_cntr_total,
+                "sample_compensations": self.sample_compensation_cntr,
+                "iq_compensations": self.iq_compensation_cntr,
+            },
+        }
+        if self._status_extended:
+            snapshot["counters"].update(self._extended_counters())
+            snapshot.update(self._build_extended_status())
+        return snapshot
+
+    def _preprocess_frame(self, iq_samples_in, active_buffer_index_iq):
+        """IQ preprocessing of a non-dummy frame with a payload.
+
+        Copies (or IQ-corrects) the input payload into the outbound frame (or
+        the drop scratch / the input itself when the outbound buffer was
+        dropped), truncates it for the FSM into ``self._iq_samples`` and
+        returns the per-channel powers for the metrics DB (None without DB).
+        """
+        ch_powers = None
+        if active_buffer_index_iq in (0, 1):
+            iq_frame_buffer_out = (self.out_shmem_iface_iq.buffers[active_buffer_index_iq]).view(dtype=np.complex64)
+            # IQ header offset:1 sample -> 8 byte, 1024 byte length header -> 128 "sample"
+            iq_samples_out = iq_frame_buffer_out[128:128+self.iq_header.cpi_length*self.iq_header.active_ant_chs].reshape(self.iq_header.active_ant_chs, self.iq_header.cpi_length)
+
+            if self.en_iq_cal:
+                iq_samples_out = correct_iq(iq_samples_in, iq_samples_out, self.iq_corrections, self.M)
+            else:
+                iq_samples_out = copy_iq(iq_samples_in, iq_samples_out, self.M)
+        elif self._skip_copy_on_drop and not self.en_iq_cal:
+            # IQ output buffer dropped and nothing to correct: process the input
+            # frame in place ([offload] skip_copy_on_drop = 1; copy_iq is a pure
+            # element copy, so every downstream result is identical)
+            iq_samples_out = iq_samples_in
+        else:
+            # IQ output buffer dropped - process into a reusable
+            # scratch frame instead of allocating one per drop
+            scratch_shape = (self.iq_header.active_ant_chs, self.iq_header.cpi_length)
+            if self._drop_scratch is None or self._drop_scratch.shape != scratch_shape:
+                self._drop_scratch = np.empty(scratch_shape, dtype=np.complex64)
+            iq_samples_out = self._drop_scratch
+            if self.en_iq_cal:
+                iq_samples_out = correct_iq(iq_samples_in, iq_samples_out, self.iq_corrections, self.M)
+            else:
+                iq_samples_out = copy_iq(iq_samples_in, iq_samples_out, self.M)
+
+        # Truncate IQ sample matrix for further processing
+        if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
+            iq_samples = iq_samples_out[:,:] # payload size must be N_proc
+        elif self.N >= self.N_proc: iq_samples = iq_samples_out[:,0:self.N_proc] # Normal truncation
+        else: iq_samples = iq_samples_out[:,:] # Only N sample is availabe in data frames
+
+        # -> Aggregate received power for the scan-and-peak objective (v8 telemetry)
+        if self._en_frontend_telemetry and self.iq_header.frame_type == IQHeader.FRAME_TYPE_DATA:
+            p_lin = float(np.real(np.vdot(iq_samples, iq_samples))) / max(iq_samples.size, 1)
+            self._agg_power_mdb = int(round(10.0 * np.log10(p_lin + 1e-20) * 1000.0))
+
+        # -> Per-channel power estimates for the frame-metrics
+        #    database record (only computed when the DB is enabled)
+        if self.db is not None:
+            ch_powers = np.einsum('ij,ij->i', iq_samples,
+                                  iq_samples.conj()).real / max(iq_samples.shape[1], 1)
+
+        self._iq_samples = iq_samples
+        return ch_powers
+
+    def _fsm_step(self):
+        """Run the delay-synchronizer FSM on the current frame.
+
+        Reads ``self.iq_header`` and ``self._iq_samples`` (the truncated
+        sample matrix of the last frame with a payload) and returns
+        ``(sample_sync_flag, iq_sync_flag, sync_state)`` for the outbound
+        header.
+        """
+        sample_sync_flag = False
+        iq_sync_flag     = False
+        sync_state       = 0
+        iq_samples       = self._iq_samples
+        state_before     = self.current_state
+
+        if (self.iq_header.frame_type != IQHeader.FRAME_TYPE_DUMMY):  # Check frame type
+            #
+            #------------------------------------------>
+            #            
+            if self.current_state == "STATE_INIT": 
+                sync_state = 1
+                # Recalculate IQ adjustment for the RF center frequency
+                daq_rf           = self.iq_header.rf_center_freq # Read RF center frequency for phase offset calculation
+                if self.iq_adjust_source == "explicit-time-delay":
+                    iq_adjust_phase  = self.iq_adjust_time*daq_rf*2*np.pi  # Convert time delay to phase         
+
+                    self.iq_adjust = self.iq_adjust_amplitude * np.exp(1j*iq_adjust_phase) # Assemble IQ adjustment vector
+                    self.iq_adjust = np.insert(self.iq_adjust, self.std_ch_ind, 1+0j)
+                elif self.iq_adjust_source == "touchstone":
+                    self.iq_adjust = self.iq_adjust_table[np.argmin(abs(self.iq_adjust_table[:,0]-daq_rf)),1::]
+
+                    self.logger.debug(f"IQ adjustment vector: abs:{abs(self.iq_adjust)}")
+                    self.logger.debug(f"IQ adjustment vector: phase:{np.rad2deg(np.angle(self.iq_adjust))}")
+
+                self.iq_adjust /= self.iq_adjust[self.std_ch_ind]
+                # Reset IQ corrections
+                self.iq_corrections    = np.ones(self.M, dtype=np.complex64) 
+                self.iq_corrections[:] = self.iq_adjust[:]
+                # Calibration frame
+                if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
+                    self.current_state = "STATE_SAMPLE_CAL"
+                    self._cal_start_frame = self.iq_header.cpi_index
+                    if self.db is not None:
+                        self.db.put_cal_event(CAL_EVENT_CAL_START, self.iq_header,
+                                              sync_state_before=1, sync_state_after=2)
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_CAL_START
+                        self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                            event_type=EVT_CAL_START, payload={"freq": self.iq_header.rf_center_freq}))
+
+            #
+            #------------------------------------------>
+            #
+            elif self.current_state == "STATE_SAMPLE_CAL":
+                sync_state        = 2
+                sample_sync_flag  = True
+                delay_update_flag = 0
+                fs_ppm_offsets=[0]*self.M 
+
+                # ->  Calculate correlation functions
+                self._compute_corr_functions(iq_samples)
+                # ->  Calculate sample delays, check dynamic range
+                # WARNING: This dynamic range checking assumes dirac like coorelation peak                    
+                for m in self.channel_list:
+                    peak_index = np.argmax(self.corr_functions[m, :])
+
+                    # Check dynamic range. The sidelobe sample is taken with a
+                    # wrapped index so a peak within corr_peak_offset samples of
+                    # the end (badly desynced channel) cannot over-index, and
+                    # degenerate (all-zero) correlations are treated as
+                    # insufficient dynamic range instead of dividing by zero.
+                    peak_val     = self.corr_functions[m, peak_index]
+                    sidelobe_val = self.corr_functions[m, (peak_index+self.corr_peak_offset) % (2*self.N_proc)]
+                    if peak_val > 0 and sidelobe_val > 0:
+                        dyn_range = 10*np.log10(peak_val / sidelobe_val)
+                    else:
+                        dyn_range = 0.0
+                    if dyn_range < self.min_corr_peak_dyn_range:
+                        self.logger.warning("Correlation peak dynamic range is insufficient to perform calibration")
+                        self.logger.warning("Real value: {:.2f}, minimum: {:.2f}".format(dyn_range, self.min_corr_peak_dyn_range))
+                        delay_update_flag = 0
+                        sample_sync_flag = False # Sync can not be checked properly
+                        break
+
+                    # Calculate sample offset
+                    self.delays[m] = (self.N_proc - peak_index)
+
+                    if np.abs(self.delays[m]) >= 1:
+                        sample_sync_flag = False # Misalling detected
+                        delay_update_flag=1
+                else:
+                    # Every channel had a usable correlation peak: derive the
+                    # sampling-rate tune values from the measured delays
+                    fs_ppm_offsets = int_fs_ppm_offsets(self.delays, self.INT_FS_TUNE_GAIN,
+                                                        self.MIN_FS_PPM_OFFSET, self.MAX_FS_PPM_OFFSET)
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        for m in self.channel_list:
+                            self.logger.debug("Channel {:d}, delay: {:d}, tune gain: {:d} ppm-offset: {:.7f}, ".format(
+                                m, self.delays[m], int_fs_tune_gain(self.delays[m], self.INT_FS_TUNE_GAIN), fs_ppm_offsets[m]))
+
+                # Set time delay
+                if delay_update_flag:
+                    msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
+                    if self._rtl_daq_transaction(msg_byte_array) is not None:
+                        self.last_update_ind=self.iq_header.cpi_index
+                        self.current_state = "STATE_SYNC_WAIT"
+                    # On a failed transaction stay in this state and retry
+
+                if sample_sync_flag:
+                    self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far
+                    self.current_state = "STATE_FRAC_SAMPLE_CAL"
+                    if self.db is not None:
+                        self.db.put_cal_event(CAL_EVENT_SAMPLE_CAL_DONE, self.iq_header,
+                                              delays=self.delays,
+                                              sync_state_before=2, sync_state_after=3)
+            #
+            #------------------------------------------>
+            #
+            elif self.current_state == "STATE_SYNC_WAIT":
+                sync_state = 3                    
+
+                # Hold this state until the first summy frame arrives
+                if self.last_update_ind+1 == self.iq_header.cpi_index:
+                    self.last_update_ind += 1
+            #
+            #------------------------------------------>
+            #                
+            elif self.current_state == "STATE_FRAC_SAMPLE_CAL":
+                sync_state          = 3
+                # TODO: Change sync state -> changes have to take effect in the HWC module as well
+                # Calculate fractional delays (truncate the SAMPLE axis to N_proc)
+                taus = self.estimate_frac_delays(iq_samples[:, 0:self.N_proc])
+                self.logger.debug(f"Fractional delays: {taus}")
+
+                # Determine and set tune values
+                # taus are ordered as self.channel_list (all channels
+                # except the reference channel self.std_ch_ind)
+                fs_ppm_offsets = frac_fs_ppm_offsets(taus, self.channel_list, self.M,
+                                                     self.frac_delay_tolerance, self.FRAC_FS_TUNE_GAIN,
+                                                     self.MIN_FS_PPM_OFFSET)
+                frac_delay_update_flag = any(abs(taus[i]) > self.frac_delay_tolerance
+                                             for i in range(len(self.channel_list)))
+
+                if frac_delay_update_flag:
+                    self.logger.debug(f"Sending ppm offsets: {fs_ppm_offsets}")
+                    msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
+                    if self._rtl_daq_transaction(msg_byte_array) is not None:
+                        self.last_update_ind=self.iq_header.cpi_index
+                        self.current_state = "STATE_FRAC_SYNC_WAIT"
+                    # On a failed transaction stay in this state and retry
+                else:
+                    self.current_state = "STATE_IQ_CAL"
+            #
+            #------------------------------------------>
+            #
+            elif self.current_state == "STATE_FRAC_SYNC_WAIT":
+                sync_state          = 3
+
+                # Hold this state until the first summy frame arrives
+                if self.last_update_ind+1 == self.iq_header.cpi_index:
+                    self.last_update_ind += 1                           
+            #
+            #------------------------------------------>
+            #
+            elif self.current_state == "STATE_IQ_CAL":
+                sync_state          = 4
+                iq_corr_update_flag = False
+                sample_sync_flag    = True
+                iq_sync_flag        = True                
+
+                if self.en_iq_cal:
+                    dyn_ranges, iq_diffs = self.calc_iq_sync(iq_samples)
+                    iq_diffs *= self.iq_adjust[:]
+                    if dyn_ranges.size:
+                        self._cal_quality = float(np.min(dyn_ranges))
+
+                    if (dyn_ranges < self.min_corr_peak_dyn_range).any():
+                        self.logger.warning("Correlation peak dynamic range is insufficient to perform calibration")
+                        for m in range(self.M-1):                        
+                            self.logger.warning("Real value: {:.2f}, minimum: {:.2f}".format(dyn_ranges[m], self.min_corr_peak_dyn_range))                        
+
+                        sample_sync_flag = False # It seems that the sample sync has lost
+                        iq_sync_flag = False
+                        iq_corr_update_flag = False                            
+
+                    # Check IQ calibration necessity (over ALL channels)
+                    elif (abs(np.rad2deg(np.angle(iq_diffs))) > self.phase_diff_tolerance).any() or \
+                         self._amplitude_out_of_tolerance(iq_diffs):
+                        iq_corr_update_flag = True
+                        self.logger.debug("Amplitude or phase differenceas are out of tolerance")
+
+                    # Update correction values if needed                
+                    if iq_corr_update_flag:
+                        iq_sync_flag = False
+                        self.iq_compensation_cntr+=1  # Used to track how many iq compensations have we issued so far
+                        self.logger.info("Updating IQ correction values")                                        
+                        self.iq_corrections *= iq_diffs
+                        self.logger.info("Amplitude differences: {0}".format(20*np.log10(np.abs(iq_diffs))))
+                        self.logger.info("Phase differernces: {0}".format(np.rad2deg(np.angle(iq_diffs))))
+
+                if not sample_sync_flag:
+                    self.current_state = "STATE_SAMPLE_CAL"
+
+                if sample_sync_flag and iq_sync_flag:
+                    self.current_state = "STATE_TRACK_LOCK"
+                    if self.db is not None:
+                        self.db.put_cal_event(CAL_EVENT_IQ_CAL_DONE, self.iq_header,
+                                              iq_corrections=self.iq_corrections,
+                                              sync_state_before=4, sync_state_after=5)
+                        self.db.put_cal_event(CAL_EVENT_TRACK_LOCK, self.iq_header,
+                                              iq_corrections=self.iq_corrections,
+                                              sync_state_before=4, sync_state_after=5)
+                        # Per-frequency scan aggregate: successful calibration
+                        self.db.update_freq_scan(self.iq_header.rf_center_freq,
+                                                 cal_success=True,
+                                                 cal_quality=self._cal_quality,
+                                                 iq_corrections=self.iq_corrections,
+                                                 delays=self.delays,
+                                                 num_channels=self.M)
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_SYNC_LOCK
+                        self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                            event_type=EVT_SYNC_LOCK, payload={"freq": self.iq_header.rf_center_freq}))
+                    if self.metrics is not None:
+                        convergence = self.iq_header.cpi_index - self._cal_start_frame
+                        self.metrics.record("cal_convergence_frames", float(convergence))
+                    if self.cal_track_mode == 2 and self.en_iq_cal:
+                        self.iq_diff_ref[:] = iq_diffs[:]
+            #
+            #------------------------------------------>
+            #
+            elif self.current_state == "STATE_TRACK_LOCK":
+                sync_state       = 5
+                sample_sync_flag = True
+                iq_sync_flag     = True
+                # Wait here until the calibration frame is turned off
+                if self.iq_header.frame_type == IQHeader.FRAME_TYPE_DATA: # Normal data frame
+                    dyn_ranges, iq_diffs = self.calc_iq_sync(iq_samples)
+                    iq_diffs *= self.iq_adjust[:]
+                    if dyn_ranges.size:
+                        self._cal_quality = float(np.min(dyn_ranges))
+
+                    if self.cal_track_mode == 1:
+                        self.iq_diff_ref[:] = iq_diffs[:]
+                    self.current_state = "STATE_TRACK"
+                    self.last_rf = self.iq_header.rf_center_freq
+                    # [calibration] track_decimation: the first tracking frame is checked
+                    self._track_check_counter = 0
+                    self._track_last_flags = (True, True)
+
+            #
+            #------------------------------------------>
+            #
+            elif self.current_state == "STATE_TRACK":
+                sync_state = 6
+                # Caltrack mode 0: Calibration tracking is disabled
+                # Caltrack mode 1: Normal continous tracking
+                # Caltrack mode 2: Track only on calibration frames
+
+                track_check = (self.cal_track_mode == 1 or
+                               (self.cal_track_mode == 2 and self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL))
+                run_check = track_check
+                if (track_check and self.cal_track_mode == 1 and self._track_decimation > 1
+                        and self.iq_header.frame_type == IQHeader.FRAME_TYPE_DATA):
+                    # [calibration] track_decimation = k: check every k-th DATA frame
+                    # and reuse the last check's flags in between; other frame
+                    # types (a CAL burst while locked) are always checked
+                    run_check = (self._track_check_counter % self._track_decimation) == 0
+                    self._track_check_counter += 1
+
+                if run_check:
+
+                    dyn_ranges, iq_diffs = self.calc_iq_sync(iq_samples)
+                    iq_diffs *= self.iq_adjust[:]
+                    if dyn_ranges.size:
+                        self._cal_quality = float(np.min(dyn_ranges))
+                    # Check sample sync loss
+                    if (dyn_ranges < self.min_corr_peak_dyn_range).any():
+                        self.logger.warning("Sample sync may lost")
+                        sample_sync_flag = False
+                    else:
+                        sample_sync_flag = True
+
+                    if self.en_iq_cal:
+                        # Check IQ sync loss
+                        if (abs(np.rad2deg(np.angle(iq_diffs/self.iq_diff_ref))) > self.phase_diff_tolerance).any() or \
+                           self._amplitude_out_of_tolerance(iq_diffs/self.iq_diff_ref):
+                               iq_sync_flag = False
+                               self.logger.warning("IQ sync may lost")
+                               for m in range(self.M):
+                                   self.logger.debug("Differences: Amplitude {:.2f}, Phase: {:.2f}".format(
+                                           20*np.log10((abs(iq_diffs[m]/self.iq_diff_ref[m]))), 
+                                           (abs(np.rad2deg(np.angle(iq_diffs[m]/self.iq_diff_ref[m]))))))
+                        else:
+                            iq_sync_flag = True
+
+                    # Track loss control
+                    if (not sample_sync_flag) or (self.en_iq_cal and (not iq_sync_flag)):
+                        self.sync_failed_cntr +=1
+                        self.sync_failed_cntr_total+=1
+                    else:
+                        self.sync_failed_cntr -=1                       
+                    if self.sync_failed_cntr == self.max_sync_fails:
+                        self.current_state = "STATE_INIT"
+                        self.sync_failed_cntr = 0
+                        if self.db is not None:
+                            self.db.put_cal_event(CAL_EVENT_TRACK_LOST, self.iq_header,
+                                                  iq_corrections=self.iq_corrections,
+                                                  sync_state_before=6, sync_state_after=1)
+                            # Per-frequency scan aggregate: calibration lost
+                            self.db.update_freq_scan(self.iq_header.rf_center_freq,
+                                                     cal_success=False,
+                                                     cal_quality=self._cal_quality,
+                                                     num_channels=self.M)
+                        if self.event_bus is not None:
+                            from daq_events import DAQEvent, EVT_SYNC_LOST
+                            self.event_bus.emit(DAQEvent(severity="warning", module="delay_sync",
+                                event_type=EVT_SYNC_LOST, payload={"total_fails": self.sync_failed_cntr_total}))
+                    elif self.sync_failed_cntr < 0: # Sync tracking holds
+                        self.sync_failed_cntr = 0
+                    self._track_last_flags = (sample_sync_flag, iq_sync_flag)
+
+                elif track_check:
+                    # Decimated tracking: no check on this frame, keep the last flags
+                    sample_sync_flag, iq_sync_flag = self._track_last_flags
+
+                else:
+                    self.logger.debug("Sync flags are set")
+                    sample_sync_flag = True
+                    iq_sync_flag = True
+
+                # Has the RF center frequency changed?
+                if self.last_rf != self.iq_header.rf_center_freq:
+                    self.logger.info("Center frequency changed, initiating recalibration")
+                    sample_sync_flag = False
+                    iq_sync_flag = False
+                    self.sync_failed_cntr = 0
+                    self.current_state = "STATE_INIT"
+                    if self.db is not None:
+                        self.db.put_cal_event(CAL_EVENT_FREQ_CHANGE, self.iq_header,
+                                              iq_corrections=self.iq_corrections,
+                                              sync_state_before=6, sync_state_after=1)
+                    if self.event_bus is not None:
+                        from daq_events import DAQEvent, EVT_FREQ_CHANGE
+                        self.event_bus.emit(DAQEvent(severity="info", module="delay_sync",
+                            event_type=EVT_FREQ_CHANGE, payload={
+                                "old_freq": self.last_rf,
+                                "new_freq": self.iq_header.rf_center_freq}))
+
+            # Per-frame statistic - DEBUG level to keep string formatting
+            # and log I/O out of the hot loop at the default INFO level
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("Delay track statistic [sync fails ,sample, iq, total][{:d},{:d},{:d}/{:d}]".format(
+                                 self.sync_failed_cntr_total,
+                                 self.sample_compensation_cntr,
+                                 self.iq_compensation_cntr,
+                                 self.iq_header.daq_block_index))
+
+        elif (self.iq_header.frame_type == IQHeader.FRAME_TYPE_DUMMY): 
+            # Reset instantaneous sync failed counter (New noise burst will start)
+            self.sync_failed_cntr = 0
+
+            # To speed up the calibration, this first call frame will be checked immediatly
+            if self.current_state == "STATE_SYNC_WAIT":
+                self.current_state = "STATE_SAMPLE_CAL"
+            elif self.current_state == "STATE_FRAC_SYNC_WAIT":
+                self.current_state = "STATE_FRAC_SAMPLE_CAL"
+
+        if self._cal_timeout_frames > 0:
+            self._track_cal_timeout(state_before, sync_state)
+
+        return sample_sync_flag, iq_sync_flag, sync_state
 
 @njit(fastmath=True, cache=True)
 def correct_iq(iq_samples_in, iq_samples_out, iq_corrections, M):
@@ -1366,6 +2338,12 @@ if __name__ == '__main__':
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _sig_handler)
+
+    # Defence in depth (HEIMDALL_INSTANCE_GUARD=refuse only): refuse to run
+    # without the inherited instance lock, before any interface is opened
+    _lock_rc = enforce_instance_lock("daq_chain_config.ini")
+    if _lock_rc:
+        sys.exit(_lock_rc)
 
     delay_synchronizer_inst0 = delaySynchronizer()
     try:

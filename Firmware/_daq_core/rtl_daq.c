@@ -57,14 +57,22 @@
 #include "rtl_daq.h"
 #include "iq_header.h"
 #include "sh_mem_util.h" /* compute_port() - NOTE: sh_mem_util.o must be on the rtl_daq link line */
+#include "device_map.h"  /* [hw] serial_base / device_serials - device_map.o is on the link line */
 
 #ifdef USEPIGPIO
 #include <pigpio.h>
 #endif
 
-#define NUM_BUFF 8  // Number of buffers used in the circular, coherent read buffer
-#define CFN "_data_control/rec_control_fifo" // Receiver control FIFO name 
-#define ASYNC_BUF_NUMBER 12// Number of buffers used by the asynchronous read 
+/* Depth of the circular, coherent read buffer ([daq] usb_ring_buffers) and the
+ * number of librtlsdr asynchronous transfers ([daq] usb_async_transfers).
+ * Assigned from the config before any allocation; the defaults are the former
+ * NUM_BUFF / ASYNC_BUF_NUMBER literals. */
+#define USB_DEPTH_MIN 2
+#define USB_DEPTH_MAX 64
+static int num_buff = 8;
+static int async_buf_number = 12;
+/* The 128-byte ZMQ message carries 31 four-byte per-channel parameters */
+#define ZMQ_MAX_CH_PARAMS 31
 #define FS_CORRECTION_KEEP_LIMIT 0.008 // Above this ppm offset the tuning is not terminated after 1 cal. frame
 #define INI_FNAME "daq_chain_config.ini"
 
@@ -86,6 +94,9 @@ pthread_t fifo_read_thread;
 static pthread_barrier_t rtl_init_barrier;
 
 int rtl_daq_zmq_port = 1130; // Set from config via federation instance_id
+/* Bind host of the ZMQ REP socket ([daq] zmq_listen_address, default "*").
+ * Written by the ini handler in main() before the ZMQ thread is created. */
+static char rtl_daq_zmq_bind[64] = "*";
 int reconfig_trigger=0;
 volatile sig_atomic_t exit_flag = 0;
 int noise_source_state = 0; // Noise source state is used also to track the calibration frame status!
@@ -105,6 +116,14 @@ static int ctr_channel_index;
 
 int gpio_23 = 0;
 int gpio_24 = 0;
+
+#ifdef USEPIGPIO
+/* Antenna-switch pins ([hw] antenna_switch_gpio); 23/24 when the key is absent.
+ * ant_gpio_enabled = 0 for "none": pigpio is not initialised at all. */
+static int ant_gpio_a = 23;
+static int ant_gpio_b = 24;
+static int ant_gpio_enabled = 1;
+#endif
 
 /*
  * This structure stores the configuration parameters, 
@@ -126,7 +145,68 @@ typedef struct
     int ioo_type;
     int instance_id;
     int port_stride;
+    char* device_serials;     /* [hw] device_serials: comma list, wins over serial_base */
+    int serial_base;          /* [hw] serial_base: channel i -> serial_base + i (default 1000) */
+    int serial_keys_set;      /* serial_base or a non-empty device_serials is present */
+    int hw_unit_id_auto;      /* [hw] unit_id = auto -> header unit_id = instance_id */
+    int usb_ring_buffers;     /* [daq] usb_ring_buffers (default 8) */
+    int usb_async_transfers;  /* [daq] usb_async_transfers (default 12) */
 } configuration;
+
+/* Strict decimal parse for the new integer keys; returns `bad` on garbage so
+ * the range checks reject it instead of silently using atoi()'s 0. */
+static int parse_int_or(const char* value, int bad)
+{
+    char *endp = NULL;
+    errno = 0;
+    long v = strtol(value, &endp, 10);
+    if (errno != 0 || endp == value || *endp != '\0' || v < -2147483647L || v > 2147483647L)
+        return bad;
+    return (int) v;
+}
+
+/* Length (without the line ending) of the longest line of `fname` whose
+ * first non-blank text is `key` followed by optional blanks and '=' or ':'.
+ * Returns 0 when no such line exists or the file cannot be read. */
+static long ini_key_line_length(const char* fname, const char* key)
+{
+    FILE* fp = fopen(fname, "r");
+    if (fp == NULL)
+        return 0;
+    const size_t key_len = strlen(key);
+    long longest = 0, len = 0;
+    size_t matched = 0; /* characters of `key` matched after the leading blanks */
+    enum { LEAD, KEY, AFTER_KEY, HIT, MISS } state = LEAD;
+    int c;
+    do
+    {
+        c = fgetc(fp);
+        if (c == '\n' || c == EOF)
+        {
+            if (state == HIT && len > longest)
+                longest = len;
+            len = 0;
+            matched = 0;
+            state = LEAD;
+            continue;
+        }
+        if (c != '\r')
+            len++;
+        if (state == LEAD && c != ' ' && c != '\t')
+            state = KEY;
+        if (state == KEY)
+        {
+            if (matched < key_len && c == key[matched])
+                matched++;
+            else
+                state = (matched == key_len) ? AFTER_KEY : MISS;
+        }
+        if (state == AFTER_KEY && c != ' ' && c != '\t')
+            state = (c == '=' || c == ':') ? HIT : MISS;
+    } while (c != EOF);
+    fclose(fp);
+    return longest;
+}
 
 /*
  * Ini configuration parser callback function  
@@ -142,7 +222,35 @@ static int handler(void* conf_struct, const char* section, const char* name,
     else if (MATCH("hw","name"))
         {pconfig->hw_name = strdup(value);}
     else if (MATCH("hw","unit_id"))
-        {pconfig->hw_unit_id = atoi(value);}
+    {
+        pconfig->hw_unit_id_auto = (strcmp(value, "auto") == 0);
+        pconfig->hw_unit_id = pconfig->hw_unit_id_auto ? 0 : atoi(value);
+    }
+    else if (MATCH("hw","serial_base"))
+    {
+        pconfig->serial_base = parse_int_or(value, -1);
+        pconfig->serial_keys_set = 1;
+    }
+    else if (MATCH("hw","device_serials"))
+    {
+        free(pconfig->device_serials);
+        pconfig->device_serials = strdup(value);
+        if (value[0] != '\0')
+            pconfig->serial_keys_set = 1;
+    }
+    else if (MATCH("daq","usb_ring_buffers"))
+        {pconfig->usb_ring_buffers = parse_int_or(value, -1);}
+    else if (MATCH("daq","usb_async_transfers"))
+        {pconfig->usb_async_transfers = parse_int_or(value, -1);}
+    else if (MATCH("daq","zmq_listen_address"))
+    {
+        /* Empty value = key absent (keep "*"); "localhost" is not accepted by
+         * zmq_bind, so it maps to the loopback address. */
+        if (strcmp(value, "localhost") == 0)
+            snprintf(rtl_daq_zmq_bind, sizeof(rtl_daq_zmq_bind), "%s", "127.0.0.1");
+        else if (value[0] != '\0')
+            snprintf(rtl_daq_zmq_bind, sizeof(rtl_daq_zmq_bind), "%.63s", value);
+    }
     else if (MATCH("hw", "ioo_type"))
         {pconfig->ioo_type = atoi(value);}
     else if (MATCH("hw","en_bias_tee"))
@@ -208,9 +316,11 @@ void * fifo_read_tf(void* arg)
     // Initialize ZMQ Socket
     void *context   = zmq_ctx_new ();
     void *responder = zmq_socket (context, ZMQ_REP);
-    char zmq_addr[64];
-    sprintf(zmq_addr, "tcp://*:%d", rtl_daq_zmq_port);
+    char zmq_addr[96];
+    snprintf(zmq_addr, sizeof(zmq_addr), "tcp://%s:%d", rtl_daq_zmq_bind, rtl_daq_zmq_port);
     int rc          = zmq_bind (responder, zmq_addr);
+    if(rc!=0 && strcmp(rtl_daq_zmq_bind, "*") != 0)
+        log_fatal("ZMQ bind to %s failed ([daq] zmq_listen_address): %s", zmq_addr, zmq_strerror(zmq_errno()));
     assert (rc == 0);
     if(rc!=0)
     {        
@@ -223,6 +333,10 @@ void * fifo_read_tf(void* arg)
     }
     int zmq_rcv_timeout_ms = 500;
     zmq_setsockopt(responder, ZMQ_RCVTIMEO, &zmq_rcv_timeout_ms, sizeof(zmq_rcv_timeout_ms));
+
+    /* Per-channel parameter loops never read past the 31 values a message holds */
+    const int n_ch_params = ch_no < ZMQ_MAX_CH_PARAMS ? (int) ch_no : ZMQ_MAX_CH_PARAMS;
+    int r_deprecation_logged = 0;
 
     // Initialize message structure
     struct hdaq_im_msg_struct* msg;
@@ -240,6 +354,14 @@ void * fifo_read_tf(void* arg)
         }
         log_info("IM Request from: %d",msg->source_module_identifier);
         log_info("Command id: %c",msg->command_identifier);
+
+        /* The parameters start at byte offset 2 of the message: copy the 31
+         * four-byte values into aligned storage instead of dereferencing a
+         * misaligned uint32_t / float pointer (undefined behaviour). */
+        uint32_t param_u32[ZMQ_MAX_CH_PARAMS];
+        float param_f32[ZMQ_MAX_CH_PARAMS];
+        memcpy(param_u32, msg->parameters, sizeof(param_u32));
+        memcpy(param_f32, msg->parameters, sizeof(param_f32));
         
         /* Log the request BEFORE taking buff_ind_mutex: log_log() performs
          * blocking file-backed I/O (stderr is redirected to a log file by the
@@ -248,7 +370,12 @@ void * fifo_read_tf(void* arg)
          * to this thread, so it is safe to inspect outside the mutex. */
         if( msg->command_identifier == 'r')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            const uint32_t * parameters = param_u32;
+            if (!r_deprecation_logged)
+            {
+                log_warn("ZMQ 'r' reconfiguration is deprecated");
+                r_deprecation_logged = 1;
+            }
             log_info("Signal 'r': Reconfiguring the tuner");
             log_info("Center freq: %u MHz", ((unsigned int) parameters[0]/1000000));
             log_info("Sample rate: %u MSps", ((unsigned int) parameters[1]/1000000));
@@ -256,15 +383,15 @@ void * fifo_read_tf(void* arg)
         }
         else if (msg->command_identifier == 'c')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            const uint32_t * parameters = param_u32;
             log_info("Signal 'c': Center frequency tuning request");
             log_info("New center frequency: %u MHz", ((unsigned int) parameters[0]/1000000));
         }
         else if( msg->command_identifier == 'g')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            const uint32_t * parameters = param_u32;
             log_info("Signal 'g': Gain tuning request");
-            for(int i=0;i<ch_no;i++){
+            for(int i=0;i<n_ch_params;i++){
                 log_info("Channel: %d, Gain: %f dB",i, (float) parameters[i]/10);
             }
         }
@@ -274,9 +401,9 @@ void * fifo_read_tf(void* arg)
         }
         else if( msg->command_identifier == 's')
         {
-            float * parameters = (float * ) msg->parameters;
+            const float * parameters = param_f32;
             log_info("Signal 's': Sampling frequency correction");
-            for(int i=0;i<ch_no;i++){
+            for(int i=0;i<n_ch_params;i++){
                 log_info("Channel: %d, fs ppm offset: %.8f",i, parameters[i]);
             }
         }
@@ -290,9 +417,9 @@ void * fifo_read_tf(void* arg)
         }
         else if (msg->command_identifier == 'b')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            const uint32_t * parameters = param_u32;
             log_info("Signal 'b': runtime bias-tee switch request");
-            for(int i=0;i<ch_no;i++){
+            for(int i=0;i<n_ch_params;i++){
                 log_info("Channel: %d, bias-tee: %d", i, parameters[i] ? 1 : 0);
             }
         }
@@ -308,7 +435,7 @@ void * fifo_read_tf(void* arg)
         /* Tuner reconfiguration request */
         if( msg->command_identifier == 'r')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            const uint32_t * parameters = param_u32;
             for(int i=0; i<ch_no; i++)
             {
               rtl_receivers[i].gain = (int) parameters[2];
@@ -320,15 +447,15 @@ void * fifo_read_tf(void* arg)
         /* Center Frequency Tuning */
         else if (msg->command_identifier == 'c')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
+            const uint32_t * parameters = param_u32;
             new_center_freq = parameters[0];
             center_freq_change_flag = 1;
         }
         /* Gain tuning*/
         else if( msg->command_identifier == 'g')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
-            for(int i=0;i<ch_no;i++){
+            const uint32_t * parameters = param_u32;
+            for(int i=0;i<n_ch_params;i++){
                 new_gains[i] = (int) parameters[i];
             }
             gain_change_flag=1;
@@ -341,8 +468,8 @@ void * fifo_read_tf(void* arg)
         /* Sampling Freq Correction - Used for sampling clock delay tuning*/
         else if( msg->command_identifier == 's')
         {
-            float * parameters = (float * ) msg->parameters;
-            for(int i=0;i<ch_no;i++){
+            const float * parameters = param_f32;
+            for(int i=0;i<n_ch_params;i++){
                 new_fs_corrections[i] = parameters[i];
             }
             fs_reset_cntr = 0;
@@ -356,8 +483,8 @@ void * fifo_read_tf(void* arg)
         /* Runtime inline-LNA bias-tee switch request */
         else if (msg->command_identifier == 'b')
         {
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
-            for(int i=0;i<ch_no;i++){
+            const uint32_t * parameters = param_u32;
+            for(int i=0;i<n_ch_params;i++){
                 new_bias_states[i] = parameters[i] ? 1 : 0;
             }
             bias_change_flag = 1;
@@ -408,7 +535,7 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx)
 {
     struct rtl_rec_struct *rtl_rec = (struct rtl_rec_struct *) ctx;// Set the receiver's structure
 
-    int wr_buff_ind = (int)(rtl_rec->buff_ind % NUM_BUFF); // Calculate current buffer index in the circular buffer
+    int wr_buff_ind = (int)(rtl_rec->buff_ind % (unsigned long long) num_buff); // Calculate current buffer index in the circular buffer
 
     /* Guard against short (or oversized) USB transfers: publishing a partially
      * filled slot would silently break multichannel coherence. Copy what
@@ -584,11 +711,45 @@ void *read_thread_entry(void *arg)
 
         /* Starting Asychronous read*/
         pthread_barrier_wait(&rtl_init_barrier);
-        rtlsdr_read_async(dev, rtlsdrCallback, rtl_rec, ASYNC_BUF_NUMBER, buffer_size);
+        rtlsdr_read_async(dev, rtlsdrCallback, rtl_rec, (uint32_t) async_buf_number, buffer_size);
     }    
 return NULL;
 }
 
+
+#ifdef USEPIGPIO
+/* [hw] antenna_switch_gpio pre-pass: read before pigpio is initialised (which
+ * happens before the main ini_parse, as it always has). Reads that one key
+ * only and never logs; a parse error is reported by the main parse. */
+typedef struct
+{
+    int present;
+    char value[64];
+} gpio_prepass_cfg;
+
+static int gpio_prepass_handler(void* conf_struct, const char* section, const char* name,
+                                const char* value)
+{
+    gpio_prepass_cfg* pcfg = (gpio_prepass_cfg*) conf_struct;
+    if (strcmp(section, "hw") == 0 && strcmp(name, "antenna_switch_gpio") == 0)
+    {
+        pcfg->present = (value[0] != '\0'); /* empty value = key absent (pins 23/24) */
+        snprintf(pcfg->value, sizeof(pcfg->value), "%s", value);
+    }
+    return 1;
+}
+
+/* "A,B": two distinct BCM GPIO numbers 0..27. Returns 0 on success. */
+static int parse_gpio_pair(const char* value, int* a, int* b)
+{
+    char tail;
+    if (sscanf(value, " %d , %d %c", a, b, &tail) != 2)
+        return -1;
+    if (*a < 0 || *a > 27 || *b < 0 || *b > 27 || *a == *b)
+        return -1;
+    return 0;
+}
+#endif
 
 // Memory locking for real-time performance
 int init_rt_memory(void) {
@@ -620,19 +781,42 @@ int main( int argc, char** argv )
     configuration config;
     memset(&config, 0, sizeof(config));
     config.port_stride = 100;
+    config.serial_base = 1000;
+    config.usb_ring_buffers = 8;
+    config.usb_async_transfers = 12;
 
     #ifdef USEPIGPIO
-    // PIGPIO
-    if (gpioInitialise() < 0)
     {
-       log_fatal("pigpio init failed");
-       return -1;
+        gpio_prepass_cfg gpio_cfg;
+        memset(&gpio_cfg, 0, sizeof(gpio_cfg));
+        (void) ini_parse(INI_FNAME, gpio_prepass_handler, &gpio_cfg);
+        if (gpio_cfg.present && strcmp(gpio_cfg.value, "none") == 0)
+        {
+            ant_gpio_enabled = 0;
+            log_info("antenna switch GPIO: none (skipped)");
+        }
+        else if (gpio_cfg.present &&
+                 parse_gpio_pair(gpio_cfg.value, &ant_gpio_a, &ant_gpio_b) != 0)
+        {
+            log_fatal("Invalid [hw] antenna_switch_gpio '%s': use 'none' or two distinct GPIO numbers 0..27 as 'A,B'",
+                      gpio_cfg.value);
+            return -1;
+        }
     }
+    if (ant_gpio_enabled)
+    {
+        // PIGPIO
+        if (gpioInitialise() < 0)
+        {
+           log_fatal("pigpio init failed");
+           return -1;
+        }
 
-    gpioSetMode(23, PI_OUTPUT);
-    gpioSetMode(24, PI_OUTPUT);
-    gpioWrite(23, 1); /* enable antenna input 1 by default */
-    gpioWrite(24, 0); /* disable antenna input 2 */
+        gpioSetMode(ant_gpio_a, PI_OUTPUT);
+        gpioSetMode(ant_gpio_b, PI_OUTPUT);
+        gpioWrite(ant_gpio_a, 1); /* enable antenna input 1 by default */
+        gpioWrite(ant_gpio_b, 0); /* disable antenna input 2 */
+    }
     #endif
 
     /* Set parameters from the config file*/
@@ -655,6 +839,47 @@ int main( int argc, char** argv )
     {
         log_fatal("Invalid or missing daq_buffer_size in configuration: %d", config.daq_buffer_size);
         return -1;
+    }
+    if (config.usb_ring_buffers < USB_DEPTH_MIN || config.usb_ring_buffers > USB_DEPTH_MAX)
+    {
+        log_fatal("Invalid [daq] usb_ring_buffers: %d (allowed %d..%d)",
+                  config.usb_ring_buffers, USB_DEPTH_MIN, USB_DEPTH_MAX);
+        return -1;
+    }
+    if (config.usb_async_transfers < USB_DEPTH_MIN || config.usb_async_transfers > USB_DEPTH_MAX)
+    {
+        log_fatal("Invalid [daq] usb_async_transfers: %d (allowed %d..%d)",
+                  config.usb_async_transfers, USB_DEPTH_MIN, USB_DEPTH_MAX);
+        return -1;
+    }
+    num_buff = config.usb_ring_buffers;
+    async_buf_number = config.usb_async_transfers;
+
+    /* inih keeps INI_MAX_LINE-1 bytes per line: the rest of a longer
+     * device_serials line becomes a bogus key or a continuation that replaces
+     * the value, so the list would be silently cut. Refuse it by name. */
+    if (config.device_serials != NULL && config.device_serials[0] != '\0')
+    {
+        long len = ini_key_line_length(INI_FNAME, "device_serials");
+        if (len > INI_MAX_LINE - 1)
+        {
+            log_fatal("[hw] device_serials line is %ld bytes long; the INI reader keeps at most %d bytes"
+                      " per line - shorten it (e.g. drop the spaces after the commas)",
+                      len, INI_MAX_LINE - 1);
+            return -1;
+        }
+    }
+
+    /* Channel -> device serial map ([hw] device_serials, else serial_base + i) */
+    char serials[DEVICE_MAP_MAX_CH][DEVICE_MAP_SERIAL_LEN];
+    {
+        char map_err[128];
+        if (device_map_resolve(config.device_serials, config.serial_base, config.num_ch,
+                               serials, map_err, sizeof map_err) != 0)
+        {
+            log_fatal("device map: %s", map_err);
+            return -1;
+        }
     }
     buffer_size = config.daq_buffer_size*2;
     ch_no = config.num_ch;
@@ -709,6 +934,47 @@ int main( int argc, char** argv )
         ctr_channel_dev_index=0;
     }
 
+    /* Duplicate-serial defence: two attached devices carrying the same serial
+     * make rtlsdr_get_index_by_serial() silently pick the first one. Fatal when
+     * the serials were configured explicitly, a warning otherwise (today's
+     * first-match behaviour is kept so a working config keeps working). */
+    {
+        int n_present = (int) rtlsdr_get_device_count();
+        char (*present)[DEVICE_MAP_SERIAL_LEN] = NULL;
+        if (n_present > 0)
+        {
+            present = calloc((size_t) n_present, sizeof(*present));
+            if (!present)
+            {
+                log_fatal("Device serial list allocation failed. Exiting..");
+                return -1;
+            }
+            for (int j = 0; j < n_present; j++)
+            {
+                char manufact[256], product[256], serial[256];
+                serial[0] = '\0';
+                if (rtlsdr_get_device_usb_strings((uint32_t) j, manufact, product, serial) == 0)
+                    snprintf(present[j], DEVICE_MAP_SERIAL_LEN, "%.15s", serial);
+            }
+        }
+        for (int i = 0; i < ch_no; i++)
+        {
+            int n = device_map_count(serials[i], (const char (*)[DEVICE_MAP_SERIAL_LEN]) present, n_present);
+            if (n <= 1)
+                continue;
+            if (config.serial_keys_set)
+            {
+                log_fatal("serial %s is present on %d devices; program distinct serials with util/set_unit_serials.sh",
+                          serials[i], n);
+                free(present);
+                return -1;
+            }
+            log_warn("serial %s is present on %d devices; program distinct serials with util/set_unit_serials.sh",
+                     serials[i], n);
+        }
+        free(present);
+    }
+
     /* Allocation */    
     struct iq_header_struct* iq_header = calloc(1, sizeof(struct iq_header_struct));
     
@@ -723,11 +989,17 @@ int main( int argc, char** argv )
         memset(rtl_rec, 0, sizeof(struct rtl_rec_struct));
 
         // Get device index by serial number
-        sprintf(dev_serial, "%d", 1000+i);
+        strcpy(dev_serial, serials[i]);
         int dev_index = rtlsdr_get_index_by_serial(dev_serial);
         rtl_rec->dev_ind = dev_index;
         log_info("Device serial:%s, index: %d",dev_serial, dev_index);
-        if(dev_index==-3){log_fatal("The serial numbers of the devices are not yet configured, exiting.."); return(-1);}
+        if(dev_index==-3)
+        {
+            log_fatal("The serial numbers of the devices are not yet configured (expected serial %s for channel %d;"
+                      " see [hw] serial_base/device_serials and util/set_unit_serials.sh), exiting..",
+                      dev_serial, i);
+            return(-1);
+        }
 
         // Set noise control channel        
         if(dev_index == ctr_channel_dev_index){ctr_channel_index=i;}
@@ -743,7 +1015,7 @@ int main( int argc, char** argv )
         rtl_rec->agc = 0;
         rtl_rec->center_freq = config.center_freq;
         rtl_rec->sample_rate = config.sample_rate;
-        rtl_rec->buffer = malloc(NUM_BUFF * buffer_size * sizeof(uint8_t));      
+        rtl_rec->buffer = malloc((size_t) num_buff * buffer_size * sizeof(uint8_t));      
         if(! rtl_rec->buffer)
         {
             log_fatal("Data buffer allocation failed. Exiting..");   
@@ -758,7 +1030,7 @@ int main( int argc, char** argv )
 	 * (the header was calloc'd and strncpy pads the remainder with NULs) */
 	strncpy(iq_header->hardware_id, config.hw_name ? config.hw_name : "",
 	        sizeof(iq_header->hardware_id)-1);
-	iq_header->unit_id=config.hw_unit_id;
+	iq_header->unit_id = config.hw_unit_id_auto ? config.instance_id : config.hw_unit_id;
 	iq_header->active_ant_chs=ch_no;
 	iq_header->ioo_type=config.ioo_type;
 	iq_header->rf_center_freq= (uint64_t) config.center_freq;
@@ -860,9 +1132,9 @@ int main( int argc, char** argv )
             if (rtl_rec->buff_ind <= read_buff_ind)
             {data_ready = 0; break;}
 
-            if((rtl_rec->buff_ind - read_buff_ind) >= NUM_BUFF)
+            if((rtl_rec->buff_ind - read_buff_ind) >= (unsigned long long) num_buff)
             {overrun_detected = 1;}
-            if(rtl_rec->buff_ind % NUM_BUFF == read_buff_ind % NUM_BUFF)
+            if(rtl_rec->buff_ind % (unsigned long long) num_buff == read_buff_ind % (unsigned long long) num_buff)
             {
                 /* Record the fact only; logging is blocking file I/O and must
                  * not run under buff_ind_mutex (every SCHED_FIFO USB callback
@@ -889,7 +1161,7 @@ int main( int argc, char** argv )
             pthread_mutex_unlock(&buff_ind_mutex);
             if (overrun_detected)
             {
-                /* The reader threads lapped the main loop in the NUM_BUFF-slot
+                /* The reader threads lapped the main loop in the num_buff-slot
                  * ring: unread transfers were overwritten, so channel data in
                  * this frame may come from different USB epochs (coherence not
                  * guaranteed). Detection only - the frame is still emitted with
@@ -900,8 +1172,9 @@ int main( int argc, char** argv )
                 overrun_cntr++;
                 if (overrun_cntr <= 5 || (overrun_cntr % 100) == 0)
                     log_warn("USB ring-buffer overrun (affected frame #%u): reader lag reached %d transfers."
-                             " Channel coherence is not guaranteed. Consider increasing the number of buffers.",
-                             overrun_cntr, NUM_BUFF);
+                             " Channel coherence is not guaranteed. Consider increasing the number of buffers."
+                             " - raise [daq] usb_ring_buffers (now %d)",
+                             overrun_cntr, num_buff, num_buff);
             }
             /*
              *---------------------
@@ -917,7 +1190,7 @@ int main( int argc, char** argv )
             iq_header->daq_block_index = (uint32_t) read_buff_ind;
             iq_header->reserved[IQH_RSV_BUFFER_OVERRUN_CNT] = overrun_cntr;
             /* Buffer slot of the frame that is being sent out in this iteration */
-            rd_buff_ind = (int)(read_buff_ind % NUM_BUFF);
+            rd_buff_ind = (int)(read_buff_ind % (unsigned long long) num_buff);
             for(int i=0; i<ch_no; i++)
             {
                 rtl_rec = &rtl_receivers[i];
@@ -1129,13 +1402,16 @@ int main( int argc, char** argv )
 
                     // Use pigpio to set Pi GPIO for third party Kerberos CKOVAL switches
                     #ifdef USEPIGPIO
-                    // Maintain GPIO state, as we may change to ant 2 in the Python code
-                    gpio_23 = gpioRead(23);
-                    gpio_24 = gpioRead(24);
+                    if (ant_gpio_enabled)
+                    {
+                        // Maintain GPIO state, as we may change to ant 2 in the Python code
+                        gpio_23 = gpioRead(ant_gpio_a);
+                        gpio_24 = gpioRead(ant_gpio_b);
 
-                    // Disconnect antennas
-                    gpioWrite(23, 0); /* enable antenna input 1 by default */
-                    gpioWrite(24, 0); /* disable antenna input 2 */
+                        // Disconnect antennas
+                        gpioWrite(ant_gpio_a, 0); /* enable antenna input 1 by default */
+                        gpioWrite(ant_gpio_b, 0); /* disable antenna input 2 */
+                    }
                     #endif
  
                     //rtlsdr_set_gpio(rtl_rec->dev, 1, 0);
@@ -1149,8 +1425,11 @@ int main( int argc, char** argv )
                     // Use pigpio to set Pi GPIO for third party Kerberos CKOVAL switches
                     #ifdef USEPIGPIO
                     // PIGPIO
-                    gpioWrite(23, gpio_23); /* enable antenna input 1 by default */
-                    gpioWrite(24, gpio_24); /* disable antenna input 2 */
+                    if (ant_gpio_enabled)
+                    {
+                        gpioWrite(ant_gpio_a, gpio_23); /* enable antenna input 1 by default */
+                        gpioWrite(ant_gpio_b, gpio_24); /* disable antenna input 2 */
+                    }
                     #endif
                 }
                 /*
@@ -1202,12 +1481,14 @@ int main( int argc, char** argv )
     free(rtl_receivers);
     free((char*)config.hw_name);
     free(config.en_bias_tee_str);
+    free(config.device_serials);
     pthread_mutex_destroy(&buff_ind_mutex);
     pthread_cond_destroy(&buff_ind_cond);
     log_info("All the resources are free now");
 
     #ifdef USEPIGPIO
-    gpioTerminate();
+    if (ant_gpio_enabled)
+        gpioTerminate();
     #endif
 
     return 0;

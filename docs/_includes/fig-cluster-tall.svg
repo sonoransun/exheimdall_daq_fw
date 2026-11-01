@@ -1,0 +1,49 @@
+<svg class="fig fig-tall" viewBox="0 0 320 560" role="img" aria-labelledby="clt-t clt-d">
+<title id="clt-t">Instances, hosts, the coordinator and the IQ router</title>
+<desc id="clt-d">A vertical version of the cluster. Host A runs instance 0 on base ports and instance 1 on ports offset by 100 with the inst1_ prefix. Host B runs one instance with its own receivers, opened by serial number. Below them, a coordinator on port 6000, driven by heimdall-ctl fleet, polls every instance's status port and sends commands to its control port; an IQ router reads every instance's IQ stream and serves one multi-client output on port 7000 to consumers. Channels are coherent within an instance, never across instances.</desc>
+<defs>
+<marker id="clta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow"/></marker>
+<marker id="cltc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-ctl"/></marker>
+</defs>
+<rect x="6" y="6" width="308" height="168" rx="14" class="fig-box fig-dash"/>
+<text x="20" y="28" class="fig-h">HOST A</text>
+<rect x="18" y="38" width="136" height="124" rx="10" class="fig-box fig-hot"/>
+<text x="86" y="60" class="fig-t" text-anchor="middle">instance 0</text>
+<path d="M54 74 h64 M54 82 h64 M54 90 h64 M54 98 h64 M54 106 h64" class="fig-lanes"/>
+<text x="86" y="130" class="fig-s" text-anchor="middle">1130 · 5000–5003</text>
+<text x="86" y="147" class="fig-s" text-anchor="middle">unprefixed</text>
+<rect x="166" y="38" width="136" height="124" rx="10" class="fig-box fig-hot"/>
+<text x="234" y="60" class="fig-t" text-anchor="middle">instance 1</text>
+<path d="M202 74 h64 M202 82 h64 M202 90 h64 M202 98 h64 M202 106 h64" class="fig-lanes"/>
+<text x="234" y="130" class="fig-s" text-anchor="middle">1230 · 5100–5103</text>
+<text x="234" y="147" class="fig-s" text-anchor="middle">prefix inst1_</text>
+<rect x="6" y="186" width="308" height="168" rx="14" class="fig-box fig-dash"/>
+<text x="20" y="208" class="fig-h">HOST B</text>
+<rect x="18" y="218" width="136" height="124" rx="10" class="fig-box fig-hot"/>
+<text x="86" y="240" class="fig-t" text-anchor="middle">instance 0</text>
+<path d="M54 254 h64 M54 262 h64 M54 270 h64 M54 278 h64 M54 286 h64" class="fig-lanes"/>
+<text x="86" y="310" class="fig-s" text-anchor="middle">1130 · 5000–5003</text>
+<text x="86" y="327" class="fig-s" text-anchor="middle">receivers by serial</text>
+<text x="170" y="262" class="fig-s">Channels are coherent</text>
+<text x="170" y="278" class="fig-s">within an instance,</text>
+<text x="170" y="294" class="fig-s">never across instances.</text>
+<path d="M80 410 V358" class="fig-ctl" marker-end="url(#cltc)"/>
+<text x="90" y="378" class="fig-s">polls :5002</text>
+<text x="90" y="393" class="fig-s">commands :5001</text>
+<path d="M240 356 V408" class="fig-flow" marker-end="url(#clta)"/>
+<text x="250" y="378" class="fig-m">:5000</text>
+<text x="250" y="393" class="fig-s">+ N × 100</text>
+<rect x="6" y="412" width="148" height="56" rx="10" class="fig-box fig-ctlbox"/>
+<text x="80" y="436" class="fig-t" text-anchor="middle">coordinator</text>
+<text x="80" y="454" class="fig-s" text-anchor="middle">:6000 · lease</text>
+<rect x="166" y="412" width="148" height="56" rx="10" class="fig-box"/>
+<text x="240" y="436" class="fig-t" text-anchor="middle">IQ router</text>
+<text x="240" y="454" class="fig-s" text-anchor="middle">:7000 · stats :7001</text>
+<path d="M80 498 V472" class="fig-ctl" marker-end="url(#cltc)"/>
+<path d="M240 470 V496" class="fig-flow" marker-end="url(#clta)"/>
+<rect x="6" y="500" width="148" height="52" rx="10" class="fig-box fig-soft"/>
+<text x="80" y="522" class="fig-t" text-anchor="middle">heimdall-ctl</text>
+<text x="80" y="539" class="fig-s" text-anchor="middle">fleet · router</text>
+<rect x="166" y="500" width="148" height="52" rx="10" class="fig-box fig-soft"/>
+<text x="240" y="531" class="fig-t" text-anchor="middle">consumers</text>
+</svg>

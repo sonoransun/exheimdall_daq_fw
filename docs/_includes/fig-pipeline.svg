@@ -1,0 +1,71 @@
+<svg class="fig fig-wide has-tall" viewBox="0 0 760 262" role="img" aria-labelledby="pl-t pl-d">
+<title id="pl-t">The journey of a sample through the HeIMDALL pipeline</title>
+<desc id="pl-d">Five RTL-SDR tuners feed rtl_daq over USB at 24 MB/s of 8-bit samples. rtl_daq emits 109.2 millisecond blocks to rebuffer, which assembles 0.437 second frames for decimate. decimate converts to complex float, 96 MB/s, and filters only when decimating. delay_sync aligns the channels and locks; the output stage is a shared-memory ring by default, or iq_server on TCP port 5000. hw_controller drives the tuners over ZMQ port 1130, reads frame headers from delay_sync and accepts commands on TCP port 5001.</desc>
+<defs>
+<marker id="pla" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow"/></marker>
+<marker id="plc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-ctl"/></marker>
+</defs>
+<g class="fig-tuners">
+<rect x="8" y="128" width="72" height="84" rx="8" class="fig-box"/>
+<path d="M18 142 h52 M18 156 h52 M18 170 h52 M18 184 h52 M18 198 h52" class="fig-lanes"/>
+<text x="44" y="104" class="fig-s" text-anchor="middle">5 tuners</text>
+<text x="44" y="118" class="fig-s" text-anchor="middle">one clock</text>
+</g>
+<path d="M82 170 H104" class="fig-flow" marker-end="url(#pla)"/>
+<g>
+<rect x="108" y="138" width="112" height="64" rx="10" class="fig-box fig-hot"/>
+<text x="164" y="166" class="fig-t" text-anchor="middle">rtl_daq</text>
+<text x="164" y="184" class="fig-s" text-anchor="middle">USB capture</text>
+<circle cx="112" cy="138" r="10" class="fig-num"/><text x="112" y="142" class="fig-numt" text-anchor="middle">1</text>
+</g>
+<path d="M222 170 H246" class="fig-flow" marker-end="url(#pla)"/>
+<g>
+<rect x="250" y="138" width="112" height="64" rx="10" class="fig-box"/>
+<text x="306" y="166" class="fig-t" text-anchor="middle">rebuffer</text>
+<text x="306" y="184" class="fig-s" text-anchor="middle">blocks → frames</text>
+<circle cx="254" cy="138" r="10" class="fig-num"/><text x="254" y="142" class="fig-numt" text-anchor="middle">2</text>
+</g>
+<path d="M364 170 H388" class="fig-flow" marker-end="url(#pla)"/>
+<g>
+<rect x="392" y="138" width="112" height="64" rx="10" class="fig-box"/>
+<text x="448" y="161" class="fig-t" text-anchor="middle">decimate</text>
+<text x="448" y="178" class="fig-s" text-anchor="middle">u8 → cf32</text>
+<text x="448" y="192" class="fig-s" text-anchor="middle">FIR if decimating</text>
+<circle cx="396" cy="138" r="10" class="fig-num"/><text x="396" y="142" class="fig-numt" text-anchor="middle">3</text>
+</g>
+<path d="M506 170 H530" class="fig-flow" marker-end="url(#pla)"/>
+<g>
+<rect x="534" y="138" width="112" height="64" rx="10" class="fig-box fig-hot"/>
+<text x="590" y="166" class="fig-t" text-anchor="middle">delay_sync</text>
+<text x="590" y="184" class="fig-s" text-anchor="middle">align + lock</text>
+<circle cx="538" cy="138" r="10" class="fig-num"/><text x="538" y="142" class="fig-numt" text-anchor="middle">4</text>
+</g>
+<path d="M648 170 H668" class="fig-flow" marker-end="url(#pla)"/>
+<g>
+<rect x="672" y="138" width="84" height="64" rx="10" class="fig-box"/>
+<text x="714" y="162" class="fig-t" text-anchor="middle">output</text>
+<text x="714" y="179" class="fig-s" text-anchor="middle">shmem</text>
+<text x="714" y="193" class="fig-s" text-anchor="middle">or TCP :5000</text>
+<circle cx="676" cy="138" r="10" class="fig-num"/><text x="676" y="142" class="fig-numt" text-anchor="middle">5</text>
+</g>
+<path d="M93 176 V214 M234 176 V214 M376 176 V214 M518 176 V214 M658 176 V214" class="fig-tick"/>
+<text x="93" y="230" class="fig-m" text-anchor="middle">24 MB/s</text>
+<text x="93" y="245" class="fig-s" text-anchor="middle">8-bit IQ</text>
+<text x="234" y="230" class="fig-m" text-anchor="middle">109.2 ms</text>
+<text x="234" y="245" class="fig-s" text-anchor="middle">blocks</text>
+<text x="376" y="230" class="fig-m" text-anchor="middle">0.437 s</text>
+<text x="376" y="245" class="fig-s" text-anchor="middle">frames</text>
+<text x="518" y="230" class="fig-m" text-anchor="middle">96 MB/s</text>
+<text x="518" y="245" class="fig-s" text-anchor="middle">complex float</text>
+<text x="658" y="230" class="fig-m" text-anchor="middle">locked</text>
+<text x="658" y="245" class="fig-s" text-anchor="middle">coherent</text>
+<rect x="250" y="26" width="254" height="56" rx="10" class="fig-box fig-ctlbox"/>
+<text x="377" y="50" class="fig-t" text-anchor="middle">hw_controller</text>
+<text x="377" y="68" class="fig-s" text-anchor="middle">calibration bursts · gain · scheduler</text>
+<path d="M250 54 H164 V134" class="fig-ctl" marker-end="url(#plc)"/>
+<text x="172" y="46" class="fig-s">ZMQ :1130</text>
+<path d="M590 134 V54 H508" class="fig-ctl" marker-end="url(#plc)"/>
+<text x="598" y="98" class="fig-s">frame headers</text>
+<path d="M440 4 V22" class="fig-ctl" marker-end="url(#plc)"/>
+<text x="450" y="16" class="fig-s">TCP :5001 control</text>
+</svg>

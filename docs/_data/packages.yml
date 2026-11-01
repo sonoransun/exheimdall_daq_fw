@@ -1,0 +1,130 @@
+# Work-package status for every badge on the site. Edit here; pages read it at build time.
+# As of 2026-11-01. "done" = implemented and reviewed in the working tree; nothing
+# is committed or tagged yet.
+#
+# badge: done | done · test defect | in review | in progress | planned
+# class: shipped (done) | risk (done with a known defect) | review | progress | planned
+# state: longer wording, used in tooltips.
+# WP-12, WP-13 and WP-14 are "in progress" because their files are on disk
+# (01:17-01:28); none of them has been reviewed.
+
+- id: WP-01
+  title: "IQ header reserved slots 103-113"
+  state: "done"
+  badge: "done"
+  class: shipped
+  tests: "29 tests pass on macOS and Linux; all three build lanes clean"
+- id: WP-02
+  title: "Shared federation helpers"
+  state: "done"
+  badge: "done"
+  class: shipped
+  tests: "136 tests pass"
+- id: WP-03
+  title: "rtl_daq ingress / device map"
+  state: "done"
+  badge: "done"
+  class: shipped
+  tests: "39 tests pass, as root and as a normal user"
+- id: WP-07
+  title: "Database instance awareness"
+  state: "done"
+  badge: "done"
+  class: shipped
+  tests: "50 tests pass with BerkeleyDB, none skipped"
+- id: WP-10
+  title: "Synthetic source"
+  state: "done (test defect)"
+  badge: "done · test defect"
+  class: risk
+  tests: "2 of 15 loop-model tests error; a two-line fix is known"
+- id: WP-17a
+  title: "CI infrastructure"
+  state: "done"
+  badge: "done"
+  class: shipped
+  tests: "Pending-module handling works as specified"
+- id: WP-05
+  title: "hw_controller control plane"
+  state: "in review"
+  badge: "in review"
+  class: review
+  tests: "95 tests pass on macOS; Linux run pending"
+- id: WP-11
+  title: "Config validation and discovery"
+  state: "in review"
+  badge: "in review"
+  class: review
+  tests: "75 tests pass"
+- id: WP-15
+  title: "heimdall-ctl"
+  state: "in review"
+  badge: "in review"
+  class: review
+  tests: "119 tests pass"
+- id: WP-04
+  title: "C data plane"
+  state: "in flight"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-06
+  title: "delay_sync, status, offload"
+  state: "in flight"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-08
+  title: "Federation core"
+  state: "in flight"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-09
+  title: "IQ router"
+  state: "in flight"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-12
+  title: "Launch/stop/supervise scripts"
+  state: "in flight, files on disk, not reviewed"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-13
+  title: "Capacity model and preflight"
+  state: "in flight, files on disk, not reviewed"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-14
+  title: "Provisioning"
+  state: "in flight, files on disk, not reviewed"
+  badge: "in progress"
+  class: progress
+  tests: "awaiting review"
+- id: WP-16
+  title: "Packaging (systemd, udev, install)"
+  state: "not started"
+  badge: "planned"
+  class: planned
+  tests: ""
+- id: WP-17b
+  title: "Cross-package integration tests"
+  state: "not started"
+  badge: "planned"
+  class: planned
+  tests: ""
+- id: WP-20
+  title: "Recording and replay"
+  state: "not started"
+  badge: "planned"
+  class: planned
+  tests: ""
+- id: WP-22
+  title: "Folded into WP-06"
+  state: "in flight"
+  badge: "in progress"
+  class: progress
+  tests: "see WP-06"

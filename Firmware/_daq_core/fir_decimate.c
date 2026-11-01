@@ -42,6 +42,7 @@
 #include "rtl_daq.h"
 #include "transport.h"
 #include "offload.h"
+#include "frame_sizes.h"
 
 static volatile sig_atomic_t sig_exit_flag = 0;
 
@@ -83,6 +84,8 @@ typedef struct
     int log_level;
     int instance_id;
     int port_stride;
+    int size_segments_from_config; /* [pre_processing], 0 = worst-case decimator_out */
+    int stamp_decimator_drops;     /* [monitoring], 1 = stamp header slot 109 */
     /* Offload configuration */
     char decimator_transport[64];
     char fir_engine[64];
@@ -114,6 +117,10 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {pconfig->instance_id = atoi(value);}
     else if (MATCH("federation", "port_stride"))
     {pconfig->port_stride = atoi(value);}
+    else if (MATCH("pre_processing", "size_segments_from_config"))
+    {pconfig->size_segments_from_config = atoi(value);}
+    else if (MATCH("monitoring", "stamp_decimator_drops"))
+    {pconfig->stamp_decimator_drops = atoi(value);}
     else if (MATCH("offload", "decimator_transport"))
     {strncpy(pconfig->decimator_transport, value, sizeof(pconfig->decimator_transport)-1);}
     else if (MATCH("offload", "fir_engine"))
@@ -189,12 +196,10 @@ int main(int argc, char **argv)
 
     transport_type_t transport_type = transport_type_from_string(config.decimator_transport);
 
-    /* Calculate input buffer size */
-    size_t input_buf_size;
-    if((config.cpi_size*dec)>=config.cal_size)
-        input_buf_size = config.cpi_size*config.num_ch*dec*4*2+IQ_HEADER_LENGTH;
-    else
-        input_buf_size = config.cal_size*config.num_ch*4*2+IQ_HEADER_LENGTH;
+    /* Calculate input buffer size (mapping only; rebuffer.out creates the
+     * u8 object, see frame_sizes.h) */
+    size_t input_buf_size = hd_decimator_in_consumer_map_bytes(
+        config.num_ch, config.cpi_size, dec, config.cal_size);
 
     /* Initialize input transport (consumer) */
     struct transport_handle* input_transport = transport_create(
@@ -206,8 +211,20 @@ int main(int argc, char **argv)
     if (succ != 0) {FATAL_ERR("Input transport initialization failed")}
     else{log_info("Input transport interface succesfully initialized");}
 
-    /* Initialize output transport (producer) */
-    size_t output_buf_size = MAX_IQFRAME_PAYLOAD_SIZE*ch_no*4*2+IQ_HEADER_LENGTH;
+    /* Initialize output transport (producer). The default sizes the
+     * decimator_out segments for the 2^23-sample worst case; with
+     * [pre_processing] size_segments_from_config = 1 they are sized for the
+     * configured frames (the delay_sync consumer maps the object size). */
+    size_t output_buf_size;
+    if (config.size_segments_from_config)
+    {
+        if (ch_no < 1 || config.cpi_size < 1 || config.cal_size < 1)
+        {FATAL_ERR("size_segments_from_config = 1 requires positive num_ch, cpi_size and corr_size")}
+        output_buf_size = hd_iq_frame_bytes(ch_no, config.cpi_size, config.cal_size);
+        log_info("decimator_out segments sized from config: %zu bytes", output_buf_size);
+    }
+    else
+        output_buf_size = hd_worst_frame_bytes(ch_no);
     struct transport_handle* output_transport = transport_create(
         "decimator_out", output_buf_size, true,
         drop_mode ? FLOW_DROP : FLOW_BACKPRESSURE,
@@ -228,13 +245,13 @@ int main(int argc, char **argv)
     offload_engine_t engine_type = offload_engine_from_string(config.fir_engine);
 
     /* Allocate FIR I/O buffers (platform-agnostic) */
-    float* fir_input_buffer_i = malloc(config.cpi_size*dec*sizeof(float));
-    float* fir_input_buffer_q = malloc(config.cpi_size*dec*sizeof(float));
+    float* fir_input_buffer_i = malloc((size_t)config.cpi_size*(size_t)dec*sizeof(float));
+    float* fir_input_buffer_q = malloc((size_t)config.cpi_size*(size_t)dec*sizeof(float));
     CHK_MALLOC(fir_input_buffer_i)
     CHK_MALLOC(fir_input_buffer_q)
 
-    float* fir_output_buffer_i = malloc(config.cpi_size*sizeof(float));
-    float* fir_output_buffer_q = malloc(config.cpi_size*sizeof(float));
+    float* fir_output_buffer_i = malloc((size_t)config.cpi_size*sizeof(float));
+    float* fir_output_buffer_q = malloc((size_t)config.cpi_size*sizeof(float));
     CHK_MALLOC(fir_output_buffer_i)
     CHK_MALLOC(fir_output_buffer_q)
 
@@ -242,8 +259,17 @@ int main(int argc, char **argv)
     float* fir_coeffs = malloc(tap_size*sizeof(float));
     CHK_MALLOC(fir_coeffs)
 
-    FILE * fir_coeff_fd = fopen(FIR_COEFF, "r");
-    if (fir_coeff_fd == NULL) {FATAL_ERR("Failed to open FIR coefficient file")}
+    /* Instance N > 0 reads _data_control/inst<N>_fir_coeffs.txt, written by
+     * fir_filter_designer.py for the same instance_id */
+    char fir_coeff_path[512];
+    build_fifo_path(fir_coeff_path, config.instance_id, FIR_COEFF);
+    FILE * fir_coeff_fd = fopen(fir_coeff_path, "r");
+    if (fir_coeff_fd == NULL)
+    {
+        log_fatal("Failed to open FIR coefficient file %s: cannot open coefficients (%s)",
+                  fir_coeff_path, strerror(errno));
+        return -1;
+    }
     int k=0;
     while (k < (int)tap_size && fscanf(fir_coeff_fd, "%f", &fir_coeffs[k]) == 1)
         k++;
@@ -253,7 +279,7 @@ int main(int argc, char **argv)
     int extra_status = (k == (int)tap_size) ? fscanf(fir_coeff_fd, "%f", &extra_coeff) : EOF;
     fclose(fir_coeff_fd);
     if (k == (int)tap_size && extra_status != 1)
-    {log_info("FIR filter coefficients initialized, tap size: %d",k);}
+    {log_info("FIR coefficients: %s (%d taps)", fir_coeff_path, k);}
     else{FATAL_ERR("FIR filter coefficient file does not match the configured tap size")}
 
     /* Create and initialize FIR offload engine */
@@ -302,6 +328,8 @@ int main(int argc, char **argv)
                 iq_header->data_type = 3; // Data type is decimated IQ
                 iq_header->sample_bit_depth = 32; // Complex float 32
                 iq_header->cpi_index = cpi_index;
+                if (config.stamp_decimator_drops)
+                    iq_header->reserved[IQH_RSV_DECIMATOR_DROP_CNT] = (uint32_t)output_transport->dropped_frames;
 
                 if (iq_header->frame_type==FRAME_TYPE_DATA && dec > 1)
                 {

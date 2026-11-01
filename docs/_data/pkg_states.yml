@@ -1,0 +1,17 @@
+# Badge states in display order, with the legend wording. Used by the legends,
+# the status table order and the per-card package summaries.
+- badge: "done"
+  class: shipped
+  meaning: "implemented and reviewed in the working tree"
+- badge: "done · test defect"
+  class: risk
+  meaning: "implemented and reviewed, but one of its tests fails"
+- badge: "in review"
+  class: review
+  meaning: "implemented, verification under way"
+- badge: "in progress"
+  class: progress
+  meaning: "being implemented now"
+- badge: "planned"
+  class: planned
+  meaning: "specified, not started"

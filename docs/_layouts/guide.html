@@ -1,0 +1,23 @@
+---
+layout: default
+main_class: page guide
+---
+<div class="wrap guide-wrap">
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="{{ '/library.html' | relative_url }}">Library</a>
+    <span aria-hidden="true">/</span>
+    <span>{{ page.title }}</span>
+  </nav>
+  <aside class="synced-note">
+    <p>Synced from <code>Documentation/{{ page.source_file }}</code>.{% if page.has_badges %} Notes marked <span class="vnote-k">Described from the design</span> cover work that has not been reviewed; they show the package's state as of <span class="nowrap">{{ site.as_of }}</span>. Unmarked text may describe unreviewed work too; check the <a href="{{ '/status.html' | relative_url }}">status page</a>.{% endif %}</p>
+    {%- if page.verify_wp %}
+    {% include verify_note.html wp=page.verify_wp block=true lead="This whole guide describes unreviewed work" %}
+    {%- endif %}
+  </aside>
+  <article class="prose">
+{{ content }}
+  </article>
+  <nav class="guide-foot" aria-label="Guide">
+    <a href="{{ '/library.html' | relative_url }}">&larr; Back to the library</a>
+  </nav>
+</div>

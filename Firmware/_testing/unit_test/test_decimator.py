@@ -34,6 +34,7 @@ import numpy as np
 import warnings
 from struct import pack
 import time
+import threading
 from configparser import ConfigParser
 from scipy import signal
 
@@ -53,6 +54,8 @@ from iq_header import IQHeader
 from capture_shmem_stream import IQFrameRecorder
 from gen_ramp import rampFrameGenator
 from gen_std_frame import stdFrameGenator
+from gen_utils import wait_consumer_done
+from shmemIface import inShmemIface, outShmemIface
 
 # plotly is only needed by the (development-skipped) transfer/phase report
 # checkers - do not make the whole suite depend on it. Without plotly the
@@ -797,3 +800,311 @@ class TesterDecimatorModule(unittest.TestCase):
         with open(self.config_filename, 'w') as configfile:
             parser.write(configfile)
         return 0
+
+
+#############################################
+#   WP-04: segment sizing, drop stamping,   #
+#   per-instance FIR coefficients           #
+#############################################
+
+DECIMATE_BIN = join(daq_core_path, "decimate.out")
+SHM_DIR = "/dev/shm"
+MAX_IQFRAME_PAYLOAD_SIZE = 2**23  # rtl_daq.h
+RSV_DECIMATOR_DROP_CNT = 109      # iq_header.h IQH_RSV_DECIMATOR_DROP_CNT
+
+
+def _page_round(nbytes):
+    page = os.sysconf("SC_PAGE_SIZE")
+    return (nbytes + page - 1) // page * page
+
+
+def _shm_name(instance_id, base):
+    return base if instance_id == 0 else "inst{:d}_{:s}".format(instance_id, base)
+
+
+def _shm_mapping_len(pid, shm_name):
+    """Length of the mapping of /dev/shm/<shm_name> in process <pid>."""
+    with open("/proc/{:d}/maps".format(pid)) as maps:
+        for line in maps:
+            fields = line.split()
+            if len(fields) >= 6 and fields[5] == join(SHM_DIR, shm_name):
+                start, end = (int(x, 16) for x in fields[0].split("-"))
+                return end - start
+    return None
+
+
+class _CU8FrameSource(threading.Thread):
+    """Producer of 'decimator_in' (rebuffer.out's role): DATA frames of
+    M x N complex uint8 samples with a seeded, frame-dependent payload."""
+
+    def __init__(self, frames, N, M=4, instance_id=0, seed=1, delay=0.0):
+        threading.Thread.__init__(self, daemon=True)
+        self.frames, self.N, self.M = frames, N, M
+        self.instance_id, self.seed, self.delay = instance_id, seed, delay
+        self.size = 1024 + N * M * 2
+
+    def run(self):
+        iface = outShmemIface("decimator_in", self.size, drop_mode=False,
+                              instance_id=self.instance_id)
+        if not iface.init_ok:
+            iface.destory_sm_buffer()
+            return
+        rng = np.random.default_rng(self.seed)
+        header = IQHeader()
+        header.sync_word = IQHeader.SYNC_WORD
+        header.frame_type = IQHeader.FRAME_TYPE_DATA
+        header.active_ant_chs = self.M
+        header.cpi_length = self.N
+        header.sample_bit_depth = 8
+        header.adc_sampling_freq = 2400000
+        header.sampling_freq = 2400000
+        for b in range(self.frames):
+            header.daq_block_index = b
+            payload = rng.integers(0, 256, self.N * self.M * 2, dtype=np.uint8)
+            idx = iface.wait_buff_free()
+            if idx not in (0, 1):
+                break
+            buf = iface.buffers[idx]
+            buf[0:1024] = np.frombuffer(header.encode_header(), dtype=np.uint8)
+            buf[1024:1024 + len(payload)] = payload
+            iface.send_ctr_buff_ready(idx)
+            if self.delay:
+                time.sleep(self.delay)
+        iface.send_ctr_terminate()
+        wait_consumer_done(iface)
+        iface.destory_sm_buffer()
+
+
+class _FrameCapture(threading.Thread):
+    """Consumer of a cf32 stream that keeps every frame in memory. A
+    per-frame delay makes it a slow consumer (drop-mode producers drop)."""
+
+    def __init__(self, shmem_name, instance_id=0, delay=0.0):
+        threading.Thread.__init__(self, daemon=True)
+        self.delay = delay
+        self.frames = []  # (header_bytes, payload_bytes)
+        self.iface = inShmemIface(shmem_name, instance_id=instance_id)
+        self.object_sizes = [m.size for m in self.iface.memories]
+
+    def run(self):
+        header = IQHeader()
+        while True:
+            idx = self.iface.wait_buff_free()
+            if idx not in (0, 1):
+                break
+            buf = self.iface.buffers[idx]
+            hdr = buf[0:1024].tobytes()
+            header.decode_header(hdr)
+            nbytes = header.cpi_length * header.active_ant_chs * 2 * (header.sample_bit_depth // 8)
+            self.frames.append((hdr, buf[1024:1024 + nbytes].tobytes()))
+            if self.delay:
+                time.sleep(self.delay)
+            self.iface.send_ctr_buff_ready(idx)
+        self.iface.destory_sm_buffer()
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(DECIMATE_BIN),
+                     "needs Linux and a built decimate.out")
+class TesterDecimatorWP04(unittest.TestCase):
+    """[pre_processing] size_segments_from_config, [monitoring]
+    stamp_decimator_drops and the instance-prefixed FIR coefficient file
+    (spec I.4 #6, G.6, B.2). Runs in a private temp cwd like the suite above."""
+
+    M = 4
+
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="decimator_wp04_")
+        self.prev_cwd = os.getcwd()
+        shutil.copyfile(live_config_filename, join(self.workdir, "daq_chain_config.ini"))
+        os.makedirs(join(self.workdir, "_data_control"))
+        os.makedirs(join(self.workdir, "_logs"))
+        os.chdir(self.workdir)
+        self.instance_id = 0
+        self.log_name = join(self.workdir, "decimator.log")
+
+    def tearDown(self):
+        os.chdir(self.prev_cwd)
+        shutil.rmtree(self.workdir, ignore_errors=True)
+        # A decimate.out that failed after its transport init leaves its
+        # inst<N>_ producer segments behind (instance 0 names are never
+        # touched: they may belong to a running chain)
+        if self.instance_id != 0:
+            for name in ("decimator_out_A", "decimator_out_B"):
+                path = join(SHM_DIR, _shm_name(self.instance_id, name))
+                if os.path.exists(path):
+                    os.remove(path)
+
+    # ---------- helpers ----------
+    def _configure(self, N, R, N_cal, K, instance_id=0, **keys):
+        """keys: {'section__key': value} for optional keys."""
+        parser = ConfigParser()
+        parser.read("daq_chain_config.ini")
+        parser["hw"]["num_ch"] = str(self.M)
+        parser["pre_processing"]["cpi_size"] = str(N)
+        parser["pre_processing"]["decimation_ratio"] = str(R)
+        parser["daq"]["daq_buffer_size"] = str(N)
+        parser["calibration"]["corr_size"] = str(N_cal)
+        parser["pre_processing"]["fir_relative_bandwidth"] = "1.0"
+        parser["pre_processing"]["fir_tap_size"] = str(K)
+        parser["pre_processing"]["fir_window"] = "hann"
+        parser["pre_processing"]["en_filter_reset"] = "0"
+        parser["daq"]["log_level"] = "2"
+        if not parser.has_section("federation"):
+            parser.add_section("federation")
+        parser["federation"]["instance_id"] = str(instance_id)
+        for name, value in keys.items():
+            section, key = name.split("__")
+            if not parser.has_section(section):
+                parser.add_section(section)
+            parser[section][key] = str(value)
+        with open("daq_chain_config.ini", "w") as f:
+            parser.write(f)
+        self.instance_id = instance_id
+        prefix = "" if instance_id == 0 else "inst{:d}_".format(instance_id)
+        for fifo in ("fw_decimator_in", "bw_decimator_in", "fw_decimator_out", "bw_decimator_out"):
+            path = join("_data_control", prefix + fifo)
+            if not os.path.exists(path):
+                os.mkfifo(path)
+
+    def _design(self):
+        res = subprocess.run([sys.executable, join(root_path, "fir_filter_designer.py")],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def _run(self, frames, N, args=("0",), delay=0.0, seed=1, source_delay=0.0):
+        """Runs source -> decimate.out -> capture; returns a result dict."""
+        source = _CU8FrameSource(frames, N, M=self.M, instance_id=self.instance_id,
+                                 seed=seed, delay=source_delay)
+        source.start()
+        with open(self.log_name, "w") as log:
+            proc = subprocess.Popen([DECIMATE_BIN] + list(args),
+                                    stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                capture = _FrameCapture("decimator_out", instance_id=self.instance_id, delay=delay)
+                result = {"maps_in": None, "object_size": None}
+                if capture.iface.init_ok:
+                    result["maps_in"] = _shm_mapping_len(
+                        proc.pid, _shm_name(self.instance_id, "decimator_in_A"))
+                    result["object_size"] = os.stat(join(
+                        SHM_DIR, _shm_name(self.instance_id, "decimator_out_A"))).st_size
+                    capture.start()
+                    capture.join(timeout=120)
+                result["returncode"] = proc.wait(timeout=120)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        source.join(timeout=30)
+        with open(self.log_name) as log:
+            result["log"] = log.read()
+        result["frames"] = capture.frames
+        result["init_ok"] = capture.iface.init_ok
+        return result
+
+    @staticmethod
+    def _headers(frames):
+        out = []
+        for hdr, _ in frames:
+            h = IQHeader()
+            h.decode_header(hdr)
+            out.append(h)
+        return out
+
+    # ---------- tests ----------
+    def test_default_segment_sizes_unchanged(self):
+        """No new key: decimator_out object = the 2^23-sample worst case and
+        the decimator_in mapping = today's expression (ledger L4 values)."""
+        N, R, N_cal = 2**12, 2, 2**10
+        self._configure(N, R, N_cal, K=8)
+        self._design()
+        res = self._run(frames=4, N=N * R)
+        self.assertEqual(res["returncode"], 0, res["log"])
+        self.assertEqual(len(res["frames"]), 4)
+        self.assertEqual(res["object_size"], MAX_IQFRAME_PAYLOAD_SIZE * self.M * 4 * 2 + 1024)
+        self.assertEqual(res["maps_in"], _page_round(N * self.M * R * 4 * 2 + 1024))
+        for h in self._headers(res["frames"]):
+            self.assertEqual(h.reserved[RSV_DECIMATOR_DROP_CNT], 0)
+        self.assertIn("FIR coefficients: _data_control/fir_coeffs.txt (8 taps)", res["log"])
+
+    def test_default_consumer_map_uses_corr_size_when_larger(self):
+        N, R, N_cal = 2**10, 1, 2**13
+        self._configure(N, R, N_cal, K=1)
+        self._design()
+        res = self._run(frames=2, N=N)
+        self.assertEqual(res["returncode"], 0, res["log"])
+        self.assertEqual(res["maps_in"], _page_round(N_cal * self.M * 4 * 2 + 1024))
+
+    def test_config_sized_segments_identical_output(self):
+        """size_segments_from_config = 1: object = 1024 + max(N, Nc)*M*8 and
+        every output frame byte-identical to the default run."""
+        N, R, N_cal = 2**12, 2, 2**10
+        self._configure(N, R, N_cal, K=8)
+        self._design()
+        ref = self._run(frames=6, N=N * R, seed=7)
+        self.assertEqual(ref["returncode"], 0, ref["log"])
+
+        self._configure(N, R, N_cal, K=8, pre_processing__size_segments_from_config=1)
+        new = self._run(frames=6, N=N * R, seed=7)
+        self.assertEqual(new["returncode"], 0, new["log"])
+        self.assertEqual(new["object_size"], 1024 + max(N, N_cal) * self.M * 8)
+        self.assertEqual(len(new["frames"]), 6)
+        self.assertEqual(new["frames"], ref["frames"])
+        self.assertIn("decimator_out segments sized from config", new["log"])
+        self.assertNotIn("sized from config", ref["log"])
+
+    def test_config_sized_segments_corr_size_dominates(self):
+        N, R, N_cal = 2**10, 1, 2**12
+        self._configure(N, R, N_cal, K=1, pre_processing__size_segments_from_config=1)
+        self._design()
+        res = self._run(frames=2, N=N)
+        self.assertEqual(res["returncode"], 0, res["log"])
+        self.assertEqual(res["object_size"], 1024 + N_cal * self.M * 8)
+
+    def _drop_run(self, stamp):
+        N = 2**12
+        keys = {"monitoring__stamp_decimator_drops": 1} if stamp else {}
+        self._configure(N, 1, 2**10, K=1, **keys)
+        self._design()
+        # Drop mode; the consumer is slower than the paced source, so
+        # deliveries and output drops interleave
+        res = self._run(frames=60, N=N, args=("1",), delay=0.05, source_delay=0.02)
+        self.assertEqual(res["returncode"], 0, res["log"])
+        headers = self._headers(res["frames"])
+        self.assertGreater(len(headers), 2)
+        gaps = [h.cpi_index - i for i, h in enumerate(headers)]
+        self.assertGreater(max(gaps), 0, "no output frame was dropped between deliveries")
+        return headers
+
+    def test_drop_count_stamped(self):
+        """stamp_decimator_drops = 1: slot 109 = output frames dropped before
+        this frame = cpi_index - frames delivered before it."""
+        headers = self._drop_run(stamp=True)
+        for delivered_before, h in enumerate(headers):
+            self.assertEqual(h.reserved[RSV_DECIMATOR_DROP_CNT], h.cpi_index - delivered_before)
+            self.assertEqual(h.get_decimator_drop_cnt(), h.cpi_index - delivered_before)
+
+    def test_drop_count_not_stamped_by_default(self):
+        for h in self._drop_run(stamp=False):
+            self.assertEqual(h.reserved[RSV_DECIMATOR_DROP_CNT], 0)
+
+    def test_instance_reads_prefixed_coefficients(self):
+        """instance_id = 1: designer writes inst1_fir_coeffs.txt, decimate.out
+        reads it and streams on the inst1_ segments."""
+        N, R = 2**11, 2
+        self._configure(N, R, 2**10, K=8, instance_id=1)
+        self._design()
+        self.assertTrue(os.path.exists("_data_control/inst1_fir_coeffs.txt"))
+        self.assertFalse(os.path.exists("_data_control/fir_coeffs.txt"))
+        res = self._run(frames=3, N=N * R)
+        self.assertEqual(res["returncode"], 0, res["log"])
+        self.assertEqual(len(res["frames"]), 3)
+        self.assertIn("FIR coefficients: _data_control/inst1_fir_coeffs.txt (8 taps)", res["log"])
+
+    def test_instance_with_only_unprefixed_coefficients_fails(self):
+        """An instance N > 0 never falls back to the unprefixed file."""
+        self._configure(2**10, 1, 2**10, K=1, instance_id=1)
+        np.savetxt("_data_control/fir_coeffs.txt", np.array([1.0]))
+        res = self._run(frames=2, N=2**10)
+        self.assertNotEqual(res["returncode"], 0)
+        self.assertEqual(res["frames"], [])
+        self.assertIn("_data_control/inst1_fir_coeffs.txt: cannot open coefficients", res["log"])

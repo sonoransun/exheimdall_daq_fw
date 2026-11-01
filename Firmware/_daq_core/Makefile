@@ -18,6 +18,8 @@
 #                                                  distributable binaries)
 #                               MARCH='-mcpu=cortex-a72' -> explicit flags
 #   make all-offload            Additionally build all optional transport/offload objs
+#   make device_map_probe       Stand-alone serial-map probe (device_map.c built with
+#                               -DDEVICE_MAP_PROBE_MAIN; no external library needed)
 #   make libs                   Shared libraries for Python ctypes access
 #   make pgo-profile            Instrumented build; run a workload, then:
 #   make pgo-optimize           Rebuild using the recorded profile
@@ -44,7 +46,10 @@ BUILD  ?= release
 ENGINE ?= auto
 
 # Uncomment if you are using third party switches from ckoval on a Rpi device
-# and have pigpio installed
+# and have pigpio installed (or pass PIGPIO='-lpigpio -DUSEPIGPIO' to make).
+# Its -D flags compile rtl_daq.o, the rest links rtl_daq.out. A target-specific
+# CFLAGS change does not rebuild rtl_daq.o by itself: run 'make clean' after
+# toggling it.
 #PIGPIO=-lpigpio -DUSEPIGPIO
 
 # Uncomment if you installed GCC 11.2
@@ -199,8 +204,10 @@ $(info [heimdall make] arch=$(HOST_ARCH) engine=$(ENGINE_RESOLVED) build=$(BUILD
 
 -include $(wildcard *.d)
 
-rtl_daq.out: rtl_daq.o $(COMMON_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ -lpthread -lzmq $(PIGPIO) -L. -lrtlsdr -lusb-1.0 -lm -lrt
+rtl_daq.o: CFLAGS += $(filter -D%,$(PIGPIO))
+
+rtl_daq.out: rtl_daq.o device_map.o $(COMMON_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ -lpthread -lzmq $(filter-out -D%,$(PIGPIO)) -L. -lrtlsdr -lusb-1.0 -lm -lrt
 
 rebuffer.out: rebuffer.o $(TRANSPORT_OBJS) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ -lrt -lm
@@ -209,7 +216,11 @@ decimate.out: fir_decimate.o $(TRANSPORT_OBJS) $(OFFLOAD_OBJS) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ -lrt $(ENGINE_LIBS)
 
 iq_server.out: iq_server.o $(TRANSPORT_OBJS) $(COMMON_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ -lrt -lm
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ -lpthread -lrt -lm
+
+# Serial-map test probe: device_map.c is self-contained (no librtlsdr/zmq/pigpio)
+device_map_probe: device_map.c device_map.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -DDEVICE_MAP_PROBE_MAIN device_map.c -o $@
 
 # ---- Legacy target-name aliases (kept for scripts/docs compatibility) ----
 rtl_daq: rtl_daq.out
@@ -295,7 +306,7 @@ clean:
 	$(RM) *.o *.d \
 	      rtl_daq.out rebuffer.out decimate.out iq_server.out \
 	      hat_usb3_bridge.out hat_pcie_bridge.out \
-	      libfpga_hal.so libdma_hal.so
+	      device_map_probe libfpga_hal.so libdma_hal.so
 
 distclean: clean
 	$(RM) *.gcda *.gcno

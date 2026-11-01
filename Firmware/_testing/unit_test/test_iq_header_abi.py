@@ -67,7 +67,25 @@ RSV_SLOTS = [
     "EXT_LNA_GAINS", "TOTAL_GAINS", "SYSTEM_NF_MDB", "COMPRESSION_FLAGS",
     "BIAS_TEE_STATE", "ANTENNA_AZ_CDEG", "ANTENNA_EL_CDEG", "ROTATOR_STATE",
     "AGG_POWER_MDB", "BUFFER_OVERRUN_CNT",
+    # scaling / clustering slots 103-113
+    "ROUTER_SEQ", "ROUTER_RX_TS_LO", "ROUTER_RX_TS_HI", "SOURCE_INSTANCE",
+    "SOURCE_KEY_CRC32", "NODE_ID_CRC32", "DECIMATOR_DROP_CNT",
+    "CAL_QUALITY_MDB", "IQ_COMP_CNT", "SAMPLE_COMP_CNT", "RECAL_GEN",
 ]
+
+# Values the C probe stamps through the IQH_RSV_* defines into its "slots"
+# frame; the Python getters must read back exactly these (u64 split and the
+# signed slot 110 included).
+SLOT_STAMP_ROUTER_SEQ = 0xFFFFFFF0
+SLOT_STAMP_RX_TS_MS = 1761912345678      # > 2^32: exercises the HI word
+SLOT_STAMP_SOURCE_INSTANCE = 4           # instance 3 + 1
+SLOT_STAMP_SOURCE_KEY_CRC32 = 0x9E3779B9
+SLOT_STAMP_NODE_ID_CRC32 = 0xDEADBEEF
+SLOT_STAMP_DECIMATOR_DROPS = 17
+SLOT_STAMP_CAL_QUALITY_MDB = -12345      # signed
+SLOT_STAMP_IQ_COMP = 3
+SLOT_STAMP_SAMPLE_COMP = 5
+SLOT_STAMP_RECAL_GEN = 2
 
 
 def python_field_offsets():
@@ -109,16 +127,7 @@ int main(int argc, char **argv)
     printf("FRAME_TYPE_RAMP=%d\n", FRAME_TYPE_RAMP);
     printf("FRAME_TYPE_CAL=%d\n", FRAME_TYPE_CAL);
     printf("FRAME_TYPE_TRIGW=%d\n", FRAME_TYPE_TRIGW);
-    printf("RSV_EXT_LNA_GAINS=%d\n", IQH_RSV_EXT_LNA_GAINS);
-    printf("RSV_TOTAL_GAINS=%d\n", IQH_RSV_TOTAL_GAINS);
-    printf("RSV_SYSTEM_NF_MDB=%d\n", IQH_RSV_SYSTEM_NF_MDB);
-    printf("RSV_COMPRESSION_FLAGS=%d\n", IQH_RSV_COMPRESSION_FLAGS);
-    printf("RSV_BIAS_TEE_STATE=%d\n", IQH_RSV_BIAS_TEE_STATE);
-    printf("RSV_ANTENNA_AZ_CDEG=%d\n", IQH_RSV_ANTENNA_AZ_CDEG);
-    printf("RSV_ANTENNA_EL_CDEG=%d\n", IQH_RSV_ANTENNA_EL_CDEG);
-    printf("RSV_ROTATOR_STATE=%d\n", IQH_RSV_ROTATOR_STATE);
-    printf("RSV_AGG_POWER_MDB=%d\n", IQH_RSV_AGG_POWER_MDB);
-    printf("RSV_BUFFER_OVERRUN_CNT=%d\n", IQH_RSV_BUFFER_OVERRUN_CNT);
+@RSV_LINES@
 
     if (argc > 1) {
         /* Golden frame: distinctive value in every field, written natively */
@@ -153,6 +162,29 @@ int main(int argc, char **argv)
         if (fwrite(&h, sizeof(h), 1, f) != 1) return 1;
         fclose(f);
     }
+    if (argc > 2) {
+        /* Slots frame: a zeroed header with the 103-113 telemetry stamped
+         * through the IQH_RSV_* defines, as the C/Python stampers do */
+        struct iq_header_struct h;
+        memset(&h, 0, sizeof(h));
+        h.sync_word = SYNC_WORD;
+        h.header_version = IQ_HEADER_VERSION;
+        h.reserved[IQH_RSV_ROUTER_SEQ] = @ROUTER_SEQ@U;
+        h.reserved[IQH_RSV_ROUTER_RX_TS_LO] = (uint32_t)(@RX_TS_MS@ULL & 0xFFFFFFFFULL);
+        h.reserved[IQH_RSV_ROUTER_RX_TS_HI] = (uint32_t)(@RX_TS_MS@ULL >> 32);
+        h.reserved[IQH_RSV_SOURCE_INSTANCE] = @SOURCE_INSTANCE@U;
+        h.reserved[IQH_RSV_SOURCE_KEY_CRC32] = @SOURCE_KEY_CRC32@U;
+        h.reserved[IQH_RSV_NODE_ID_CRC32] = @NODE_ID_CRC32@U;
+        h.reserved[IQH_RSV_DECIMATOR_DROP_CNT] = @DECIMATOR_DROPS@U;
+        h.reserved[IQH_RSV_CAL_QUALITY_MDB] = (uint32_t)(int32_t)(@CAL_QUALITY_MDB@);
+        h.reserved[IQH_RSV_IQ_COMP_CNT] = @IQ_COMP@U;
+        h.reserved[IQH_RSV_SAMPLE_COMP_CNT] = @SAMPLE_COMP@U;
+        h.reserved[IQH_RSV_RECAL_GEN] = @RECAL_GEN@U;
+        FILE *f = fopen(argv[2], "wb");
+        if (!f) return 1;
+        if (fwrite(&h, sizeof(h), 1, f) != 1) return 1;
+        fclose(f);
+    }
     return 0;
 }
 """
@@ -164,6 +196,7 @@ class TesterHeaderABI(unittest.TestCase):
     compiler = None
     c_report = None       # dict name->int from the compiled C program
     golden_bytes = None   # 1024-byte struct written by the C program
+    slots_bytes = None    # 1024-byte struct with slots 103-113 stamped in C
     build_error = None
 
     @classmethod
@@ -177,9 +210,26 @@ class TesterHeaderABI(unittest.TestCase):
                 '    printf("offsetof_{0}=%zu\\n", '
                 'offsetof(struct iq_header_struct, {0}));'.format(name)
                 for name, _fmt in FIELDS)
+            rsv_lines = "\n".join(
+                '    printf("RSV_{0}=%d\\n", IQH_RSV_{0});'.format(name)
+                for name in RSV_SLOTS)
+            program = C_PROGRAM.replace("@OFFSET_LINES@", offset_lines)
+            program = program.replace("@RSV_LINES@", rsv_lines)
+            for token, value in (
+                    ("@ROUTER_SEQ@", SLOT_STAMP_ROUTER_SEQ),
+                    ("@RX_TS_MS@", SLOT_STAMP_RX_TS_MS),
+                    ("@SOURCE_INSTANCE@", SLOT_STAMP_SOURCE_INSTANCE),
+                    ("@SOURCE_KEY_CRC32@", SLOT_STAMP_SOURCE_KEY_CRC32),
+                    ("@NODE_ID_CRC32@", SLOT_STAMP_NODE_ID_CRC32),
+                    ("@DECIMATOR_DROPS@", SLOT_STAMP_DECIMATOR_DROPS),
+                    ("@CAL_QUALITY_MDB@", SLOT_STAMP_CAL_QUALITY_MDB),
+                    ("@IQ_COMP@", SLOT_STAMP_IQ_COMP),
+                    ("@SAMPLE_COMP@", SLOT_STAMP_SAMPLE_COMP),
+                    ("@RECAL_GEN@", SLOT_STAMP_RECAL_GEN)):
+                program = program.replace(token, str(value))
             src = join(tmpdir, "abi_check.c")
             with open(src, "w") as f:
-                f.write(C_PROGRAM.replace("@OFFSET_LINES@", offset_lines))
+                f.write(program)
             exe = join(tmpdir, "abi_check")
             compile_res = subprocess.run(
                 [cls.compiler, "-std=gnu11", "-Wall",
@@ -189,7 +239,8 @@ class TesterHeaderABI(unittest.TestCase):
                 cls.build_error = compile_res.stderr
                 return
             golden = join(tmpdir, "golden.bin")
-            run_res = subprocess.run([exe, golden], capture_output=True,
+            slots = join(tmpdir, "slots.bin")
+            run_res = subprocess.run([exe, golden, slots], capture_output=True,
                                      text=True, timeout=60)
             if run_res.returncode != 0:
                 cls.build_error = "abi_check runtime rc={} stderr={}".format(
@@ -203,6 +254,8 @@ class TesterHeaderABI(unittest.TestCase):
             cls.c_report = report
             with open(golden, "rb") as f:
                 cls.golden_bytes = f.read()
+            with open(slots, "rb") as f:
+                cls.slots_bytes = f.read()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -230,7 +283,14 @@ class TesterHeaderABI(unittest.TestCase):
             "ANTENNA_AZ_CDEG": 98, "ANTENNA_EL_CDEG": 99,
             "ROTATOR_STATE": 100, "AGG_POWER_MDB": 101,
             "BUFFER_OVERRUN_CNT": 102,
+            "ROUTER_SEQ": 103, "ROUTER_RX_TS_LO": 104, "ROUTER_RX_TS_HI": 105,
+            "SOURCE_INSTANCE": 106, "SOURCE_KEY_CRC32": 107,
+            "NODE_ID_CRC32": 108, "DECIMATOR_DROP_CNT": 109,
+            "CAL_QUALITY_MDB": 110, "IQ_COMP_CNT": 111,
+            "SAMPLE_COMP_CNT": 112, "RECAL_GEN": 113,
         }
+        self.assertEqual(set(expected), set(RSV_SLOTS),
+                         "RSV_SLOTS and the expected-index table diverged")
         for name, value in expected.items():
             self.assertEqual(getattr(IQHeader, "RSV_" + name), value,
                              "IQHeader.RSV_{} drifted".format(name))
@@ -267,6 +327,75 @@ class TesterHeaderABI(unittest.TestCase):
                 self.c_report["RSV_" + name],
                 getattr(IQHeader, "RSV_" + name),
                 "IQH_RSV_{0} != IQHeader.RSV_{0}".format(name))
+
+    def test_rsv_slots_distinct_and_in_range(self):
+        """Every named single-word slot is unique and inside reserved[192];
+        the three 32-word per-channel blocks end before slot 96."""
+        values = [getattr(IQHeader, "RSV_" + n) for n in RSV_SLOTS]
+        self.assertEqual(len(values), len(set(values)))
+        self.assertTrue(all(0 <= v < 192 for v in values))
+        singles = [v for v in values if v >= 96]
+        self.assertEqual(sorted(singles), list(range(96, 114)))
+
+    def test_slot_byte_offsets(self):
+        """Slot k lives at header byte 252 + 4*k (the formula the router and
+        the docs use) for every slot 103-113."""
+        for name in RSV_SLOTS:
+            k = getattr(IQHeader, "RSV_" + name)
+            if k < 103:
+                continue
+            h = IQHeader()
+            h.reserved[k] = 0xA5A5A500 | k
+            raw = h.encode_header()
+            off = 252 + 4 * k
+            self.assertEqual(struct.unpack_from("=I", raw, off)[0],
+                             0xA5A5A500 | k, name)
+            # ... and nothing else moved: only those 4 bytes differ from a
+            # fresh header
+            fresh = IQHeader().encode_header()
+            diff = [i for i in range(len(raw)) if raw[i] != fresh[i]]
+            self.assertEqual(diff, list(range(off, off + 4)), name)
+
+    def test_c_stamped_slots_read_by_python_getters(self):
+        """Slots 103-113 written in C through the IQH_RSV_* defines decode to
+        the same values through the Python accessors (incl. the u64 LO/HI
+        split and the signed slot 110)."""
+        self._require_c()
+        self.assertEqual(len(self.slots_bytes), 1024)
+        h = IQHeader()
+        h.decode_header(self.slots_bytes)
+        self.assertEqual(h.get_router_seq(), SLOT_STAMP_ROUTER_SEQ)
+        self.assertEqual(h.get_router_rx_ts_ms(), SLOT_STAMP_RX_TS_MS)
+        self.assertEqual(h.get_source_instance(), SLOT_STAMP_SOURCE_INSTANCE)
+        self.assertEqual(h.get_source_key_crc32(), SLOT_STAMP_SOURCE_KEY_CRC32)
+        self.assertEqual(h.get_node_id_crc32(), SLOT_STAMP_NODE_ID_CRC32)
+        self.assertEqual(h.get_decimator_drop_cnt(), SLOT_STAMP_DECIMATOR_DROPS)
+        self.assertEqual(h.get_cal_quality_mdb(), SLOT_STAMP_CAL_QUALITY_MDB)
+        self.assertEqual(h.get_iq_comp_cnt(), SLOT_STAMP_IQ_COMP)
+        self.assertEqual(h.get_sample_comp_cnt(), SLOT_STAMP_SAMPLE_COMP)
+        self.assertEqual(h.get_recal_gen(), SLOT_STAMP_RECAL_GEN)
+        # Every other reserved slot stays zero
+        for k in range(192):
+            if not 103 <= k <= 113:
+                self.assertEqual(h.reserved[k], 0, "slot {}".format(k))
+
+    def test_python_stamped_slots_match_c_bytes(self):
+        """Stamping the same values through the Python setters reproduces the
+        C-written slots frame byte for byte."""
+        self._require_c()
+        h = IQHeader()
+        h.header_version = IQHeader.HEADER_VERSION
+        h.set_router_seq(SLOT_STAMP_ROUTER_SEQ)
+        h.set_router_rx_ts_ms(SLOT_STAMP_RX_TS_MS)
+        h.set_source_instance(SLOT_STAMP_SOURCE_INSTANCE)
+        h.set_source_key_crc32(SLOT_STAMP_SOURCE_KEY_CRC32)
+        h.set_node_id_crc32(SLOT_STAMP_NODE_ID_CRC32)
+        h.set_decimator_drop_cnt(SLOT_STAMP_DECIMATOR_DROPS)
+        h.set_cal_quality_mdb(SLOT_STAMP_CAL_QUALITY_MDB)
+        h.set_iq_comp_cnt(SLOT_STAMP_IQ_COMP)
+        h.set_sample_comp_cnt(SLOT_STAMP_SAMPLE_COMP)
+        h.set_recal_gen(SLOT_STAMP_RECAL_GEN)
+        self.assertEqual(h.encode_header(), self.slots_bytes)
 
     def test_golden_frame_roundtrip(self):
         """A struct filled and written by the C compiler decodes to the same

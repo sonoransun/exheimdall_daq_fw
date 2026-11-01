@@ -33,6 +33,7 @@ import logging
 import numpy as np
 from struct import pack
 import time
+import threading
 from configparser import ConfigParser
 
 current_path      = dirname(realpath(__file__))
@@ -49,6 +50,7 @@ sys.path.insert(0, daq_core_path)
 sys.path.insert(0, unit_test_path)
 from iq_header import IQHeader
 from capture_shmem_stream import IQFrameRecorder
+from shmemIface import inShmemIface
 
 class TesterRebufferModule(unittest.TestCase):
 
@@ -431,3 +433,183 @@ class TesterRebufferModule(unittest.TestCase):
         with open(self.config_filename, 'w') as configfile:
             parser.write(configfile)
         return 0
+
+#############################################
+#   WP-04: drop-mode CPI discard (G73) and  #
+#   unchanged decimator_in object size      #
+#############################################
+
+REBUFFER_BIN = join(daq_core_path, "rebuffer.out")
+SHM_DIR = "/dev/shm"
+RAMP_MAX = 29  # gen_ramp.py
+
+
+def _ramp_block(t0, n, M):
+    """gen_ramp.py payload: per channel interleaved I/Q, I = t%29 + 2m*29,
+    Q = t%29 + (2m+1)*29, t = t0 .. t0+n-1."""
+    raw = (np.arange(t0, t0 + n, dtype=np.uint32) % RAMP_MAX).astype(np.uint8)
+    out = np.empty((M, 2 * n), dtype=np.uint8)
+    for m in range(M):
+        out[m, 0::2] = raw + 2 * m * RAMP_MAX
+        out[m, 1::2] = raw + (2 * m + 1) * RAMP_MAX
+    return out
+
+
+class _RampWriter(threading.Thread):
+    """Feeds rebuffer.out's stdin with paced DATA ramp frames."""
+
+    def __init__(self, stdin, blocks, N_daq, M, delay):
+        threading.Thread.__init__(self, daemon=True)
+        self.stdin, self.blocks, self.N_daq, self.M, self.delay = stdin, blocks, N_daq, M, delay
+
+    def run(self):
+        header = IQHeader()
+        header.sync_word = IQHeader.SYNC_WORD
+        header.frame_type = IQHeader.FRAME_TYPE_DATA
+        header.active_ant_chs = self.M
+        header.cpi_length = self.N_daq
+        header.sample_bit_depth = 8
+        header.sampling_freq = 2400000
+        header.adc_sampling_freq = 2400000
+        try:
+            for b in range(self.blocks):
+                header.daq_block_index = b
+                self.stdin.write(header.encode_header())
+                self.stdin.write(_ramp_block(b * self.N_daq, self.N_daq, self.M).tobytes())
+                self.stdin.flush()
+                if self.delay:
+                    time.sleep(self.delay)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                self.stdin.close()
+            except OSError:
+                pass
+
+
+class _U8Capture(threading.Thread):
+    """Slow 'decimator_in' consumer keeping every frame in memory."""
+
+    def __init__(self, delay):
+        threading.Thread.__init__(self, daemon=True)
+        self.delay = delay
+        self.frames = []  # (IQHeader, payload ndarray (M, 2*cpi_length))
+        self.iface = inShmemIface("decimator_in")
+        self.object_size = self.iface.memories[0].size if self.iface.init_ok else None
+
+    def run(self):
+        while True:
+            idx = self.iface.wait_buff_free()
+            if idx not in (0, 1):
+                break
+            buf = self.iface.buffers[idx]
+            header = IQHeader()
+            header.decode_header(buf[0:1024].tobytes())
+            n = header.cpi_length * header.active_ant_chs * 2
+            payload = buf[1024:1024 + n].copy().reshape(header.active_ant_chs, 2 * header.cpi_length)
+            self.frames.append((header, payload))
+            if self.delay:
+                time.sleep(self.delay)
+            self.iface.send_ctr_buff_ready(idx)
+        self.iface.destory_sm_buffer()
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(REBUFFER_BIN),
+                     "needs Linux and a built rebuffer.out")
+class TesterRebufferDropMode(unittest.TestCase):
+    """rebuffer.out 1 (drop mode, dormant: the start scripts pass 0) with a
+    slow consumer: a dropped CPI is discarded exactly as a delivered one is
+    consumed, so every delivered CPI is the contiguous next-in-line block of
+    the input stream (spec I.4 #8)."""
+
+    M = 4
+    N_DAQ = 2**10
+    N = 2**12           # 4 input blocks per output CPI
+    N_CAL = 2**10
+    BLOCKS = 240
+
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="rebuffer_wp04_")
+        self.prev_cwd = os.getcwd()
+        shutil.copyfile(live_config_filename, join(self.workdir, "daq_chain_config.ini"))
+        os.makedirs(join(self.workdir, "_data_control"))
+        os.chdir(self.workdir)
+        os.mkfifo("_data_control/fw_decimator_in")
+        os.mkfifo("_data_control/bw_decimator_in")
+        parser = ConfigParser()
+        parser.read("daq_chain_config.ini")
+        parser["hw"]["num_ch"] = str(self.M)
+        parser["pre_processing"]["cpi_size"] = str(self.N)
+        parser["pre_processing"]["decimation_ratio"] = "1"
+        parser["daq"]["daq_buffer_size"] = str(self.N_DAQ)
+        parser["calibration"]["corr_size"] = str(self.N_CAL)
+        with open("daq_chain_config.ini", "w") as f:
+            parser.write(f)
+
+    def tearDown(self):
+        os.chdir(self.prev_cwd)
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def _run(self, drop_arg, consumer_delay, writer_delay):
+        with open(join(self.workdir, "rebuffer.log"), "w") as log:
+            proc = subprocess.Popen([REBUFFER_BIN, drop_arg], stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                capture = _U8Capture(consumer_delay)
+                self.assertTrue(capture.iface.init_ok)
+                writer = _RampWriter(proc.stdin, self.BLOCKS, self.N_DAQ, self.M, writer_delay)
+                capture.start()
+                writer.start()
+                writer.join(timeout=120)
+                capture.join(timeout=120)
+                proc.wait(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        with open(join(self.workdir, "rebuffer.log")) as log:
+            self.assertEqual(proc.returncode, 0, log.read())
+        return capture
+
+    def _assert_contiguous_cpis(self, frames):
+        """Each delivered CPI holds the samples [(b+1)*N_daq - N, (b+1)*N_daq)
+        of the input stream, b = daq_block_index of the frame that completed it."""
+        for header, payload in frames:
+            self.assertEqual(header.cpi_length, self.N)
+            t0 = (header.daq_block_index + 1) * self.N_DAQ - self.N
+            expected = _ramp_block(t0, self.N, self.M)
+            self.assertTrue(np.array_equal(payload, expected),
+                            "CPI completed by block {:d} is not the input samples {:d}..{:d}"
+                            .format(header.daq_block_index, t0, t0 + self.N - 1))
+
+    def test_drop_mode_discards_dropped_cpis(self):
+        capture = self._run("1", consumer_delay=0.04, writer_delay=0.004)
+        total_cpis = self.BLOCKS * self.N_DAQ // self.N
+        delivered = len(capture.frames)
+        self.assertGreater(delivered, 2)
+        self.assertLess(delivered, total_cpis, "the slow consumer caused no drop")
+        # The run drops many more CPIs than the ring holds (rebuffer's ring is
+        # N/N_daq + 2 input blocks), so a backlog that outgrew the ring would
+        # have overwritten unread samples
+        ring_blocks = self.N // self.N_DAQ + 2
+        self.assertGreater(self.BLOCKS, 10 * ring_blocks)
+        self.assertGreater((total_cpis - delivered) * (self.N // self.N_DAQ), 2 * ring_blocks)
+        self._assert_contiguous_cpis(capture.frames)
+        # Deliveries after the first drop are still on CPI boundaries
+        blocks = [h.daq_block_index for h, _ in capture.frames]
+        self.assertEqual(blocks, sorted(set(blocks)))
+        self.assertTrue(all((b + 1) % (self.N // self.N_DAQ) == 0 for b in blocks))
+        # Every delivered CPI ends at the block that completed it (checked
+        # above), so `available` was exactly one CPI at each delivery: the
+        # backlog stays within the ring (available <= buffer_num*N_daq*2)
+
+    def test_backpressure_mode_delivers_every_cpi(self):
+        capture = self._run("0", consumer_delay=0.01, writer_delay=0.0)
+        self.assertEqual(len(capture.frames), self.BLOCKS * self.N_DAQ // self.N)
+        self._assert_contiguous_cpis(capture.frames)
+
+    def test_decimator_in_object_size_unchanged(self):
+        """The decimator_in object stays 1024 + max(N*R, Nc)*M*2 bytes."""
+        capture = self._run("0", consumer_delay=0.0, writer_delay=0.0)
+        self.assertEqual(capture.object_size, 1024 + max(self.N, self.N_CAL) * self.M * 2)

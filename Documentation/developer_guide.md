@@ -1,5 +1,15 @@
 # Developer Guide
 
+This guide covers building the C core, the Python environment, the test lanes,
+CI, how to add code without breaking the default path, and the invariants that
+every change must keep. Read [CONTRIBUTING.md](../CONTRIBUTING.md) for the
+pull request rules.
+
+Related documents: [architecture.md](architecture.md),
+[protocols.md](protocols.md), [configuration.md](configuration.md),
+[upgrade_and_rollback.md](upgrade_and_rollback.md) (the default-path ledger),
+[capacity_planning.md](capacity_planning.md).
+
 ## Building the C core
 
 All C components build from `Firmware/_daq_core/`:
@@ -10,50 +20,76 @@ make -j4
 # -> rtl_daq.out  rebuffer.out  decimate.out  iq_server.out
 ```
 
+Every run prints the resolved configuration first:
+
+```text
+[heimdall make] arch=x86_64 engine=kfr build=release archflags='-march=native'
+```
+
 ### Dependencies (copy-in layout)
 
-External libraries are **copied into `_daq_core/` before building** and
-resolved via `-I. -L.`:
+You copy external libraries into `_daq_core/` before building. The Makefile
+resolves them with `-I. -L.`.
 
 | Files | Needed for | Source |
 |---|---|---|
-| `librtlsdr.a`, `rtl-sdr.h`, `rtl-sdr_export.h` | always (`rtl_daq.out`) | **the krakenrf fork** — https://github.com/krakenrf/librtlsdr |
-| `libkfr_capi.so` + `kfr/` headers | `ENGINE=kfr` (default on x86_64 and aarch64) | KFR, built from source (pinned ref 7.1.0 in `ci/build.sh`, requires clang) |
+| `librtlsdr.a`, `rtl-sdr.h`, `rtl-sdr_export.h` | always (`rtl_daq.out`) | the krakenrf fork, https://github.com/krakenrf/librtlsdr |
+| `libkfr_capi.so*` + `kfr/` headers | `ENGINE=kfr` (default on x86_64 and aarch64) | KFR built from source (default ref `7.1.0` in `ci/build.sh`, needs clang) |
 | `libNE10.a` (the `NE10*.h` headers are vendored) | `ENGINE=ne10` (32-bit ARM only) | project-ne10 |
 
-> **Warning:** the stock distribution `librtlsdr` does **not** work. rtl_daq
-> depends on krakenrf-fork-only APIs: `rtlsdr_set_dithering`,
-> `rtlsdr_set_sample_freq_correction_f`, `rtlsdr_set_bias_tee_gpio`,
-> `rtlsdr_set_gpio`. Build the fork and copy its static library + headers in.
-
 System packages (Ubuntu): `build-essential cmake git libusb-1.0-0-dev
-libzmq3-dev` (+ `clang` for the KFR lane). `util/install.sh` automates the
-full dependency build and copy-in for x86_64, aarch64 (both KFR), and armv7
-(Ne10). `ENGINE=generic` needs **no** DSP library — only librtlsdr.
+libzmq3-dev`, plus `clang` for the KFR lane. `util/install.sh` automates the
+dependency build and copy-in for x86_64, aarch64 (both KFR) and armv7 (Ne10).
+`ENGINE=generic` needs no DSP library. It needs only librtlsdr.
+
+### The librtlsdr fork contract
+
+The stock distribution `librtlsdr` does not work. `rtl_daq.c` calls three
+functions that the krakenrf fork provides:
+
+| Function | Used for | Call site |
+|---|---|---|
+| `rtlsdr_set_dithering(dev, 0)` | disables tuner PLL dithering, which would cause phase drift between channels | device setup |
+| `rtlsdr_set_bias_tee_gpio(dev, gpio, on)` | GPIO 0 drives the noise source; GPIO m+1 drives the bias tee of channel m | noise-source switch, startup and runtime bias tee |
+| `rtlsdr_set_sample_freq_correction_f(dev, correction)` | the `s` sample-clock nudge from delay_sync | fs-tuning branch of the control loop |
+
+`rtlsdr_set_gpio` appears only in commented-out code. The fork header does not
+declare it.
+
+The `correction` argument is a fraction of the sample rate, not ppm. The fork
+writes `correction * -2^24` into a 14-bit demodulator register and clamps it to
+`±0x1FFF`. The usable range is therefore about `±4.88e-4` of fs. Larger
+requests saturate silently. `rtl_daq.c` resets the correction after one
+calibration frame unless `|correction| >= FS_CORRECTION_KEEP_LIMIT` (`0.008`).
+
+Build the fork, then copy its static library and both headers in.
+`ci/build.sh` shows the exact commands.
 
 ### Makefile variables
 
 | Variable | Values | Effect |
 |---|---|---|
-| `ENGINE` | `auto` (default) \| `kfr` \| `ne10` \| `generic` | FIR/convert engine. `auto` resolves: x86_64 → kfr, **aarch64/arm64 → kfr** (the old aarch64 Ne10 branch never linked — libNE10.a is armv7-only), 32-bit arm → ne10, unknown → generic. The kfr/ne10 lanes also compile the generic engine (`-DHAS_GENERIC_OFFLOAD`) so `[offload] fir_engine=generic` is runtime-selectable; `ENGINE=generic` builds with `-DOFFLOAD_GENERIC_ONLY` (generic becomes the auto-detect default, KFR/Ne10 compiled out) |
-| `BUILD` | `release` (default) \| `debug` \| `asan` | release = the historical aggressive per-arch flags (`-Ofast -ffast-math -flto ...`, `-DNDEBUG`); debug = `-Og -g`; asan = `-O1 -g -fsanitize=address,undefined` (also on link) |
-| `MARCH` | unset \| `portable` \| explicit flags | unset keeps native tuning (`-march=native` / `-mcpu=native`); `portable` strips arch flags (CI/distributable binaries); anything else is used verbatim, e.g. `MARCH='-mcpu=cortex-a72'` |
-| `CC` | default `gcc` | Compiler override |
-| `EXTRA_CFLAGS` | e.g. `-DHAS_NET_TRANSPORT` | Appended defines for optional drivers |
-| `PGO` | `generate` \| `use` | Used internally by `pgo-profile` / `pgo-optimize` |
+| `ENGINE` | `auto` (default), `kfr`, `ne10`, `generic` | FIR/convert engine. `auto` resolves x86_64 to `kfr`, aarch64/arm64 to `kfr`, 32-bit arm to `ne10`, anything else to `generic`. The kfr and ne10 builds also compile the generic engine (`-DHAS_GENERIC_OFFLOAD`), so `[offload] fir_engine = generic` works at runtime. `ENGINE=generic` builds with `-DOFFLOAD_GENERIC_ONLY`: KFR and Ne10 are compiled out and generic becomes the auto-detect default. |
+| `BUILD` | `release` (default), `debug`, `asan` | `release` = `-Ofast -ffast-math -flto ... -DNDEBUG` on x86_64 and aarch64 (no `-flto` on 32-bit arm, `-O3` on unknown hosts). `debug` = `-Og -g`. `asan` = `-O1 -g -fsanitize=address,undefined`, also on the link line. |
+| `MARCH` | unset, `portable`, explicit flags | Unset keeps native tuning (`-march=native` or `-mcpu=native`; `-mcpu=cortex-a72` on 32-bit arm). `portable` drops all arch flags (CI, distributable binaries). Any other value is used verbatim, for example `MARCH='-mcpu=cortex-a72'`. |
+| `CC` | default `gcc` | Compiler override. The Makefile assigns `CC = gcc`, so pass `make CC=clang` on the command line. |
+| `EXTRA_CFLAGS` | extra compiler flags | A `HAS_*` define alone is not enough: the driver's object must also be in `TRANSPORT_OBJS`/`OFFLOAD_OBJS` (uncomment its block, see [Optional transport and offload drivers](#optional-transport-and-offload-drivers)). For example, `make EXTRA_CFLAGS=-DHAS_NET_TRANSPORT` alone fails to link `rebuffer.out`, `decimate.out` and `iq_server.out` with an undefined `transport_net_get_ops`. A value on the command line replaces any `EXTRA_CFLAGS +=` lines in the Makefile, so use one method, not both. |
+| `PIGPIO` | unset, `'-lpigpio -DUSEPIGPIO'` | Builds rtl_daq with pigpio support for third-party antenna switches on a Pi. The `-D` part compiles `rtl_daq.o`, the rest links `rtl_daq.out`. Run `make clean` after toggling it. |
+| `PGO` | `generate`, `use` | Used internally by `pgo-profile` and `pgo-optimize`. |
 
 Examples:
 
 ```bash
-make -j4                                  # platform default (kfr on x86_64/aarch64)
-make ENGINE=generic MARCH=portable        # dependency-light, portable binaries
-make BUILD=asan ENGINE=generic            # sanitizer build
-make BUILD=debug                          # -Og -g
+make -j4                              # platform default (kfr on x86_64/aarch64)
+make ENGINE=generic MARCH=portable    # dependency-light, portable binaries
+make BUILD=asan ENGINE=generic        # sanitizer build
+make BUILD=debug                      # -Og -g
 make CC=clang ENGINE=kfr
+make PIGPIO='-lpigpio -DUSEPIGPIO'    # Pi antenna-switch support
 ```
 
-The KFR link uses `-Wl,-rpath,'$ORIGIN'`, so the copied-in `libkfr_capi.so`
-resolves next to `decimate.out` without `LD_LIBRARY_PATH`; a system-installed
+The KFR link uses `-Wl,-rpath,'$ORIGIN'`. The copied-in `libkfr_capi.so`
+resolves next to `decimate.out` without `LD_LIBRARY_PATH`. A system-installed
 KFR also works.
 
 ### Targets
@@ -61,144 +97,528 @@ KFR also works.
 | Target | Builds |
 |---|---|
 | `all` (default) | `rtl_daq.out rebuffer.out decimate.out iq_server.out` |
-| `all-offload` | core + all optional transport/offload objects |
+| `device_map_probe` | stand-alone serial-map probe: `device_map.c` built with `-DDEVICE_MAP_PROBE_MAIN`. No external library. `test_device_map` builds it in a temp dir. |
+| `hat_usb3_bridge`, `hat_pcie_bridge` | the HAT bridge processes (`hat_usb3_bridge.out`, `hat_pcie_bridge.out`). The CI generic lane builds them as optional targets. |
+| `all-offload` | core plus every optional transport/offload object (objects only, not linked into a pipeline binary) |
 | `libs` | `libfpga_hal.so`, `libdma_hal.so` for Python ctypes |
-| `clean` | removes objects/binaries but **keeps `*.gcda`** (PGO profiles) and never touches the copied-in vendor libs |
-| `distclean` | `clean` + removes PGO profile data |
-| `pgo-profile` / `pgo-optimize` | PGO flow, see below |
+| `clean` | removes objects, binaries and probes. It keeps `*.gcda` (PGO profiles) and never touches the copied-in vendor libraries. |
+| `distclean` | `clean` plus the PGO profile data (`*.gcda *.gcno`) |
+| `pgo-profile`, `pgo-optimize` | the PGO flow, see below |
 | legacy aliases | `rtl_daq`, `rebuffer`, `decimator`, `decimate`, `iq_server`, `daq_util`, `transport_objs`, `offload_objs` |
 
-Optional transport/offload drivers stay commented out in the Makefile
-(`#TRANSPORT_OBJS += transport_spi.o`, `#EXTRA_CFLAGS += -DHAS_SPI_TRANSPORT
--DHAS_FPGA_OFFLOAD`, etc.) — uncomment the block for the driver you need.
-Object builds use `-MMD -MP` dependency tracking, so `make -j` and
+Object builds use `-MMD -MP` dependency tracking. `make -j` and
 header-triggered rebuilds work.
+
+### Optional transport and offload drivers
+
+The optional drivers stay commented out in the Makefile (`#TRANSPORT_OBJS +=
+transport_spi.o`, `#EXTRA_CFLAGS += -DHAS_SPI_TRANSPORT -DHAS_FPGA_OFFLOAD`,
+and so on). Uncommenting a block is not always enough:
+
+| Block | Extra edit needed | Symptom without it |
+|---|---|---|
+| FPGA HAT (`transport_spi.o`, `offload_fpga.o`) | add `hat_gpio_ctrl.o` to `OFFLOAD_OBJS` | `decimate.out` fails to link with undefined `gpio_*` symbols (`offload_fpga.c` calls `gpio_init`, `gpio_set_input`, ...) |
+| USB3 (`transport_usb3.o`) | add `-DUSELIBUSB` to `EXTRA_CFLAGS` and `-lusb-1.0` to the link line of each binary that uses it | the driver compiles as a stub: all libusb code sits under `#ifdef USELIBUSB` |
+| GPU, PCIe, network | none known | |
+
+No default target links an optional driver into a pipeline binary. Run `make
+clean` after changing a block, then rebuild.
 
 ### PGO flow
 
+<!-- verify-after: WP-13 -->
+
+`benchmark_workload.sh` uses paths relative to `Firmware/`
+(`_testing/benchmark_results`, `../util/performance_monitor.py`). Run it from
+`Firmware/`, with the instrumented chain already running. The hint that `make
+pgo-profile` prints (`cd ../.. && sudo ./benchmark_workload.sh`) points at the
+repository root, where the script does not exist.
+
 ```bash
-make pgo-profile            # clean + instrumented build (-fprofile-generate)
-cd ../.. && sudo ./Firmware/benchmark_workload.sh   # or any representative run
 cd Firmware/_daq_core
-make pgo-optimize           # clean + rebuild with -fprofile-use
+make pgo-profile                 # clean + instrumented build (-fprofile-generate)
+cd ..
+sudo ./daq_synthetic_start.sh    # or sudo ./daq_start_sm.sh with hardware
+sudo env "PATH=$PATH" ./benchmark_workload.sh 60  # args: duration in s (default 30), instance id (default 0)
+sudo ./daq_stop.sh               # SIGTERM: the binaries exit and write their .gcda files
+cd _daq_core
+make pgo-optimize                # clean + rebuild with -fprofile-use
 ```
 
-`clean` deliberately preserves the `.gcda` profiles between the two steps.
+The synthetic chain does not run `rtl_daq.out`. Only `rebuffer.out`,
+`decimate.out` and `iq_server.out` get profiles, and `pgo-optimize` then builds
+`rtl_daq.out` without profile data. Use `daq_start_sm.sh` with hardware to
+profile `rtl_daq.out`.
+
+`benchmark_workload.sh` calls `python3 ../util/performance_monitor.py`, which
+needs `psutil` for the per-stage metrics. Plain `sudo` resets `PATH`, so
+`python3` becomes the system interpreter. `sudo env "PATH=$PATH"` keeps your
+conda interpreter, and that interpreter must have `psutil`.
+
+The script exits 1 with `Error: DAQ not running.` when neither `rtl_daq.out`
+nor `test_data_synthesizer.py` is running. Any other representative run works
+as the workload. Profiles are written when each binary exits normally. A process
+that `daq_stop.sh` force-kills after its 2 s grace period writes none. `clean`
+keeps the `.gcda` files between the two make steps.
 
 ## Python environment
 
-Python 3.8+; the project convention is a conda/miniforge env named `kraken`.
-Required: `numpy scipy numba pyzmq` (+ `configparser` on old versions).
-Optional: `scikit-rf` (only for `iq_adjust_source=touchstone`), `berkeleydb`
-(persistence). There is **no package layout** in `Firmware/_daq_core` — no
-`__init__.py`; modules import each other directly via `sys.path.insert`.
-The only pip-installable component is the control client:
+Python 3.8 or later. The project convention is a conda/miniforge env named
+`kraken`.
+
+| Package | Status | Used for |
+|---|---|---|
+| `numpy`, `scipy`, `pyzmq` | required | the pipeline; also the `pyproject.toml` dependencies |
+| `numba` | optional | JIT speed-up of the delay_sync kernels |
+| `scikit-rf` | optional | only `iq_adjust_source = touchstone` (extra `[rf]`) |
+| `berkeleydb` | optional | `[database]` persistence (extra `[db]`) |
+| `psutil` | optional | per-stage metrics in `util/performance_monitor.py`, used by `benchmark_workload.sh` (installed by `util/install.sh`) |
+
+`delay_sync.py` imports numba inside `try/except ImportError`. Without numba it
+falls back to a built-in passthrough `njit`, and the `@njit` kernels run as
+plain numpy: correct, but slower. Minimal containers need neither numba nor a
+stub.
+
+`Firmware/_daq_core` has no package layout and no `__init__.py`. Modules inside
+`_daq_core` import their siblings directly (`from iq_header import IQHeader`).
+Python puts the launched script's directory at `sys.path[0]`, so this works.
+Code outside `_daq_core` (Firmware-level tools, `_testing`, tests) adds the
+directory first with `sys.path.insert(0, os.path.join(<dir of
+os.path.realpath(__file__)>, "_daq_core"))`, as `daq_preflight.py` and
+`_testing/test_data_synthesizer.py` do. The only pip-installable component is
+the control client:
 
 ```bash
-pip install .        # installs heimdall_ctl + the `heimdall-ctl` console script
+pip install .        # installs heimdall_ctl and the heimdall-ctl console script
 ```
 
 ## Testing
 
-Canonical entry point:
+`Firmware/unit_test.sh` is the one entry point. It runs each module in its own
+interpreter, prints a per-module summary, and returns non-zero when a module
+fails.
 
-```bash
-cd Firmware
-./unit_test.sh --ci      # entire hardware-free suite, no sudo
-./unit_test.sh --sudo    # pipeline suites (Linux + root + built C binaries)
-./unit_test.sh           # legacy behavior: the sudo decimator suite
+| Command | Lane | Requirements |
+|---|---|---|
+| `./unit_test.sh --ci` | hardware-free suite | Python 3 + numpy/scipy; Linux or macOS; no sudo, no SDR, no C binaries |
+| `sudo env "PATH=$PATH" PYTHON="$(command -v python3)" ./unit_test.sh --sudo` | pipeline suites | Linux, root, built `rebuffer.out`, `decimate.out`, `iq_server.out`, the `unit_test_k4` config values, no chain running. See [Running the pipeline lane locally](#running-the-pipeline-lane-locally). |
+| `./unit_test.sh --list` | none | prints every registered module per lane as `present` or `pending` |
+| `./unit_test.sh --help` | none | prints the usage header |
+| `./unit_test.sh` | legacy | runs the decimator pipeline suite under `sudo` |
+| `sudo env "PATH=$PATH" python3 -W ignore -m unittest -v _testing/unit_test/test_sys.py` | manual full chain | Linux, root, built binaries and KrakenSDR hardware. Run from `Firmware/` with no chain running. The test launches `./daq_start_sm.sh` itself and does not stop it, so run `sudo ./daq_stop.sh` afterwards. |
+
+Run every command from `Firmware/`. Set `PYTHON=/path/to/python` to pick the
+interpreter (default `python3`). Plain `sudo` resets `PATH` (`secure_path`), so
+`python3` becomes the system interpreter, which usually lacks numpy and scipy.
+`sudo PYTHON=... ./unit_test.sh` does not help either: `env_reset` drops it.
+Pass both through `sudo env "PATH=$PATH" PYTHON="$(command -v python3)"`, as
+CI does. A single module runs with `python3 -m unittest
+-v _testing/unit_test/<module>.py`.
+
+Exit codes of `unit_test.sh`:
+
+| Code | Meaning |
+|---|---|
+| 0 | every present module passed |
+| 1 | a module failed, or a `--sudo` precondition failed (not Linux, not root, binary not built) |
+| 2 | unknown option, or `HEIMDALL_STRICT_MODULES` is not `0` or `1` (checked by `--ci` and `--sudo` only) |
+
+### Registered and pending modules
+
+`unit_test.sh` registers modules in two lists: `CI_MODULES` and
+`SUDO_MODULES`, one module per line. The scaling program registered every
+planned module up front. A registered module whose file does not exist yet is
+pending:
+
+```text
+PEND  test_watchdog (not present yet)
 ```
+
+The run summary counts the pending modules. The counts change as packages
+merge, so run `./unit_test.sh --list` for the current state.
+
+A pending module does not count as a failure. `HEIMDALL_STRICT_MODULES=1`
+turns each pending module into a failure:
+
+```text
+FAIL  test_watchdog (not present; HEIMDALL_STRICT_MODULES=1)
+```
+
+| Variable | Values | Read by | Effect |
+|---|---|---|---|
+| `PYTHON` | path, default `python3` | `unit_test.sh`, `ci/build.sh deploy-lint` | interpreter for every module |
+| `HEIMDALL_STRICT_MODULES` | `0` (default), `1` | `unit_test.sh --ci/--sudo`, `ci/build.sh` | `1`: a pending module fails; every deploy-lint finding and every optional-target build failure is fatal |
 
 ### `--ci` lane (hardware-free)
 
-Runs 15 modules, one interpreter per module, per-module PASS/FAIL summary,
-exit 0 only when everything passes. Works on macOS and Ubuntu with just
-Python 3 + numpy/scipy. Optional extras enable more coverage — without them
-the affected tests **skip with a printed reason** (missing deps are never
-failures): a C compiler (the `test_iq_header_abi` C↔Python ABI cross-check),
-`berkeleydb` (DB integration tests), `pyzmq`, `numba`.
+Missing optional dependencies never fail a test. The affected tests skip and
+print the reason. The optional extras are: a C compiler (the
+`test_iq_header_abi` and `test_device_map` probes), `make` (the Makefile checks
+of `test_device_map`), `berkeleydb` (DB integration tests), `pyzmq` and
+`numba`.
 
-Modules: `test_iq_header_v8`, `test_iq_header_abi`,
-`test_inter_module_messages`, `test_shmem_iface`, `test_control_iface`,
-`test_delay_sync_dsp`, `test_fir_designer`, `test_ini_checker`,
-`test_gain_budget`, `test_signal_scheduler`, `test_orientation_controller`,
-`test_daq_db`, `test_monitoring`, `test_federation`, `test_heimdall_ctl`.
+| Module | Covers |
+|---|---|
+| `test_iq_header_v8`, `test_iq_header_abi` | header v8 fields, slots 96-113, C-vs-Python lockstep (compiled probe) |
+| `test_inter_module_messages` | the 128-byte ZMQ messages on 1130 |
+| `test_shmem_iface` | real FIFO + shm loopback |
+| `test_control_iface`, `test_hwc_init_instance` | the `:5001` framing, FNSD/JSON replies, XACK and extended acks, hw_controller init per instance |
+| `test_delay_sync_dsp`, `test_delay_sync_fsm` | delay_sync DSP kernels and the sync state machine |
+| `test_fir_designer` | FIR coefficient generation |
+| `test_ini_checker` | config validation, warnings, limits |
+| `test_gain_budget`, `test_signal_scheduler`, `test_orientation_controller` | RF front end, scheduler, orientation |
+| `test_daq_db` | persistence (integration cases skip without berkeleydb) |
+| `test_monitoring`, `test_status_extended` | `:5002` status server, metrics, events, extended STATUS |
+| `test_federation`, `test_federation_common`, `test_federation_protocol`, `test_federation_election` | coordinator, shared helpers, `:6000` protocol, election |
+| `test_hwc_relay` | hw_controller relay files and `RecalWatcher` |
+| `test_device_map` | rtl_daq serial-to-channel map (builds `device_map_probe`) |
+| `test_iq_router` | the IQ router |
+| `test_synthetic_control`, `test_sync_loop_model` | synthesizer ZMQ responder and the closed-loop `s` convergence model |
+| `test_heimdall_ctl`, `test_heimdall_ctl_fleet` | the CLI, local and fleet subcommands |
+| `test_launch_scripts` | start/stop/supervise script decisions with fakes |
+| `test_frame_sizes` | the `frame_sizes.h` lockstep |
+| `test_capacity_model` | the capacity model |
+| `test_provisioning`, `test_set_unit_serials` | instance dirs, cluster config generator, serial tool |
+| `test_watchdog` | the systemd watchdog helper (pending, WP-16) <!-- verify-after: WP-16 --> |
+| `test_iq_capture_format`, `test_iq_replay` | `.hcap` captures and replay (pending, WP-20) <!-- verify-after: WP-20 --> |
 
-`pytest` also works: `[tool.pytest.ini_options]` points at
-`Firmware/_testing/unit_test` and `--ignore`s the sudo/hardware pipeline
-modules, so a bare `pytest` runs only the hardware-free suite.
+Run `./unit_test.sh --list` for the current present/pending state.
+
+`pytest` also works. `[tool.pytest.ini_options]` in `pyproject.toml` points at
+`Firmware/_testing/unit_test` and ignores every sudo module and `test_sys.py`,
+so a bare `pytest` runs only the hardware-free suite.
 
 ### `--sudo` lane (pipeline integration)
 
-Runs `test_rebuffer`, `test_decimator`, `test_delay_sync`. Requirements:
-Linux, root, built `rebuffer.out`/`decimate.out`, and the `unit_test_k4`
-preset values in `daq_chain_config.ini`. The suites copy the config into a
-per-test temp directory with private FIFOs — **the live config is never
-modified**. `test_sys` (full-chain end-to-end) and `test_iq_server` are
-manual. The production `delay_sync.py` hard-imports `numba`; on minimal
-containers provide numba or a passthrough jit/njit stub on `PYTHONPATH`.
+The pipeline suites spawn the C binaries over FIFOs and shared memory. Each
+suite copies `daq_chain_config.ini` into a temp cwd with private FIFOs. The
+live config is never modified, but its values must match the `unit_test_k4`
+preset. The present stage suites need Linux, root, FIFOs and POSIX shm. The
+start-script suites (`test_start_stop_legacy`, `test_multi_instance`,
+`test_synthetic_chain`) go through `daq_start_sm.sh` and also need `chrt -f`.
 
-Test logs land in `Firmware/_testing/test_logs/`. Synthetic data generators:
-`_testing/gen_cw.py`, `gen_ramp.py`, `gen_std_frame.py` (+ shared
-`gen_utils.py`); `_testing/test_data_synthesizer.py` feeds live simulation
-mode (`daq_synthetic_start.sh`). The old `test_squelch`/`gen_burst` suite was
-deleted (no `squelch.out` source, no `[squelch]` config, no squelch support in
-delay_sync).
+| Module | Covers | Status |
+|---|---|---|
+| `test_rebuffer`, `test_decimator`, `test_delay_sync` | the stage pipelines | present |
+| `test_iq_server` | `iq_server.out` streaming | present |
+| `test_start_stop_legacy` | default-path start, re-run and stop identity | pending (WP-12) <!-- verify-after: WP-12 --> |
+| `test_multi_instance` | two synthetic instances on one host; `HEIMDALL_SOAK_SEC` sets the soak length | pending (WP-17b) <!-- verify-after: WP-17b --> |
+| `test_synthetic_chain` | one synthetic instance reaches lock; wire recal | pending (WP-17b) <!-- verify-after: WP-17b --> |
+| `test_bit_identity` | opt-in throughput levers produce identical output | pending (WP-17b) <!-- verify-after: WP-17b --> |
+| `test_throughput_lane` | 300 paced frames; writes `_testing/test_logs/throughput.json` | pending (WP-17b) <!-- verify-after: WP-17b --> |
 
-### Container verification pattern
+`test_sys.py` (full chain) stays manual and is not in `SUDO_MODULES`.
 
-The CI build steps are locally reproducible:
+#### Running the pipeline lane locally
+
+Never run the `--sudo` lane while a chain is running on the host. The suites
+isolate the FIFOs (temp cwd) but not shared memory. The binaries create the
+instance-0 POSIX shm names (for example `decimator_in`) in `/dev/shm` and
+`shm_unlink` them at teardown, so a live chain's segments collide with the
+test's and are removed. Use a Linux VM or host, not a container. From
+`Firmware/`:
 
 ```bash
-./ci/build.sh generic    # krakenrf librtlsdr from source + ENGINE=generic MARCH=portable
-./ci/build.sh kfr        # + KFR capi from source (KFR_REF=7.1.0, clang) + ENGINE=kfr
-./ci/build.sh asan       # generic lane with BUILD=asan
+sudo ./daq_stop.sh                                    # 1. stop any chain
+cp daq_chain_config.ini /tmp/daq_chain_config.ini.bak # 2. back up the config ...
+cp ../config_files/unit_test_k4/daq_chain_config.ini daq_chain_config.ini  # ... and install unit_test_k4
+make -C _daq_core                                     # 3. build
+sudo env "PATH=$PATH" PYTHON="$(command -v python3)" ./unit_test.sh --sudo  # 4. run
+cp /tmp/daq_chain_config.ini.bak daq_chain_config.ini # 5. restore the config
 ```
 
-Dependencies are cached in `DEPS_DIR` (default `.ci-deps/`, gitignored;
-override refs with `LIBRTLSDR_REF` / `KFR_REF`). To verify like CI does, run
-the same script inside a clean Ubuntu 24.04 container (x86_64 or arm64) after
-`apt-get install build-essential cmake git libusb-1.0-0-dev libzmq3-dev
-[clang]`, then `pip install numpy scipy pyzmq scikit-rf berkeleydb` and
-`cd Firmware && ./unit_test.sh --ci`.
+Test logs land in `Firmware/_testing/test_logs/`. The synthetic data
+generators are `_testing/unit_test/gen_cw.py`, `gen_ramp.py` and
+`gen_std_frame.py` (shared code in `gen_utils.py`).
+`_testing/test_data_synthesizer.py` feeds live simulation mode
+(`daq_synthetic_start.sh`). The old `test_squelch`/`gen_burst` suite was
+deleted: `squelch.out` has no source, no config has a `[squelch]` section, and
+delay_sync has no squelch support.
+
+### Container lanes
+
+The build lanes are locally reproducible with `ci/build.sh`:
+
+```bash
+./ci/build.sh generic      # krakenrf librtlsdr from source + ENGINE=generic MARCH=portable
+./ci/build.sh kfr          # + KFR capi from source (needs clang) + ENGINE=kfr MARCH=portable
+./ci/build.sh asan         # generic lane with BUILD=asan
+./ci/build.sh deploy-lint  # script, unit and config lint (no C build)
+```
+
+Any other lane name prints `Usage: ci/build.sh generic|kfr|asan|deploy-lint`
+and exits 2.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DEPS_DIR` | `<repo>/.ci-deps` | clone and build cache (gitignored). A cached build from a different ref is rebuilt. |
+| `LIBRTLSDR_REF` | `master` | branch, tag or commit sha (7-40 hex digits) of krakenrf/librtlsdr |
+| `KFR_REF` | `7.1.0` | same forms, for kfrlib/kfr |
+| `MAKE_JOBS` | `nproc` | build parallelism |
+| `CI_OPTIONAL_TARGETS` | `1` | `1`: the generic lane also builds `hat_usb3_bridge`, `hat_pcie_bridge`, `device_map_probe`; `0`: core binaries only |
+| `CI_BASE_REF` | empty | pull-request base branch for the changed-file rule |
+
+`ci/build.sh` builds in place. It runs `make clean`, replaces the copied-in
+`librtlsdr.a` and headers (and the KFR `.so` and headers in the kfr lane), and
+leaves portable (`MARCH=portable`, not native-tuned) binaries. The generic and
+asan lanes also switch to `ENGINE=generic`. Run it in a separate clone, not in
+a deployed tree. The C build lanes need Linux (POSIX shm, `-lrt`).
+
+To verify like CI does, run the script in a clean Ubuntu 24.04 container
+(x86_64 or arm64). The build writes `.ci-deps/`, the copied-in libraries and
+the binaries into the mounted tree, as root.
+
+```bash
+docker run --rm -v "$PWD":/src -w /src ubuntu:24.04 bash -c '
+  apt-get update -qq &&
+  apt-get install -y --no-install-recommends ca-certificates build-essential \
+      cmake git libusb-1.0-0-dev libzmq3-dev \
+      python3 python3-numpy python3-scipy python3-zmq &&
+  ./ci/build.sh generic &&
+  cd Firmware && ./unit_test.sh --ci'
+```
+
+Add `clang` for the kfr lane, and `shellcheck systemd udev` for deploy-lint.
+After a container run on a Linux host, take the files back and rebuild
+natively before you start the chain:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" .ci-deps Firmware/_daq_core
+cd Firmware/_daq_core && make clean && make
+```
+
+Never run the `--sudo` lane in a container. Use a full VM or host, see
+[Running the pipeline lane locally](#running-the-pipeline-lane-locally).
 
 ## CI (`.github/workflows/ci.yml`)
 
-Three jobs:
+Triggers: `push` to `main`/`master`, `pull_request`, `workflow_dispatch`, and a
+nightly `schedule` (`17 3 * * *`). The concurrency group is
+`ci-<workflow>-<event_name>-<ref>`, so the nightly run and push runs on `main`
+never cancel each other.
 
-1. **c-build** — matrix `{ubuntu-latest, ubuntu-24.04-arm} × {generic, kfr}`
-   calling `ci/build.sh <lane>` with `actions/cache` on `.ci-deps` (the kfr
-   lane is slow on a cold cache; the generic lane is the fast PR gate).
-2. **asan** — `ci/build.sh asan` compile/link with
-   `-fsanitize=address,undefined`.
-3. **python** — matrix `{ubuntu-latest, macos-latest}`: pip installs
-   numpy/scipy/pyzmq/scikit-rf (berkeleydb best-effort on Ubuntu), runs
-   `python3 ini_checker.py no_hw`, then `cd Firmware && ./unit_test.sh --ci`,
-   then `pip install .` + `heimdall-ctl --help` smoke.
+| Job | Runner | What it runs |
+|---|---|---|
+| `c-build` | matrix `{ubuntu-latest, ubuntu-24.04-arm} x {generic, kfr}` | `ci/build.sh <lane>` with `actions/cache` on `.ci-deps`. The kfr lane is slow on a cold cache. The generic lane also builds the optional targets. |
+| `asan` | ubuntu-latest | `ci/build.sh asan`: compile and link with `-fsanitize=address,undefined` |
+| `python` | matrix `{ubuntu-latest, macos-latest}`, Python 3.11 | pip installs numpy, scipy, pyzmq, scikit-rf (berkeleydb best effort on Ubuntu); `python3 ini_checker.py no_hw`; `./unit_test.sh --ci`; `pip install .` and `heimdall-ctl --help` |
+| `pipeline` | ubuntu-latest (full VM, passwordless sudo) | the `--sudo` lane, see below |
+| `deploy-lint` | ubuntu-latest | `ci/build.sh deploy-lint`, see below |
 
-There is deliberately **no FPGA gateware job**: `_fpga_gateware` `make lint`
-fails (verilator, 92 warnings-as-errors) and `make verify` fails (`Xx`
-undefined values in the top-level sim output) in a clean container. Fix the
-RTL/testbenches before re-adding it (the reason is also documented in the
-workflow header).
+Repository variables (Settings > Variables) override three defaults without a
+file change:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HEIMDALL_STRICT_MODULES` | `0` | strict mode for every job, see [Registered and pending modules](#registered-and-pending-modules) |
+| `KFR_REF` | `7.1.0` | KFR ref for the kfr lane |
+| `LIBRTLSDR_REF` | `master` | librtlsdr ref for every lane |
+
+There is no FPGA gateware job. `_fpga_gateware` `make lint` fails (verilator,
+92 warnings-as-errors) and `make verify` fails (`Xx` undefined values in the
+top-level sim output) in a clean container. Fix the RTL and testbenches before
+re-adding it.
+
+### The `pipeline` job
+
+1. A gate step sets `run=0` on a pull request whose changed paths all match
+   `^Documentation/`, `\.md$` or `^LICENSE$`. Every later step is then
+   skipped and the job passes. Every other change runs it.
+2. It installs numpy, scipy, numba, pyzmq and configparser into the
+   setup-python 3.11 interpreter, never the system Python.
+3. It builds the generic lane with `CI_OPTIONAL_TARGETS=0`.
+4. It copies `config_files/unit_test_k4/daq_chain_config.ini` over
+   `Firmware/daq_chain_config.ini` in the workspace only.
+5. It runs `sudo env "PATH=$PATH" HEIMDALL_STRICT_MODULES=... PYTHON="$(command
+   -v python)" ./unit_test.sh --sudo`.
+6. On the nightly schedule only, it runs the 600 s soak:
+   `sudo env "PATH=$PATH" HEIMDALL_SOAK_SEC=600 python -m unittest -v
+   _testing/unit_test/test_multi_instance.py`. While that file is absent the
+   step prints `SKIP ... (not present yet)`, and fails only in strict mode.
+7. It uploads `Firmware/_testing/test_logs/` as the `pipeline-test-logs`
+   artifact.
+
+To reproduce it on a Linux VM, follow
+[Running the pipeline lane locally](#running-the-pipeline-lane-locally).
+
+### The `deploy-lint` lane
+
+`ci/build.sh deploy-lint` checks the deployment files. It needs no C build.
+
+| Check | Inputs |
+|---|---|
+| `bash -n` and `shellcheck -S warning -x -e SC3043` | `Firmware/*.sh util/*.sh ci/build.sh` (dialect from each shebang) |
+| `shellcheck -s dash -S warning -x -e SC3043` | `Firmware/daq_stop.sh`, `Firmware/daq_common.sh` |
+| `systemd-analyze verify` against a stub `/opt/heimdall` tree | `packaging/systemd/*.service`, `*.timer` |
+| unit check: no inline `#` comment after an unquoted value; `User=` units other than root declare `LogsDirectory=`, plus `StateDirectory=` with `--state-dir` and `RuntimeDirectory=` with `--pid-dir` | `packaging/systemd/*` |
+| `ini_checker.py <preset> no_hw` | every `config_files/*/daq_chain_config.ini` |
+| `ini_checker.py ... --federation` | `config_files/cluster_site/federation.ini` |
+| generator round trip + validation | `util/cluster_cfg_gen.py` |
+| dry run | `util/provision_instance.py --instance 1 --root <tmp>` |
+| `--help` exits 0 within 60 s | `federation_coordinator.py`, `federation_iq_router.py`, `daq_preflight.py`, `provision_instance.py`, `cluster_cfg_gen.py` |
+| `udevadm verify` (when available) | `packaging/udev/*.rules` |
+
+SC3043 is `local` in sh. `daq_stop.sh` uses it on purpose, and dash and ash
+support it. An input that does not exist yet prints `SKIP <path> (not present
+yet)`. A missing `shellcheck` or `systemd-analyze` prints `SKIP` locally and
+is a fatal finding on CI (`CI=true`). A missing `udevadm verify` always prints
+`SKIP`, on CI too.
+
+Whether a finding fails the lane depends on the mode:
+
+| Mode | When | Finding is fatal when |
+|---|---|---|
+| strict | `HEIMDALL_STRICT_MODULES=1` | always |
+| changed-file | `CI_BASE_REF` set (pull requests) | the finding's file is in `git diff --name-only origin/<base>...HEAD`. If the diff fails, every finding is fatal. |
+| report-only | neither (push, schedule, local runs) | never; findings print in the summary |
+
+A finding is fatal in changed-file mode when any of its attributed files
+changed, not only the file it names. Preset, generator and `federation.ini`
+findings are also attributed to `Firmware/ini_checker.py` (generator findings
+to the generator too). Changing `ini_checker.py` therefore makes every such
+finding fatal.
+
+The same rule gates the generic lane's optional targets. A failure there is
+fatal when the PR changes the `Makefile`, `hat_usb3_bridge.c`,
+`hat_pcie_bridge.c`, `device_map.c` or `device_map.h`.
+
+Local run on macOS (report-only mode; shellcheck installed, no
+`systemd-analyze`, no `udevadm`), abridged:
+
+```text
+$ PYTHON=python3 ./ci/build.sh deploy-lint
+[ci/build.sh] deploy-lint (report-only: set CI_BASE_REF or HEIMDALL_STRICT_MODULES=1 to gate)
+===== bash -n / shellcheck: Firmware/*.sh util/*.sh ci/build.sh =====
+===== shellcheck -s dash: POSIX scripts =====
+===== systemd-analyze verify: packaging/systemd =====
+SKIP systemd-analyze verify (systemd-analyze not installed)
+...
+===== --help smoke tests =====
+OK   Firmware/_daq_core/federation_coordinator.py --help
+OK   Firmware/_daq_core/federation_iq_router.py --help
+OK   Firmware/daq_preflight.py --help
+OK   util/provision_instance.py --help
+OK   util/cluster_cfg_gen.py --help
+===== udevadm verify: packaging/udev =====
+SKIP packaging/udev/*.rules (not present yet)
+
+===== deploy-lint summary (report-only: set CI_BASE_REF or HEIMDALL_STRICT_MODULES=1 to gate) =====
+no findings
+===== 0 finding(s); lane passed =====
+```
+
+With findings, the summary lists one `STATUS  CHECK  FILE` row per finding
+(`REPORT` in report-only mode) and ends with `===== N finding(s); lane passed
+=====`.
+
+The unit-file inline-comment check is a heuristic. It flags ` # ` (or a
+trailing ` #`) only in unquoted values, so `Description=chain #2` and
+`Environment="X=a # b"` pass.
+
+## Adding a module
+
+### A Python module in `Firmware/_daq_core`
+
+1. Add the GPL header. Do not add `__init__.py`.
+2. Import sibling modules directly (`from iq_header import IQHeader`). The
+   launched script's directory is `sys.path[0]`. Code outside `_daq_core`
+   (Firmware-level tools, `_testing`, tests) instead adds the directory with
+   `sys.path.insert(0, os.path.join(<dir of os.path.realpath(__file__)>,
+   ...))`, as `daq_preflight.py` and `test_data_synthesizer.py` do. With
+   `realpath`, a symlinked instance directory still finds `_daq_core`.
+3. Keep third-party imports optional unless the module needs numpy, scipy or
+   pyzmq. Use the delay_sync pattern: `try: import x` / `except ImportError:`
+   with a working fallback, or skip the feature with one log line.
+4. Guard soft dependencies on other packages. Wrap a new keyword argument in
+   `try/except TypeError` and fall back to the old call. Wrap a new module in
+   `try/except ImportError`.
+5. Keep shared helpers that `ini_checker.py` or the CLI import (such as
+   `federation_common.py`, `hwc_relay.py`, `version.py`) stdlib-only.
+6. If a start script launches the module, update `daq_start_sm.sh`,
+   `daq_synthetic_start.sh` and the `daq_stop.sh` sweep together. The launch
+   helpers (such as `hd_launch`) live in `daq_common.sh`, which the start,
+   stop, supervise (`daq_supervise.sh`) and federation scripts source.
+
+### A C source
+
+1. Add the object to the right group in the Makefile (`COMMON_OBJS`,
+   `TRANSPORT_OBJS`, `OFFLOAD_OBJS`) or to one binary's link line.
+2. Add any new standalone binary or probe to `clean`.
+3. Gate an optional driver with `#ifdef HAS_XXX_*`, and ship it as a
+   commented-out Makefile block. The default build must not compile it.
+4. Keep `-Wall` clean in `release`, `debug` and `asan`.
+
+### A test module
+
+1. Create `Firmware/_testing/unit_test/test_<name>.py` with `unittest`.
+   `unit_test.sh` runs it from `Firmware/` as `python -m unittest -v
+   _testing/unit_test/test_<name>.py`.
+2. Register it in `Firmware/unit_test.sh`: one line in `CI_MODULES`
+   (hardware-free) or `SUDO_MODULES` (needs root and C binaries).
+3. For a sudo module, add `--ignore=Firmware/_testing/unit_test/test_<name>.py`
+   to `addopts` in `pyproject.toml`, so a bare `pytest` stays hardware-free.
+4. Skip, never fail, on a missing optional dependency:
+   `self.skipTest("SKIP reason: pyzmq not installed")`.
+5. Never touch the live `daq_chain_config.ini` or `_data_control/`. Copy the
+   config into a temp dir and use private FIFOs, shm names and free ports.
+
+### A CLI tool
+
+1. Give it `--help` that exits 0. Add it to `lint_help` in `ci/build.sh` so
+   deploy-lint smoke-tests it.
+2. Document its exit codes in its `--help` text and in the relevant guide.
+3. Use exit 2 for usage errors, as `argparse` does.
+
+## Adding an opt-in feature
+
+Every new behaviour must be dark by default. Use this checklist:
+
+1. **New key or flag.** The behaviour rides on a new INI key or command-line
+   flag. An existing key never gains new behaviour.
+2. **Default identical.** With the key absent, process names, FIFO names and
+   bytes, shm names and object sizes, ports, the 128-byte `:5001` and `:1130`
+   frames, every existing `FNSD` reply, every existing `:5002` reply
+   (including the unknown-command reply and usage errors), the `:5003` frames
+   and the IQ header stay byte-identical.
+3. **Ledger.** If a fix must change the default path, add a row to the
+   default-path ledger with its reason, and list it in `CHANGELOG.md`. The
+   current rows are L1-L16, described in
+   [upgrade_and_rollback.md](upgrade_and_rollback.md#4-default-path-changes-in-this-release-ledger-l1-l16).
+4. **Validation.** Teach `ini_checker.py` the key and its range. Warnings go to
+   stderr with the prefix `WARNING: ` and never change the exit code. Every
+   shipped preset must still pass `ini_checker.py <preset> no_hw` with no error
+   and no warning.
+5. **Documentation.** Add the key as a commented `;key = default` line in
+   `Firmware/daq_chain_config.ini`, and to
+   [configuration.md](configuration.md).
+6. **Wire additions.** Existing verbs keep their request grammar and reply
+   keys. Replies may only gain additive JSON keys. Legacy `:6000` replies keep
+   their framing (no trailing newline). New verbs may use new framing.
+7. **Header slots.** New header data goes only into `reserved[]` slots, defined
+   in lockstep in `iq_header.h` and `iq_header.py`. Each slot is stamped only
+   under its own opt-in key or flag. A fresh header encodes zero.
+8. **Identity test.** Add a test that runs the default path and asserts the
+   bytes are unchanged.
+9. **Instance 0.** Instance 0 keeps unprefixed resources and base ports.
 
 ## Packaging
 
-- `pyproject.toml` — installs **only** `util/heimdall_ctl` (package
-  `heimdall_ctl` + `heimdall_ctl.client`) with the `heimdall-ctl` console
-  script. `Firmware/_daq_core` is intentionally not packaged. Extras:
-  `[db]` → berkeleydb, `[rf]` → scikit-rf, `[dev]` → pytest.
-- `packaging/systemd/` — `heimdall-daq.service` (single instance, oneshot +
-  `RemainAfterExit`, wraps `daq_start_sm.sh`/`daq_stop.sh`) and the optional
+<!-- verify-after: WP-16 -->
+
+- `pyproject.toml` installs only `util/heimdall_ctl` (packages `heimdall_ctl`
+  and `heimdall_ctl.client`) with the `heimdall-ctl` console script.
+  `Firmware/_daq_core` is intentionally not packaged. Extras: `[db]` =
+  berkeleydb, `[rf]` = scikit-rf, `[dev]` = pytest. The in-tree launcher is
+  `util/bin/heimdall-ctl`.
+- `packaging/systemd/` holds `heimdall-daq.service` (single instance, oneshot
+  with `RemainAfterExit`, wraps `daq_start_sm.sh`/`daq_stop.sh`) and the
   per-instance template `heimdall-daq@.service`. The units grant
-  `LimitRTPRIO=99` and `LimitMEMLOCK=infinity` and set **no** `CPUAffinity` —
-  the tiered SCHED_FIFO priorities and affinity stay where they are defined,
-  in the start script. Each federation instance needs its own working copy of
-  `Firmware/` (the instance id comes from the ini, not the command line). See
-  `packaging/systemd/README.md` for the `/opt/heimdall` layout.
-- `packaging/logrotate/heimdall` — rotates `_logs/*.log` and
-  `_logs/inst*/*.log` with `copytruncate` (the processes keep stderr fds
-  open).
+  `LimitRTPRIO=99` and `LimitMEMLOCK=infinity` and set no `CPUAffinity`. The
+  tiered SCHED_FIFO priorities and affinity stay in the start script. See
+  [packaging/systemd/README.md](../packaging/systemd/README.md) for the
+  `/opt/heimdall` layout.
+- `packaging/logrotate/heimdall` rotates `_logs/*.log` and `_logs/inst*/*.log`
+  with `copytruncate`, because the processes keep their stderr fds open.
 
 ## Extending the abstractions
 
@@ -206,79 +626,94 @@ workflow header).
 
 1. Implement the `struct transport_ops` vtable in a new `transport_xxx.c` and
    export `const struct transport_ops* transport_xxx_get_ops(void)`.
-   Contract: `get_write_buf`/`get_read_buf` return buffer index 0/1, `3` =
-   frame dropped, `255` = TERMINATE, negative = error; `buffer_size` includes
-   the 1024-byte header; `num_buffers` is 2.
+   Contract: `get_write_buf`/`get_read_buf` return buffer index 0 or 1, `3` for
+   a dropped frame, `255` for TERMINATE, negative for an error. `buffer_size`
+   includes the 1024-byte header. `num_buffers` is 2.
 2. Guard the whole file with `#ifdef HAS_XXX_TRANSPORT`.
 3. Add the enum value to `transport_type_t` (`transport.h`) and the dispatch
-   case to `transport_get_ops()` in `transport.c` (unknown types must keep
-   falling back to shm).
+   case to `transport_get_ops()` in `transport.c`. Unknown types must keep
+   falling back to shm.
 4. Add a commented-out Makefile block (`TRANSPORT_OBJS += transport_xxx.o`,
-   `EXTRA_CFLAGS += -DHAS_XXX_TRANSPORT`) and an individual object target.
+   `EXTRA_CFLAGS += -DHAS_XXX_TRANSPORT`) and an individual object target. List
+   every extra object, define and library the block needs (see
+   [Optional transport and offload drivers](#optional-transport-and-offload-drivers)).
 5. Teach the `[offload] *_transport` string to the stage config parsers, and
-   `ini_checker.py` if it validates the value.
+   to `ini_checker.py` if it validates the value.
 
 ### Adding an offload engine
 
 1. Implement the `struct fir_engine` (init/destroy/decimate/reset) and
-   `struct convert_engine` vtables in `offload_cpu_xxx.c` /
-   `offload_xxx.c`; export `fir_engine_xxx_create()` and
-   `convert_engine_xxx_create()`.
+   `struct convert_engine` vtables in `offload_cpu_xxx.c` or `offload_xxx.c`.
+   Export `fir_engine_xxx_create()` and `convert_engine_xxx_create()`.
 2. Add the enum value in `offload.h`, the name strings in
    `offload_engine_from_string()`, and the factory cases (including the
    fallback chain) in `offload.c`.
-3. Note the FIR init contract: the coefficients pointer must outlive the
-   engine (the Ne10 path stores the pointer; `fir_decimate.c` keeps
-   `fir_coeffs` allocated for the process lifetime).
+3. Keep the FIR init contract: the coefficients pointer must outlive the
+   engine. The Ne10 path stores the pointer, and `fir_decimate.c` keeps
+   `fir_coeffs` allocated for the process lifetime.
 4. Wire a Makefile `ENGINE=` lane or a `HAS_XXX_OFFLOAD` define, and add the
    `[offload] fir_engine` alias to `ini_checker.py`.
-5. Prove bit-exactness against the generic engine over multi-frame streams
-   (state continuity, channel isolation, reset, taps > frame).
+5. Prove bit-exactness against the generic engine over multi-frame streams:
+   state continuity, channel isolation, reset, taps longer than a frame.
 
 ## Coding invariants (do not break)
 
-- **IQ header ABI**: `iq_header.h` and `iq_header.py` change **in lockstep**.
-  Exactly 1024 bytes, **native** alignment (the little-endian no-padding
-  variant is 1016 bytes — never add a `<` prefix without explicit padding),
-  sync word `0x2bf7b95a`, `header_version` 8, `reserved` at offset 252,
-  `header_version` at 1020. The named reserved-slot indices (0, 32, 64,
-  96–102) are wire ABI. `_Static_assert`s in C and an import-time assert in
-  Python enforce this — keep them.
+- **IQ header ABI.** `iq_header.h` and `iq_header.py` change in lockstep.
+  Exactly 1024 bytes, native alignment (the little-endian no-padding variant is
+  1016 bytes, so never add a `<` prefix without explicit padding), sync word
+  `0x2bf7b95a`, `header_version` 8, `reserved` at offset 252, `header_version`
+  at 1020. The named reserved-slot indices are wire ABI: 0, 32, 64, 96-102,
+  and the opt-in slots 103-113 (router sequence and receive time, source
+  instance and key, node-id CRC, decimator drops, calibration telemetry). Slot
+  `k` sits at byte `252 + 4k`. `_Static_assert`s in C and an import-time
+  assert in Python enforce the layout. Keep them.
 - **FIFO signaling bytes** are frozen: `A_BUFF_READY=1`, `B_BUFF_READY=2`,
-  `INIT_READY=10`, `TERMINATE=255`; producer signals on `fw_<name>`, consumer
-  frees on `bw_<name>`; drop mode = `O_NONBLOCK` on the backward FIFO only,
-  sentinel `3`.
-- **Gain-lock rules**: `self.gains` hold *indices* into `valid_gains`; header
-  `if_gains` hold actual tuner gains in tenths of dB; the FSM gates on exact
+  `INIT_READY=10`, `TERMINATE=255`. The producer signals on `fw_<name>` and the
+  consumer frees on `bw_<name>`. Drop mode is `O_NONBLOCK` on the backward FIFO
+  only, sentinel `3`.
+- **Gain-lock rules.** `self.gains` hold indices into `valid_gains`. Header
+  `if_gains` hold actual tuner gains in tenths of dB. The FSM gates on exact
   equality `valid_gains[gains[m]] == if_gains[m]`. External LNA gain lives in
-  the separate continuous-dB `ext_lna_gains_db` array — never route it through
-  `valid_gains.index()` (ValueError) and never write it into `self.gains` or
-  `if_gains`. Total system gain is computed **after** the
-  `unified_gain_control` clamp; compression flags are advisory and must never
-  auto-change gains.
-- **The `destory_sm_buffer` typo** is a frozen public name in both
-  `sh_mem_util.h` and `shmemIface.py` (and forwarded by the transport
-  wrappers). Do not rename.
-- **GPIO discipline**: GPIO 0 is reserved for the noise source; per-channel
-  bias-tee uses GPIO m+1; bias changes defer during calibration bursts.
-- **ini handlers return 1 on all paths** (unknown keys accepted); callers
-  treat only `ini_parse() < 0` as fatal and log a warning for > 0. Keep
+  the separate continuous-dB `ext_lna_gains_db` array. Never route it through
+  `valid_gains.index()` (ValueError), and never write it into `self.gains` or
+  `if_gains`. Total system gain is computed after the `unified_gain_control`
+  clamp. Compression flags are advisory and never change gains.
+- **The `destory_sm_buffer` typo** is a frozen public name in `sh_mem_util.h`
+  and `shmemIface.py`, forwarded by the transport wrappers. Do not rename it.
+- **GPIO discipline.** GPIO 0 is reserved for the noise source. Per-channel
+  bias tee uses GPIO m+1. Bias changes defer during calibration bursts.
+- **ini handlers return 1 on all paths** (unknown keys accepted). Callers treat
+  only `ini_parse() < 0` as fatal and log a warning for `> 0`. Keep
   `INI_STOP_ON_FIRST_ERROR` disabled in the vendored `ini.c`.
-- **Frame types** (0–4) and **sync-state numbering** (0 none, 1–4 syncing,
-  5 lock, 6 track) are consumed across modules and by external tooling —
-  renumbering breaks hw_controller, orientation gating, health derivation,
-  and DB queries.
-- **`daq_block_index`** is monotonically continuous per session; overrun
-  events are surfaced via reserved slot 102, never by skipping indices.
-- **SIGRT(64)** must remain accepted by all C binaries for
-  `daq_stop.sh --legacy`; binary names/paths (`_daq_core/*.out`) are contracts
-  referenced by the scripts and pipeline tests.
-- **Defaults are behavior-identical**: with all optional INI sections absent
-  or disabled and all optional drivers compiled out, runtime behavior must
-  match the pre-abstraction firmware. Instance 0 keeps unprefixed resources
-  and base ports.
-- **daq_db records are a persistence ABI**: every record carries a version
-  byte; changing a KEY/VALUE format requires bumping the record version and
-  the `DB_SCHEMA_VERSION` marker handling.
-- **License**: GNU GPL v3 (headers in every file). Respect vendored
-  inih/rxi-log/KFR/Ne10 licensing in packaging work.
+- **Frame types** (0-4) and **sync-state numbering** (0 none, 1-4 syncing, 5
+  lock, 6 track) are consumed across modules and by external tooling.
+  Renumbering breaks hw_controller, orientation gating, health derivation and
+  DB queries.
+- **FSM wire names.** New replies and relay documents name hw_controller states
+  without the `STATE_` prefix: `INIT`, `GAIN_TUNE`, `GAIN_CTR_WAIT`,
+  `NOISE_CTR_WAIT`, `IQ_CAL`.
+- **Version string.** `Firmware/_daq_core/version.py` `FW_VERSION` is the one
+  source of the firmware version (currently `1.1.0-dev`). Do not hardcode it
+  elsewhere.
+- **Frame sizes.** `frame_sizes.h` is the one C definition of the shm segment
+  sizes. `capacity_model.frame_sizes` mirrors it key for key, and
+  `test_frame_sizes` cross-checks both. <!-- verify-after: WP-13 -->
+- **`daq_block_index`** is the rtl_daq block counter. It rises by exactly 1
+  per rtl_daq block, so it is continuous only on the rtl_daq -> rebuffer hop.
+  Each later frame carries the index of the last block it contains. DATA
+  frames step by `cpi_size * decimation_ratio / daq_buffer_size`, CAL frames
+  by `cal_size / daq_buffer_size`, DUMMY frames by 1. Do not add a gap check
+  on it downstream of rebuffer. rtl_daq never skips an index on overrun.
+  Overruns surface in reserved slot 102.
+- **SIGRT(64)** must stay accepted by all C binaries for `daq_stop.sh
+  --legacy`. Binary names and paths (`_daq_core/*.out`) are contracts that the
+  scripts and pipeline tests reference.
+- **Defaults are behaviour-identical.** With all optional INI sections and new
+  keys absent, and all optional drivers compiled out, runtime behaviour matches
+  the previous release except for the ledger rows. Instance 0 keeps unprefixed
+  resources and base ports.
+- **daq_db records are a persistence ABI.** Every record carries a version
+  byte. Changing a KEY/VALUE format requires bumping the record version and the
+  schema generation (currently 2, marker file `_schema_version`).
+- **License.** GNU GPL v3, with headers in every file. Respect the vendored
+  inih, rxi-log, KFR and Ne10 licensing in packaging work.

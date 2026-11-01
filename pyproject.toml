@@ -49,12 +49,17 @@ markers = [
 # The pipeline tests below spawn the built C binaries over FIFOs and need
 # sudo + the unit_test_k4 config (see CLAUDE.md); they are excluded here so a
 # bare `pytest` runs only the hardware-free suite. Run them explicitly with
-# `sudo python3 -m unittest ...` per CLAUDE.md, or `./unit_test.sh` lanes.
+# `sudo python3 -m unittest ...` per CLAUDE.md, or `./unit_test.sh --sudo`
+# (the SUDO_MODULES list there; test_sys is the manual full-chain lane).
 addopts = """
 --ignore=Firmware/_testing/unit_test/test_decimator.py \
 --ignore=Firmware/_testing/unit_test/test_rebuffer.py \
---ignore=Firmware/_testing/unit_test/test_squelch.py \
 --ignore=Firmware/_testing/unit_test/test_delay_sync.py \
 --ignore=Firmware/_testing/unit_test/test_sys.py \
 --ignore=Firmware/_testing/unit_test/test_iq_server.py \
+--ignore=Firmware/_testing/unit_test/test_start_stop_legacy.py \
+--ignore=Firmware/_testing/unit_test/test_multi_instance.py \
+--ignore=Firmware/_testing/unit_test/test_synthetic_chain.py \
+--ignore=Firmware/_testing/unit_test/test_bit_identity.py \
+--ignore=Firmware/_testing/unit_test/test_throughput_lane.py \
 """

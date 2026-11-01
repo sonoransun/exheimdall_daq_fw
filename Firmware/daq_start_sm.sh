@@ -5,46 +5,61 @@
 #   Project : HeIMDALL DAQ Firmware
 #   License : GNU GPL V3
 #   Authors: Tamas Peto, Carl Laufer
+#
+#   Usage: ./daq_start_sm.sh [--takeover] [--no-host-tuning]
+#     --takeover        with [host] instance_guard = refuse: stop this
+#                       instance when it runs from another copy, then start
+#     --no-host-tuning  same as [host] host_tuning = 0
+#   Unknown arguments are ignored.
+#
+#   Exit codes: 0 started; 1 config/FIR-designer failure or ports still busy;
+#   3 guard refusal (instance_guard = refuse, allow_core_sharing = refuse);
+#   4 preflight failure with [host] preflight = strict.
 
-# Check config file (fast path: no hardware probing; exit code 0 = valid)
-if python3 ini_checker.py no_hw; then
+HD_TAKEOVER=0
+HD_NO_HOST_TUNING=0
+for arg in "$@"; do
+    case "$arg" in
+        --takeover) HD_TAKEOVER=1 ;;
+        --no-host-tuning) HD_NO_HOST_TUNING=1 ;;
+    esac
+done
+
+if [ ! -f ./daq_common.sh ]; then
+    echo -e "\e[91mdaq_common.sh not found next to $0 - DAQ chain not started!\e[39m"
+    exit 1
+fi
+# shellcheck source=daq_common.sh
+. ./daq_common.sh
+
+# Check config file (fast path: no hardware probing; exit code 0 = valid).
+# 'attached' adds the sysfs serial and host-registry checks.
+if python3 ini_checker.py no_hw attached; then
     echo -e "\e[92mConfig file check [ OK ]\e[39m"
 else
     echo -e "\e[91mConfig file check [ FAIL ]\e[39m"
     exit 1
 fi
 
-sudo sysctl -w kernel.sched_rt_runtime_us=-1
-
-# Apply IRQ tuning for optimal performance
-if [ -x "../util/irq_tuning.sh" ]; then
-    sudo ../util/irq_tuning.sh
-fi
-
 # Read config ini file (ConfigParser: immune to comments/substring matches)
-out_data_iface_type=$(python3 -c "
-from configparser import ConfigParser
-c = ConfigParser()
-c.read('daq_chain_config.ini')
-print(c.get('data_interface', 'out_data_iface_type', fallback='eth'))
-" 2>/dev/null || echo "eth")
+hd_read_config daq_chain_config.ini
+out_data_iface_type="$HD_OUT_IFACE"
+instance_id="$HD_INSTANCE_ID"
 
-# Read federation instance_id
-instance_id=$(python3 -c "
-from configparser import ConfigParser
-c = ConfigParser()
-c.read('daq_chain_config.ini')
-print(c.get('federation', 'instance_id', fallback='0'))
-" 2>/dev/null || echo "0")
-case "$instance_id" in
-    ''|*[!0-9]*) instance_id=0 ;;
-esac
+# sysctl kernel.sched_rt_runtime_us + IRQ tuning ([host] host_tuning)
+hd_host_tuning_early
 
 # Compute FIFO name prefix based on instance_id
 if [ "$instance_id" -eq 0 ]; then
     FIFO_PREFIX=""
 else
     FIFO_PREFIX="inst${instance_id}_"
+fi
+
+# Host registry, startup mutex and instance lock ([host] instance_registry = 1
+# only; the default opens no fd, exports nothing and writes no file)
+if [ "$HD_INSTANCE_REGISTRY" = 1 ]; then
+    hd_registry_begin "$instance_id"
 fi
 
 # (re) create control FIFOs
@@ -71,6 +86,12 @@ mkfifo _data_control/${FIFO_PREFIX}bw_delay_sync_iq
 
 mkfifo _data_control/${FIFO_PREFIX}fw_delay_sync_hwc
 mkfifo _data_control/${FIFO_PREFIX}bw_delay_sync_hwc
+
+# Relay files of the previous run (hw_controller state / recalibration request)
+rm -f "_data_control/${FIFO_PREFIX}recal_request" "_data_control/${FIFO_PREFIX}hwc_state"
+
+# hw_controller's track-lock approval file ('0' = not approved)
+[ -e "_data_control/${FIFO_PREFIX}iq_track_lock" ] || printf '0' > "_data_control/${FIFO_PREFIX}iq_track_lock"
 
 # Create database directory
 mkdir -p _db
@@ -100,70 +121,13 @@ fi
 # Set for Tinkerboard with heatsink/fan
 #sudo cpufreq-set -d 1.8GHz
 
-# The Kernel limits the maximum size of all buffers that libusb can allocate to 16MB by default.
-# In order to disable the limit, you have to run the following command as root:
-if [ -e /sys/module/usbcore/parameters/usbfs_memory_mb ]; then
-    sudo sh -c "echo 0 > /sys/module/usbcore/parameters/usbfs_memory_mb"
-else
-    echo "WARN: /sys/module/usbcore/parameters/usbfs_memory_mb not present, skipping"
-fi
+# usbfs_memory_mb + drop_caches ([host] host_tuning)
+hd_host_tuning_late
 
-# This command clear the caches
-echo '3' | sudo tee /proc/sys/vm/drop_caches > /dev/null
-
-# Compute ports based on instance_id (port_stride=100)
-port_stride=$(python3 -c "
-from configparser import ConfigParser
-c = ConfigParser()
-c.read('daq_chain_config.ini')
-print(c.get('federation', 'port_stride', fallback='100'))
-" 2>/dev/null || echo "100")
-case "$port_stride" in
-    ''|*[!0-9]*) port_stride=100 ;;
-esac
-port_offset=$((instance_id * port_stride))
-iq_port=$((5000 + port_offset))
-hwc_port=$((5001 + port_offset))
-status_port=$((5002 + port_offset))
-
-# Port-in-use test: lsof when available, ss as fallback. Returns 0 when the
-# port has a listener. If neither tool exists the check is skipped entirely
-# (previously a missing lsof made this loop spin forever).
-port_in_use() {
-    if command -v lsof >/dev/null 2>&1; then
-        lsof -i:"$1" >/dev/null 2>&1
-    elif command -v ss >/dev/null 2>&1; then
-        ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1\$"
-    else
-        return 1
-    fi
-}
-
-# Check ports (IQ server, Hardware controller, Status server)
-if command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1; then
-    port_attempts=0
-    while true; do
-        port_ready=1
-        for p in "$iq_port" "$hwc_port" "$status_port"; do
-            if port_in_use "$p"; then
-                port_ready=0
-            fi
-        done
-        if test $port_ready -eq 1; then
-            break
-        fi
-        port_attempts=$((port_attempts + 1))
-        if [ "$port_attempts" -ge 10 ]; then
-            echo -e "\e[91mERROR: Ports (${iq_port}, ${hwc_port} & ${status_port}) still busy after ${port_attempts} attempts - DAQ chain not started!\e[39m"
-            exit 1
-        fi
-        echo "WARN:Ports used by the DAQ chain instance ${instance_id} are not free! (${iq_port}, ${hwc_port} & ${status_port})"
-        ./daq_stop.sh
-        sleep 1
-    done
-else
-    echo "WARN: Neither lsof nor ss available - skipping port availability check"
-fi
+# Check ports (IQ server, Hardware controller, Status server): listener-only;
+# busy ports are freed with ./daq_stop.sh, 10 attempts, then exit 1
+hd_port_check hw
+hd_lock_deferred
 
 # Generating FIR filter coefficients
 python3 fir_filter_designer.py
@@ -176,23 +140,12 @@ fi
 
 # --- Hardware Discovery & Initialization ---
 echo "Discovering available hardware..."
-python3 _daq_core/hw_discover.py > _data_control/hw_caps.json 2>/dev/null || true
-python3 _daq_core/auto_config.py _data_control/hw_caps.json daq_chain_config.ini 2>/dev/null || true
+python3 _daq_core/hw_discover.py > "_data_control/${FIFO_PREFIX}hw_caps.json" 2>/dev/null || true
+python3 _daq_core/auto_config.py "_data_control/${FIFO_PREFIX}hw_caps.json" daq_chain_config.ini 2>/dev/null || true
 
 # FPGA bitstream loading (if enabled)
-FPGA_ENABLE=$(python3 -c "
-from configparser import ConfigParser
-c = ConfigParser()
-c.read('daq_chain_config.ini')
-print(c.get('fpga', 'enable', fallback='0'))
-" 2>/dev/null || echo "0")
-if [ "$FPGA_ENABLE" = "1" ]; then
-    FPGA_BITSTREAM=$(python3 -c "
-from configparser import ConfigParser
-c = ConfigParser()
-c.read('daq_chain_config.ini')
-print(c.get('fpga', 'bitstream', fallback=''))
-" 2>/dev/null)
+if [ "$HD_FPGA_ENABLE" = "1" ]; then
+    FPGA_BITSTREAM="$HD_FPGA_BITSTREAM"
     if [ -n "$FPGA_BITSTREAM" ] && [ -f "$FPGA_BITSTREAM" ]; then
         echo "Loading FPGA bitstream: $FPGA_BITSTREAM"
         python3 _daq_core/fpga_loader.py "$FPGA_BITSTREAM" || echo "FPGA load failed, continuing with CPU-only mode"
@@ -200,13 +153,7 @@ print(c.get('fpga', 'bitstream', fallback=''))
 fi
 
 # GPU initialization (if enabled)
-GPU_ENABLE=$(python3 -c "
-from configparser import ConfigParser
-c = ConfigParser()
-c.read('daq_chain_config.ini')
-print(c.get('gpu', 'enable', fallback='0'))
-" 2>/dev/null || echo "0")
-if [ "$GPU_ENABLE" = "1" ]; then
+if [ "$HD_GPU_ENABLE" = "1" ]; then
     echo "Initializing GPU offload..."
     python3 _daq_core/gpu_init.py || echo "GPU init failed, continuing with CPU-only mode"
 fi
@@ -226,17 +173,35 @@ case "$NUM_CORES" in
 esac
 HOST_ARCH=$(uname -m)
 
-# Per-instance CPU affinity: instance N is offset by N*4 cores (mod NUM_CORES)
-# so two federation instances on an 8-core host do not stack their SCHED_FIFO
-# 99/94/92 processes on the same cores. Instance 0 resolves to cores 0/1/2/3 -
-# identical to the historical fixed assignment.
-CORE0=$(( (instance_id * 4 + 0) % NUM_CORES ))
-CORE1=$(( (instance_id * 4 + 1) % NUM_CORES ))
-CORE2=$(( (instance_id * 4 + 2) % NUM_CORES ))
-CORE3=$(( (instance_id * 4 + 3) % NUM_CORES ))
-if [ "$instance_id" -gt 0 ] && [ "$NUM_CORES" -lt $(( (instance_id + 1) * 4 )) ]; then
-    echo "WARN: ${NUM_CORES} cores for $((instance_id + 1)) instances - RT processes of multiple instances will share cores (${CORE0},${CORE1},${CORE2},${CORE3})"
+if [ -n "$HD_CPU_CORES" ]; then
+    # [host] cpu_cores: tiers T0 rtl_daq, T1 rebuffer+decimate,
+    # T2 delay_sync+iq_server, T3 hw_controller
+    IFS=, read -r CORE0 CORE1 CORE2 CORE3 <<EOF
+$HD_CPU_CORES
+EOF
+else
+    # Per-instance CPU affinity: instance N is offset by N*4 cores (mod NUM_CORES)
+    # so two federation instances on an 8-core host do not stack their SCHED_FIFO
+    # 99/94/92 processes on the same cores. Instance 0 resolves to cores 0/1/2/3 -
+    # identical to the historical fixed assignment.
+    CORE0=$(( (instance_id * 4 + 0) % NUM_CORES ))
+    CORE1=$(( (instance_id * 4 + 1) % NUM_CORES ))
+    CORE2=$(( (instance_id * 4 + 2) % NUM_CORES ))
+    CORE3=$(( (instance_id * 4 + 3) % NUM_CORES ))
 fi
+hd_core_guard "$CORE0" "$CORE1" "$CORE2" "$CORE3"
+
+# [host] rt_priority_offset is subtracted from every tier (default 0)
+RT_OFF="$HD_RT_PRIORITY_OFFSET"
+PRIO_RTL=$((99 - RT_OFF))
+PRIO_REB=$((94 - RT_OFF))
+PRIO_DEC=$((92 - RT_OFF))
+PRIO_DS=$((90 - RT_OFF))
+PRIO_IQS=$((88 - RT_OFF))
+PRIO_HWC=$((82 - RT_OFF))
+
+# [host] preflight = warn|strict (default off)
+hd_preflight
 
 # Differentiated Real-Time Priority & CPU Affinity Assignment
 echo "Starting DAQ Subsystem (instance ${instance_id}) with RT optimization"
@@ -244,55 +209,61 @@ echo "Platform: $HOST_ARCH, Cores: $NUM_CORES (using ${CORE0},${CORE1},${CORE2},
 
 # Tier 1: Hardware I/O Critical (95-99) - Core 0 & 1
 # RTL-SDR USB acquisition (highest priority) + Rebuffer pipeline
-taskset -c $CORE0 chrt -f 99 _daq_core/rtl_daq.out 2> "$LOG_DIR/rtl_daq.log" | \
-taskset -c $CORE1 chrt -f 94 _daq_core/rebuffer.out 0 2> "$LOG_DIR/rebuffer.log" &
+taskset -c "$CORE0" chrt -f "$PRIO_RTL" _daq_core/rtl_daq.out 2> "$LOG_DIR/rtl_daq.log" 8>&- | \
+taskset -c "$CORE1" chrt -f "$PRIO_REB" _daq_core/rebuffer.out 0 2> "$LOG_DIR/rebuffer.log" 8>&- &
 echo $! > "$PID_DIR/rebuffer.pid"
 # $! is the LAST process of the pipeline (rebuffer); the pipeline's process
 # group leader is its FIRST process (rtl_daq) - record it too so per-instance
 # daq_stop.sh can signal the USB acquisition process.
 jobs -p %+ > "$PID_DIR/rtl_daq.pid" 2>/dev/null
+# From here on a failing start stops the stages it launched
+hd_arm_abort "$instance_id"
 
 # FIR Decimation (high priority) - Core 1 (shared with rebuffer for cache locality)
-taskset -c $CORE1 chrt -f 92 _daq_core/decimate.out 2> "$LOG_DIR/decimator.log" &
+hd_launch taskset -c "$CORE1" chrt -f "$PRIO_DEC" _daq_core/decimate.out 2> "$LOG_DIR/decimator.log"
 echo $! > "$PID_DIR/decimate.pid"
 
-# FFT Cross-correlation (high priority) - Core 2
-if [ $NUM_CORES -ge 4 ]; then
-    taskset -c $CORE2 chrt -f 90 python3 _daq_core/delay_sync.py 2> "$LOG_DIR/delay_sync.log" &
-elif [ $NUM_CORES -ge 3 ]; then
-    taskset -c $CORE2 chrt -f 90 python3 _daq_core/delay_sync.py 2> "$LOG_DIR/delay_sync.log" &
+# FFT Cross-correlation (high priority) - Core 2 ([host] delay_sync_cores
+# widens the list for delay_sync only)
+if [ -n "$HD_CPU_CORES" ] || [ "$NUM_CORES" -ge 3 ]; then
+    hd_launch taskset -c "${HD_DELAY_SYNC_CORES:-$CORE2}" chrt -f "$PRIO_DS" python3 _daq_core/delay_sync.py 2> "$LOG_DIR/delay_sync.log"
 else
     # Fallback for dual-core systems
-    taskset -c $CORE1 chrt -f 90 python3 _daq_core/delay_sync.py 2> "$LOG_DIR/delay_sync.log" &
+    hd_launch taskset -c "${HD_DELAY_SYNC_CORES:-$CORE1}" chrt -f "$PRIO_DS" python3 _daq_core/delay_sync.py 2> "$LOG_DIR/delay_sync.log"
 fi
 echo $! > "$PID_DIR/delay_sync.pid"
 
 # Tier 2: Control Plane (75-84) - Core 3 (or available)
-if [ $NUM_CORES -ge 4 ]; then
-    taskset -c $CORE3 chrt -f 82 sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> "$LOG_DIR/hwc.log" &
+if [ -n "$HD_CPU_CORES" ] || [ "$NUM_CORES" -ge 4 ]; then
+    hd_launch taskset -c "$CORE3" chrt -f "$PRIO_HWC" sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> "$LOG_DIR/hwc.log"
 else
     # Use any available core for systems with fewer cores
-    chrt -f 82 sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> "$LOG_DIR/hwc.log" &
+    hd_launch chrt -f "$PRIO_HWC" sudo env "PATH=$PATH" python3 _daq_core/hw_controller.py 2> "$LOG_DIR/hwc.log"
 fi
 echo $! > "$PID_DIR/hw_controller.pid"
 # root priviliges are needed to drive the i2c master
 
-if [ $out_data_iface_type = eth ]; then
+if [ "$out_data_iface_type" = eth ]; then
     echo "Output data interface: IQ ethernet server"
     # IQ server (medium-high priority) - Core 2 or 3 depending on system
-    if [ $NUM_CORES -ge 4 ]; then
-        taskset -c $CORE2 chrt -f 88 _daq_core/iq_server.out 2>"$LOG_DIR/iq_server.log" &
+    if [ -n "$HD_CPU_CORES" ] || [ "$NUM_CORES" -ge 4 ]; then
+        hd_launch taskset -c "$CORE2" chrt -f "$PRIO_IQS" _daq_core/iq_server.out 2>"$LOG_DIR/iq_server.log"
     else
-        chrt -f 88 _daq_core/iq_server.out 2>"$LOG_DIR/iq_server.log" &
+        hd_launch chrt -f "$PRIO_IQS" _daq_core/iq_server.out 2>"$LOG_DIR/iq_server.log"
     fi
     echo $! > "$PID_DIR/iq_server.pid"
-elif [ $out_data_iface_type = shmem ]; then
+elif [ "$out_data_iface_type" = shmem ]; then
     echo "Output data interface: Shared memory"
 fi
 
 # IQ Eth sink used for testing
 #sleep 3
 #python3 _daq_core/iq_eth_sink.py 2>"$LOG_DIR/iq_eth_sink.log" &
+
+if [ "$HD_INSTANCE_REGISTRY" = 1 ]; then
+    hd_registry_write hw "$PID_DIR" "$CORE0,$CORE1,$CORE2,$CORE3"
+fi
+hd_disarm_abort
 
 echo -e "      )  (     "
 echo -e "      (   ) )  "

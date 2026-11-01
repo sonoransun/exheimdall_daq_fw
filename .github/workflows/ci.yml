@@ -1,12 +1,33 @@
 # HeIMDALL DAQ Firmware - CI
 #
 # Lanes:
-#   c-build   : C core on x86_64 + arm64, generic (dependency-light) engine
-#               always, plus a full ENGINE=kfr lane with KFR built from source
-#               (cached - the first run on a cold cache is slow, ~5-15 min).
-#   asan      : compile+link the core with -fsanitize=address,undefined.
-#   python    : hardware-free Python suite via the canonical entry point
-#               `cd Firmware && ./unit_test.sh --ci` on ubuntu and macos.
+#   c-build     : C core on x86_64 + arm64, generic (dependency-light) engine
+#                 always, plus a full ENGINE=kfr lane with KFR built from source
+#                 (cached - the first run on a cold cache is slow, ~5-15 min).
+#                 The generic lane also builds the optional targets
+#                 hat_usb3_bridge / hat_pcie_bridge / device_map_probe; their
+#                 failure is fatal only under the changed-file rule below.
+#   asan        : compile+link the core with -fsanitize=address,undefined.
+#   python      : hardware-free Python suite via the canonical entry point
+#                 `cd Firmware && ./unit_test.sh --ci` on ubuntu and macos.
+#   pipeline    : the sudo/pipeline suites (`./unit_test.sh --sudo`) on a full
+#                 ubuntu VM with passwordless sudo (SCHED_FIFO works there);
+#                 skipped on documentation-only pull requests; the nightly
+#                 schedule adds the 600 s multi-instance soak.
+#   deploy-lint : `ci/build.sh deploy-lint` - bash -n / shellcheck, systemd
+#                 unit verification, preset + generator validation, --help
+#                 smoke tests, udev rules.
+#
+# Registered-but-absent test modules print PEND in unit_test.sh and absent
+# lint inputs print SKIP. The repository variable HEIMDALL_STRICT_MODULES
+# (Settings > Variables; default 0) turns PEND into FAIL and makes every
+# deploy-lint finding and every optional-target build failure fatal; absent
+# lint inputs (and optional targets with no Makefile rule) still print SKIP.
+# Set it to 1 once every work package has merged. Without it the changed-file rule applies: on a pull
+# request a finding is fatal when its file is in
+# `git diff --name-only origin/<base>...HEAD`, otherwise it is report-only.
+# LIBRTLSDR_REF / KFR_REF can likewise be overridden by repository variables
+# (a branch, tag or commit sha); the defaults are master / 7.1.0.
 #
 # There is intentionally NO FPGA gateware job: `make lint` (verilator) exits
 # non-zero with 92 warnings-as-errors and `make verify` fails on 'Xx'
@@ -14,7 +35,8 @@
 # ubuntu 24.04 container with apt iverilog/verilator. Re-add a gateware job
 # once _fpga_gateware lint/verify pass locally.
 #
-# All C-build steps live in ci/build.sh so they are locally reproducible.
+# All build and lint steps live in ci/build.sh so they are locally
+# reproducible.
 name: CI
 
 on:
@@ -22,14 +44,20 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # nightly soak (pipeline job)
+    - cron: "17 3 * * *"
 
+# The event name is part of the group so the nightly schedule run (which also
+# runs on refs/heads/main) neither cancels nor is cancelled by push runs.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  KFR_REF: "7.1.0"
-  LIBRTLSDR_REF: "master"
+  KFR_REF: ${{ vars.KFR_REF || '7.1.0' }}
+  LIBRTLSDR_REF: ${{ vars.LIBRTLSDR_REF || 'master' }}
+  HEIMDALL_STRICT_MODULES: ${{ vars.HEIMDALL_STRICT_MODULES || '0' }}
 
 jobs:
   c-build:
@@ -43,6 +71,8 @@ jobs:
         lane: [generic, kfr]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install build dependencies
         run: |
@@ -57,9 +87,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ci-deps
-          key: ci-deps-${{ matrix.os }}-${{ matrix.lane }}-librtlsdr-${{ env.LIBRTLSDR_REF }}-kfr-${{ env.KFR_REF }}-v1
+          key: ci-deps-${{ matrix.os }}-${{ matrix.lane }}-librtlsdr-${{ env.LIBRTLSDR_REF }}-kfr-${{ env.KFR_REF }}-v2
 
       - name: Build (${{ matrix.lane }} lane)
+        env:
+          # changed-file rule for the optional targets (empty on push)
+          CI_BASE_REF: ${{ github.base_ref }}
         run: ./ci/build.sh ${{ matrix.lane }}
 
       - name: Show binaries
@@ -82,7 +115,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ci-deps
-          key: ci-deps-ubuntu-latest-asan-librtlsdr-${{ env.LIBRTLSDR_REF }}-v1
+          key: ci-deps-ubuntu-latest-asan-librtlsdr-${{ env.LIBRTLSDR_REF }}-v2
 
       - name: Build with AddressSanitizer/UBSan
         run: ./ci/build.sh asan
@@ -131,3 +164,132 @@ jobs:
         run: |
           python -m pip install .
           heimdall-ctl --help
+
+  pipeline:
+    name: Pipeline suites (sudo, ubuntu VM)
+    # A full VM with passwordless sudo - chrt -f 99 / SCHED_FIFO work here;
+    # never run this job in a container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate (skip documentation-only pull requests)
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          run=1
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if changed="$(git diff --name-only "origin/${BASE_REF}...HEAD")"; then
+              # Inverse gating: run unless EVERY changed path is documentation.
+              if [ -n "$changed" ] && \
+                 ! printf '%s\n' "$changed" | grep -Ev '^Documentation/|\.md$|^LICENSE$' >/dev/null; then
+                run=0
+              fi
+            else
+              echo "::warning::cannot diff against origin/${BASE_REF}; running the pipeline lane"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "pipeline lane: run=$run (event: $EVENT_NAME)"
+
+      - name: Install build dependencies
+        if: steps.gate.outputs.run == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git libusb-1.0-0-dev libzmq3-dev
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == '1'
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies (into the setup-python interpreter)
+        if: steps.gate.outputs.run == '1'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy numba pyzmq configparser
+
+      - name: Cache built dependencies (librtlsdr)
+        if: steps.gate.outputs.run == '1'
+        uses: actions/cache@v4
+        with:
+          path: .ci-deps
+          # same key as the c-build ubuntu-latest generic lane
+          key: ci-deps-ubuntu-latest-generic-librtlsdr-${{ env.LIBRTLSDR_REF }}-kfr-${{ env.KFR_REF }}-v2
+
+      - name: Build C core (generic lane)
+        if: steps.gate.outputs.run == '1'
+        env:
+          # the optional targets are gated by the c-build job
+          CI_OPTIONAL_TARGETS: "0"
+        run: ./ci/build.sh generic
+
+      - name: Stage the sudo-suite config (workspace only, never committed)
+        if: steps.gate.outputs.run == '1'
+        run: cp config_files/unit_test_k4/daq_chain_config.ini Firmware/daq_chain_config.ini
+
+      - name: Pipeline suites (./unit_test.sh --sudo)
+        if: steps.gate.outputs.run == '1'
+        run: |
+          cd Firmware
+          sudo env "PATH=$PATH" HEIMDALL_STRICT_MODULES="$HEIMDALL_STRICT_MODULES" \
+            PYTHON="$(command -v python)" ./unit_test.sh --sudo
+
+      - name: Nightly multi-instance soak (600 s)
+        if: steps.gate.outputs.run == '1' && github.event_name == 'schedule'
+        run: |
+          cd Firmware
+          if [ ! -f _testing/unit_test/test_multi_instance.py ]; then
+            echo "SKIP _testing/unit_test/test_multi_instance.py (not present yet)"
+            [ "$HEIMDALL_STRICT_MODULES" != "1" ] || exit 1
+            exit 0
+          fi
+          sudo env "PATH=$PATH" HEIMDALL_SOAK_SEC=600 \
+            python -m unittest -v _testing/unit_test/test_multi_instance.py
+
+      - name: Upload test logs
+        if: always() && steps.gate.outputs.run == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-test-logs
+          path: Firmware/_testing/test_logs/
+          if-no-files-found: warn
+
+  deploy-lint:
+    name: Deploy lint (scripts, units, configs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install lint tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck systemd udev
+          # stub service user for the User=heimdall units (systemd-analyze
+          # verify runs against a stub /opt/heimdall tree built by the lane)
+          getent passwd heimdall >/dev/null || \
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin heimdall
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy pyzmq
+
+      - name: Deploy lint
+        env:
+          CI_BASE_REF: ${{ github.base_ref }}
+          PYTHON: python
+        run: ./ci/build.sh deploy-lint

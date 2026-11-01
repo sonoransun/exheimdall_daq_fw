@@ -10,6 +10,11 @@
       * calc_iq_sync must recover known amplitude/phase offsets (the
         returned iq_diffs equalize the channels) and report a healthy
         cross-correlation dynamic range for aligned channels.
+      * int_fs_ppm_offsets / frac_fs_ppm_offsets equal the inline FSM
+        expressions they replaced (down to the 's' message bytes).
+      * throughput levers (spec I.4): results are bit-identical for 1, 2, 4
+        FFT workers, and skip_copy_on_drop gives the same downstream results
+        on the aliased input as on the copied frame.
 
     numba and zmq are stubbed only when the real modules are unavailable
     (delay_sync imports both at module scope; neither is exercised here).
@@ -244,6 +249,191 @@ class TesterCalcIQSync(unittest.TestCase):
             err = (np.max(np.abs(corrected[m] - corrected[1])) /
                    np.max(np.abs(corrected[1])))
             self.assertLess(err, 0.02)
+
+
+
+# ======================================================================
+# Extracted tuning math and throughput levers (spec I.4, K.1) — WP-06
+# ======================================================================
+
+import inter_module_messages  # noqa: E402
+from iq_header import IQHeader  # noqa: E402
+from offload_engines import resolve_workers  # noqa: E402
+
+MIN_FS_PPM_OFFSET = 0.0000001
+MAX_FS_PPM_OFFSET = 0.01
+INT_FS_TUNE_GAIN = np.array([[100, 2, 0], [50, 25, 15]])
+FRAC_FS_TUNE_GAIN = 20
+FRAC_DELAY_TOLERANCE = 0.03
+
+
+def inline_int_offsets(delays, channel_list, M):
+    """Verbatim copy of the pre-extraction STATE_SAMPLE_CAL loop body."""
+    fs_ppm_offsets = [0] * M
+    for m in channel_list:
+        fs_tune_gain_m = (INT_FS_TUNE_GAIN[1, (INT_FS_TUNE_GAIN[0, :] <= abs(delays[m]))])[0]
+        fs_ppm_offsets[m] = -1 * delays[m] * fs_tune_gain_m * MIN_FS_PPM_OFFSET
+        if abs(fs_ppm_offsets[m]) > MAX_FS_PPM_OFFSET:
+            fs_ppm_offsets[m] = np.sign(fs_ppm_offsets[m]) * MAX_FS_PPM_OFFSET
+    return fs_ppm_offsets
+
+
+def inline_frac_offsets(taus, channel_list, M):
+    """Verbatim copy of the pre-extraction STATE_FRAC_SAMPLE_CAL loop."""
+    frac_delay_update_flag = False
+    fs_ppm_offsets = [0] * M
+    for i, m in enumerate(channel_list):
+        if abs(taus[i]) > FRAC_DELAY_TOLERANCE:
+            fs_ppm_offsets[m] = np.sign(taus[i]) * np.abs(taus[i] * FRAC_FS_TUNE_GAIN) * MIN_FS_PPM_OFFSET
+            frac_delay_update_flag = True
+    return fs_ppm_offsets, frac_delay_update_flag
+
+
+class TesterExtractedTuningMath(unittest.TestCase):
+    """int_fs_ppm_offsets / frac_fs_ppm_offsets equal the inline expressions
+    they replace, down to the bytes of the 's' message sent to rtl_daq."""
+
+    def test_int_offsets_equal_inline(self):
+        rng = np.random.default_rng(3)
+        for ref in (0, 2):
+            M = 5
+            channel_list = [m for m in range(M) if m != ref]
+            grid = [np.zeros(M, dtype=int)]
+            for d in (1, 2, 3, 10, 49, 50, 99, 100, 101, 5000, 10**6):
+                v = np.zeros(M, dtype=int)
+                for k, m in enumerate(channel_list):
+                    v[m] = (d, -d, 2 * d + 1, -3 * d)[k]
+                grid.append(v)
+            grid.extend(np.where(np.arange(M) == ref, 0, rng.integers(-300, 300, M))
+                        for _ in range(50))
+            for delays in grid:
+                got = delay_sync.int_fs_ppm_offsets(delays, INT_FS_TUNE_GAIN,
+                                                    MIN_FS_PPM_OFFSET, MAX_FS_PPM_OFFSET)
+                want = inline_int_offsets(delays, channel_list, M)
+                for m in channel_list:
+                    self.assertEqual(got[m], want[m], (ref, list(delays)))
+                self.assertEqual(
+                    inter_module_messages.pack_msg_sample_freq_tune(5, got),
+                    inter_module_messages.pack_msg_sample_freq_tune(5, want),
+                    (ref, list(delays)))
+
+    def test_frac_offsets_equal_inline(self):
+        rng = np.random.default_rng(4)
+        M = 5
+        channel_list = [1, 2, 3, 4]
+        cases = [[0.0] * 4, [0.03, -0.03, 0.031, -0.5], [0.2, -0.2, 0.01, 1.5]]
+        cases.extend(list(rng.uniform(-0.6, 0.6, 4)) for _ in range(50))
+        for taus in cases:
+            got = delay_sync.frac_fs_ppm_offsets(taus, channel_list, M, FRAC_DELAY_TOLERANCE,
+                                                 FRAC_FS_TUNE_GAIN, MIN_FS_PPM_OFFSET)
+            want, _flag = inline_frac_offsets(taus, channel_list, M)
+            self.assertEqual(list(got), list(want), taus)
+            self.assertEqual(inter_module_messages.pack_msg_sample_freq_tune(5, got),
+                             inter_module_messages.pack_msg_sample_freq_tune(5, want))
+
+    def test_tune_gain_table(self):
+        self.assertEqual(delay_sync.int_fs_tune_gain(0, INT_FS_TUNE_GAIN), 15)
+        self.assertEqual(delay_sync.int_fs_tune_gain(-2, INT_FS_TUNE_GAIN), 25)
+        self.assertEqual(delay_sync.int_fs_tune_gain(100, INT_FS_TUNE_GAIN), 50)
+
+
+class TesterResolveWorkers(unittest.TestCase):
+
+    def test_values(self):
+        self.assertEqual(resolve_workers(None), 4)
+        self.assertEqual(resolve_workers(""), 4)
+        self.assertEqual(resolve_workers("1"), 1)
+        self.assertEqual(resolve_workers(" 8 "), 8)
+        self.assertEqual(resolve_workers("auto", cores=[2, 3, 3]), 2)
+        self.assertGreaterEqual(resolve_workers("AUTO"), 1)
+        for bad in ("0", "-2", "x", "1.5"):
+            with self.assertRaises(ValueError):
+                resolve_workers(bad)
+
+
+def _ds_for_levers(M=4, N=2**13, workers=4):
+    ds = make_ds(M=M, std_ch_ind=0, N_proc=N)
+    ds.fft_engine = FFTEngine(engine_type="cpu_scipy", workers=workers)
+    ds.xcorr_engine = FFTEngine(engine_type="cpu_scipy", workers=workers)
+    ds.corr_functions = np.zeros((M, 2 * N))
+    ds.N = N
+    ds.M = M
+    return ds
+
+
+class TesterWorkerIdentity(unittest.TestCase):
+    """[offload] fft_workers / xcorr_workers only split independent
+    transforms: results are bit-identical for 1, 2 and 4 workers."""
+
+    def test_bit_identical_for_worker_counts(self):
+        iq_samples = frac_delayed_channels(2**13, 4, [0.0, 0.3, -0.2, 0.15], seed=11)
+        iq_samples[2] = np.roll(iq_samples[2], 3)
+        results = {}
+        for workers in (1, 2, 4):
+            ds = _ds_for_levers(workers=workers)
+            taus = ds.estimate_frac_delays(iq_samples, block_size=2**10)
+            ds._compute_corr_functions(iq_samples)
+            dyn, diffs = ds.calc_iq_sync(iq_samples)
+            results[workers] = (np.array(taus), ds.corr_functions.copy(), dyn, diffs)
+        for workers in (2, 4):
+            for a, b in zip(results[1], results[workers]):
+                self.assertTrue(np.array_equal(a, b), "workers={}".format(workers))
+
+
+class TesterSkipCopyOnDrop(unittest.TestCase):
+    """[offload] skip_copy_on_drop: on a dropped output buffer the FSM works
+    on the input frame itself; every downstream result is unchanged."""
+
+    def _ds(self, skip, en_iq_cal=False):
+        ds = _ds_for_levers()
+        ds.iq_header = IQHeader()
+        ds.iq_header.frame_type = IQHeader.FRAME_TYPE_CAL
+        ds.iq_header.active_ant_chs = ds.M
+        ds.iq_header.cpi_length = ds.N
+        ds._skip_copy_on_drop = skip
+        ds.en_iq_cal = en_iq_cal
+        ds.iq_corrections = np.ones(ds.M, dtype=np.complex64)
+        ds._drop_scratch = None
+        ds._en_frontend_telemetry = False
+        ds.db = None
+        return ds
+
+    def _downstream(self, ds):
+        iq = ds._iq_samples
+        ds._compute_corr_functions(iq)
+        taus = ds.estimate_frac_delays(iq[:, 0:ds.N_proc])
+        dyn, diffs = ds.calc_iq_sync(iq)
+        return np.array(taus), ds.corr_functions.copy(), dyn, diffs
+
+    def test_aliased_equals_copied(self):
+        iq_in = frac_delayed_channels(2**13, 4, [0.0, 0.25, -0.1, 0.4], seed=5)
+        snapshot = iq_in.copy()
+        copied = self._ds(skip=False)
+        copied._preprocess_frame(iq_in, 3)            # 3 = BUFFER_DROPPED
+        self.assertFalse(np.shares_memory(copied._iq_samples, iq_in))
+        aliased = self._ds(skip=True)
+        aliased._preprocess_frame(iq_in, 3)
+        self.assertTrue(np.shares_memory(aliased._iq_samples, iq_in))
+        for a, b in zip(self._downstream(copied), self._downstream(aliased)):
+            self.assertTrue(np.array_equal(a, b))
+        np.testing.assert_array_equal(iq_in, snapshot)   # input never modified
+
+    def test_not_applied_with_iq_cal(self):
+        iq_in = frac_delayed_channels(2**13, 4, [0.0, 0.0, 0.0, 0.0], seed=6)
+        ds = self._ds(skip=True, en_iq_cal=True)
+        ds._preprocess_frame(iq_in, 3)
+        self.assertFalse(np.shares_memory(ds._iq_samples, iq_in))
+
+    def test_not_applied_when_buffer_available(self):
+        iq_in = frac_delayed_channels(2**13, 4, [0.0, 0.0, 0.0, 0.0], seed=7)
+        ds = self._ds(skip=True)
+
+        class Out(object):
+            buffers = [np.zeros(1024 + iq_in.nbytes, dtype=np.uint8)] * 2
+        ds.out_shmem_iface_iq = Out()
+        ds._preprocess_frame(iq_in, 0)
+        self.assertFalse(np.shares_memory(ds._iq_samples, iq_in))
+        np.testing.assert_array_equal(ds._iq_samples, iq_in)
 
 
 if __name__ == "__main__":

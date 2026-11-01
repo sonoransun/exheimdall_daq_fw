@@ -46,6 +46,7 @@
 #include "iq_header.h"
 #include "sh_mem_util.h"
 #include "transport.h"
+#include "frame_sizes.h"
 
 static volatile sig_atomic_t sig_exit_flag = 0;
 
@@ -220,11 +221,8 @@ int main(int argc, char* argv[])
     
     /* Initializing output transport interface */
     transport_type_t transport_type = transport_type_from_string(config.rebuffer_transport);
-    size_t output_buf_size;
-    if (out_buffer_size >= cal_out_buffer_size)
-        output_buf_size = out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
-    else
-        output_buf_size = cal_out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
+    size_t output_buf_size = hd_decimator_in_object_bytes(
+        ch_num, config.cpi_size, config.decimation_ratio, cal_out_buffer_size);
 
     struct transport_handle* output_transport = transport_create(
         "decimator_in", output_buf_size, true,
@@ -402,6 +400,13 @@ int main(int argc, char* argv[])
                     log_trace("--> Transfering frame: type: %d, daq ind:[%d]",iq_header->frame_type, iq_header->daq_block_index);
 		    break;
                 case 3: // Frame drop
+                    /* Discard the undelivered CPI exactly as the delivery path
+                     * consumes it, so the next frame carries the next CPI
+                     * instead of re-sending this one from a ring that the
+                     * reader keeps overwriting. */
+                    wr_offset = (wr_offset + active_out_buffer_size*2) % (buffer_num * in_buffer_size*2);
+                    available -= active_out_buffer_size*2;
+                    log_trace("--> Dropped frame: type: %d, daq ind:[%d]",iq_header->frame_type, iq_header->daq_block_index);
                     break;
                 default:
                     log_error("Failed to acquire free buffer");

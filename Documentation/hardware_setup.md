@@ -1,0 +1,940 @@
+# Hardware Setup and Provisioning
+
+This guide takes a receiver from the box to a Linux host that `rtl_daq.out`
+can open. It covers serial numbers, second units, larger arrays, USB
+topology, antennas and cables, LNAs and bias tees, rotators, and the
+Raspberry Pi antenna-switch build. It ends with a bring-up checklist.
+
+Related documents:
+
+- [configuration.md](configuration.md) lists every INI key.
+- [tutorial_directional_df.md](tutorial_directional_df.md) is a worked
+  example with LNAs, a Yagi and a rotator.
+- [scaling_and_clustering.md](scaling_and_clustering.md) and
+  [deployment_recipes.md](deployment_recipes.md) cover several instances
+  and hosts.
+- [capacity_planning.md](capacity_planning.md) sizes CPU, memory and USB.
+- [operations_runbook.md](operations_runbook.md) maps symptoms to fixes.
+- [theory_coherent_acquisition.md](theory_coherent_acquisition.md)
+  explains the calibration that this hardware feeds.
+
+Some tools named here are still being implemented. Sections that describe
+them follow the design specification and carry a `verify-after` marker in
+the source of this page.
+
+## 1. Receivers and serial numbers
+
+rtl_daq finds each channel by the EEPROM serial number of its RTL-SDR
+tuner. It does not use USB port order.
+
+### The default rule: channel i is serial 1000 + i
+
+With no serial keys in the INI, channel `i` opens the tuner whose serial
+is the decimal string `1000 + i`. A factory KrakenSDR carries serials
+`1000` to `1004`. The shipped configs expect exactly that.
+
+| Receiver | Channels | Factory serials | Preset |
+|---|---|---|---|
+| KrakenSDR | 5 | `1000`..`1004` | `config_files/kraken_default/` |
+| KerberosSDR | 4 | none; program `1000`..`1003` yourself (section 2.3) | `config_files/kerberos_default/` |
+
+rtl_daq logs one line per channel in `_logs/rtl_daq.log`:
+
+```
+Device serial:1000, index: 0
+```
+
+This is an INFO line. It appears only with `[daq] log_level` 2 (INFO) or
+lower. WARN lines need `log_level` 3 or lower. Every shipped config sets
+`log_level = 5` (FATAL only), which hides all of them. Set
+`log_level = 2` for bring-up (section 11, step 6).
+
+When a serial is not found, rtl_daq exits with:
+
+```
+The serial numbers of the devices are not yet configured (expected serial 1003 for channel 3; see [hw] serial_base/device_serials and util/set_unit_serials.sh), exiting..
+```
+
+### The control channel: `[daq] ctr_channel_serial_no`
+
+The control channel is the tuner whose GPIOs drive the calibration noise
+source (GPIO 0) and the per-channel bias tees (GPIO m+1). On a KrakenSDR it
+is the tuner with the lowest factory serial. Set
+`[daq] ctr_channel_serial_no` to its serial.
+
+| Setting | Value |
+|---|---|
+| Factory KrakenSDR | `ctr_channel_serial_no = 1000` |
+| Unit k under the multi-unit convention (section 3) | `ctr_channel_serial_no = 1000 + 100*k` |
+
+If rtl_daq cannot find that serial, it logs this warning (visible at
+`log_level` 3 or lower) and falls back to device index 0:
+
+```
+Failed to identify control channel index based on its configured serial number:1100
+Set to default device index: 0
+```
+
+rtl_daq then uses the channel that opened librtlsdr device index 0 as the
+control channel. If none of its channels is device index 0 (for example,
+index 0 belongs to another unit), it uses channel 0. Either way the noise
+source and bias tees can be switched on the wrong tuner. Treat this
+warning as an error.
+
+When serial keys are set (section 3), `ini_checker.py` rejects a control
+serial that is not one of the resolved serials, in every mode:
+
+```
+ERROR:root:[daq] ctr_channel_serial_no 1000 is not one of the configured serials 1100, 1101, 1102, 1103, 1104 ([hw] serial_base/device_serials; rtl_daq compares the serial strings, so write them without leading zeros)
+```
+
+### Diagnostic: read the serials that are attached
+
+Use one of these with the chain stopped.
+
+1. Hardware-mode validation. It runs `lsusb` and `rtl_eeprom -d <i>`:
+
+   ```bash
+   cd Firmware
+   python3 ini_checker.py            # no "no_hw" token = hardware mode
+   echo $?                           # 0 = valid, 1 = errors
+   ```
+
+   It counts receivers as the `lsusb` lines that contain `Realtek`. Without
+   serial keys it reads device indices 0 to 4 only. With serial keys it
+   reads every attached receiver and reports, for example:
+
+   ```
+   Only 2 of the 5 configured serials are attached; missing: 1102, 1103, 1104 (see [hw] serial_base/device_serials)
+   ```
+
+   `rtl_eeprom` claims each device briefly. Do not run hardware mode while
+   the chain runs. With serial keys set, a claimed device is reported as
+   `WARNING: device index(es) N busy (claimed by another process; ...)`.
+   Without serial keys it is silently skipped, and a
+   `ctr_channel_serial_no` error can follow with no busy hint.
+
+2. sysfs listing. It opens no device, so it also works while the chain
+   runs:
+
+   ```bash
+   python3 _daq_core/hw_discover.py --sdr
+   ```
+
+   ```json
+   {
+     "rtlsdr": {
+       "count": 5,
+       "devices": [
+         {
+           "busnum": 1,
+           "devnum": 3,
+           "path": "/sys/bus/usb/devices/1-1.1",
+           "serial": "1000",
+           "product_id": "2838"
+         }
+       ],
+       "sysfs": true
+     }
+   }
+   ```
+
+   It lists USB devices with vendor `0bda` and product `2838` or `2832`.
+   `busnum` is the USB bus (section 5). On macOS or in a container without
+   sysfs it prints `"count": 0` and `"sysfs": false`.
+
+3. Attached-serial validation. It compares the configured serials with
+   sysfs and with the live instance registry:
+
+   ```bash
+   python3 ini_checker.py no_hw attached
+   ```
+
+   Section 3 shows its messages.
+
+   <!-- verify-after: WP-12 -->
+
+   The registry comparison sees only instances started with the opt-in
+   `[host] instance_registry = 1` (default `0`). An instance started
+   without it is not registered, so the check cannot report it.
+
+## 2. Programming serials
+
+Program serials with one unit plugged in at a time. Two units with the same
+serials cannot be told apart. Power-cycle the unit after every EEPROM
+write.
+
+### 2.1 By hand with `rtl_eeprom`
+
+`rtl_eeprom` ships with the krakenrf librtlsdr fork that `util/install.sh`
+builds.
+
+```bash
+rtl_eeprom -d 0                   # print the EEPROM of device index 0, incl. "Serial number:"
+rtl_eeprom -d 0 -s 1100           # write serial 1100 (answer the y/n prompt)
+```
+
+Repeat for each device index. Keep the factory order: the tuner that had
+the lowest serial keeps the lowest new serial. That tuner is the control
+channel.
+
+### 2.2 `util/set_unit_serials.sh` (KrakenSDR, multi-unit)
+
+<!-- verify-after: WP-14 -->
+
+This tool is new in this release and still in review. It renumbers one
+unit to the multi-unit convention `1000 + 100*K + i`. Run
+`util/set_unit_serials.sh --help` to confirm that your tree has it.
+
+```
+sudo util/set_unit_serials.sh --list
+sudo util/set_unit_serials.sh --unit K [--count M] [--base 1000] [--stride 100]
+                              [--by-index] [--dry-run] [--yes] [--force]
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--list` | | Print `idx  bus:dev  sysfs-serial  eeprom-serial  state` (`free` or `busy`) |
+| `--unit K` | | Unit number; new serials start at `base + K*stride` |
+| `--count M` | `5` | Number of RTL2832U devices that must be attached |
+| `--base` | `1000` | Base serial |
+| `--stride` | `100` | Serial distance between units |
+| `--by-index` | off | Number devices in librtlsdr index order instead of by old serial |
+| `--dry-run` | off | Print the plan and stop |
+| `--yes` | off | Write without stopping at the plan |
+| `--force` | off | Accept old serials that are not contiguous |
+
+By default the tool keeps the factory channel order. New serial =
+`base + K*stride + (old serial - lowest old serial)`. For `--unit 1`,
+`1000..1004` becomes `1100..1104`. Without `--yes`, or with `--dry-run`,
+it prints the plan and exits 0. With `--yes` it writes every device,
+re-reads it and verifies.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Done, or plan printed |
+| 2 | Usage error |
+| 3 | A DAQ chain or another program holds the receivers |
+| 4 | The number of RTL2832U devices in sysfs is not `--count` (plug in one unit at a time) |
+| 5 | `rtl_eeprom` is not on `PATH` |
+| 6 | Old serials are not contiguous (override with `--force`) |
+| 7 | Verification after the write failed |
+
+It ends with the INI lines to set:
+
+```
+Power-cycle the unit, then set in daq_chain_config.ini: [hw] serial_base = 1100
+[daq] ctr_channel_serial_no = 1100
+```
+
+If your tree does not have the tool, use `rtl_eeprom` by hand (section
+2.1) with the same numbering.
+
+### 2.3 KerberosSDR: `util/kerberos_eeprom_init.sh`
+
+This script is for KerberosSDR only. It writes serials `1000 + i` to the
+four tuners, one at a time, selected by the board's DIP switches.
+
+```bash
+cd util
+sudo ./kerberos_eeprom_init.sh
+```
+
+What it does:
+
+1. Counts the receivers as the `lsusb` lines that contain `Realtek`.
+2. Asks before it overwrites the EEPROMs.
+3. For each receiver i, asks you to turn off every DIP switch except
+   `#i+1`, then runs:
+
+   ```
+   rtl_eeprom -d 0 -g realtek_oem
+   rtl_eeprom -d 0 -s <1000+i> -m RTL-SDR -p KerberosSDR
+   ```
+
+4. Asks for a full power cycle.
+
+The check for "exactly one device online" only prints a message. It does
+not stop the script. Make sure only one DIP switch is on at each prompt.
+Otherwise `-d 0` writes to whichever tuner enumerates first.
+
+## 3. Two or more units on one host
+
+Run one instance per unit. Give each unit distinct serials and tell each
+instance which serials are its own.
+
+### 3.1 Serial keys (opt-in)
+
+Both keys are optional. Without them rtl_daq uses `1000 + i`, exactly as
+before.
+
+| Key | Default | Validation | Meaning |
+|---|---|---|---|
+| `[hw] serial_base` | absent (behaves as `1000`) | integer, 0..99999968 | Channel i opens serial `serial_base + i` |
+| `[hw] device_serials` | absent | comma list; exactly `num_ch` items; each 1-8 decimal digits; all distinct | Channel i opens item i. Wins over `serial_base` when non-empty |
+| `[hw] unit_id` | `0` | integer, or `auto` | `auto` stamps `[federation] instance_id` into the header `unit_id`, so consumers can tell the units apart |
+
+Convention: unit k carries serials `1000 + 100*k + i`. The instance that
+owns unit k sets `serial_base = 1000 + 100*k`.
+
+Example for unit 1, run as instance 1:
+
+```ini
+[hw]
+num_ch = 5
+serial_base = 1100
+unit_id = auto
+
+[daq]
+ctr_channel_serial_no = 1100
+
+[federation]
+instance_id = 1
+port_stride = 100
+```
+
+`device_serials` takes an explicit list instead:
+
+```ini
+[hw]
+device_serials = 1100,1101,1102,1103,1104
+```
+
+The INI reader keeps at most 199 bytes per line. rtl_daq refuses a longer
+`device_serials` line by name. Drop the spaces after the commas if you hit
+the limit.
+
+Each instance runs from its own working directory with its own
+`daq_chain_config.ini`, `_data_control/` and `_logs/`. Every stage reads
+the cwd-relative `daq_chain_config.ini`, so two instances cannot share one
+`Firmware/` directory. Create the instance directory as described in
+[scaling_and_clustering.md section 4.4](scaling_and_clustering.md#44-the-instance-directory-model):
+by hand today, or with `util/provision_instance.py` (in review). The INI
+above is the `daq_chain_config.ini` of that directory.
+
+The `[federation] instance_id` gives each instance its own FIFOs, shared
+memory, control files, logs and ports (`base + instance_id * port_stride`).
+See [scaling_and_clustering.md](scaling_and_clustering.md) for the instance
+model and [deployment_recipes.md](deployment_recipes.md) for a two-instance
+host.
+
+### 3.2 What the checks report
+
+With serial keys set, problems block start. Without them, rtl_daq keeps its
+old first-match behaviour and the checks only warn.
+
+| Condition | Where it is reported | Serial keys set | Serial keys absent |
+|---|---|---|---|
+| List length is not `num_ch`, duplicate list item, bad digits | `ini_checker.py` (every mode); rtl_daq `device map: <reason>` | error | n/a |
+| `ctr_channel_serial_no` not a resolved serial | `ini_checker.py` (every mode) | error | old hardware-mode check only |
+| Configured serial not attached | `ini_checker.py ... attached` | error | rtl_daq fatal at open |
+| Same serial on two devices (two factory units) | `ini_checker.py ... attached`; rtl_daq before opening | error; rtl_daq fatal | `WARNING:` line; rtl_daq `log_warn`, opens the first match |
+| Serial used by another live registered instance (only instances started with `[host] instance_registry = 1`) | `ini_checker.py ... attached` | error | `WARNING:` line |
+| No sysfs (macOS, containers) | `ini_checker.py ... attached` | one `WARNING:` line | silent |
+
+<!-- verify-after: WP-12 -->
+
+Only instances started with `[host] instance_registry = 1` are
+registered. The default is `0`, so by default the registry row never
+fires. See [scaling_and_clustering.md](scaling_and_clustering.md).
+
+Real output against a host with two factory units attached and
+`serial_base = 1000` set:
+
+```
+ERROR:root:serial 1000 (channel 0) is present on 2 devices (/sys/bus/usb/devices/1-1.1, /sys/bus/usb/devices/3-1.1); plug in one unit at a time and program distinct serials with util/set_unit_serials.sh --unit 1
+```
+
+With `serial_base = 1100` and unit 1 not plugged in:
+
+```
+ERROR:root:configured serial 1100 (channel 0) is not attached (sysfs); plug in the unit or fix [hw] serial_base/device_serials
+```
+
+With serial keys set and no sysfs:
+
+```
+WARNING: sysfs not available; attached-serial checks skipped
+```
+
+Warnings go to stderr with the prefix `WARNING: `. They never change the
+exit code. Errors print as `ERROR:root:<text>` and give exit 1.
+
+rtl_daq repeats the duplicate check itself before it opens any device:
+
+```
+serial 1000 is present on 2 devices; program distinct serials with util/set_unit_serials.sh
+```
+
+This line is fatal with serial keys. Without them it is a `log_warn`,
+visible only at `log_level` 3 or lower.
+
+<!-- verify-after: WP-12 -->
+
+`daq_start_sm.sh` runs `python3 ini_checker.py no_hw attached`, so these
+errors block a hardware start. `daq_synthetic_start.sh` runs `no_hw` only.
+
+### 3.3 CPU cores per unit
+
+Each hardware instance runs four real-time tiers on four cores. By default
+`daq_start_sm.sh` places instance N on cores `(N*4 + k) % nproc` for
+k = 0..3. It prints a `WARN:` line when instances must share cores. A
+4-core Raspberry Pi therefore runs one hardware instance. An 8-core host
+runs two.
+
+<!-- verify-after: WP-12 -->
+
+The optional `[host]` section sets the layout per instance:
+`cpu_cores = c0,c1,c2,c3` (rtl_daq, rebuffer+decimate,
+delay_sync+iq_server, hw_controller), `allow_core_sharing`
+(`warn`, `refuse` or `allow`, default `warn`) and `rt_priority_offset`
+(subtracted from every priority, default `0`). See
+[scaling_and_clustering.md](scaling_and_clustering.md).
+
+## 4. Arrays with more than five channels
+
+One instance accepts `num_ch` from 1 to 31. The `:1130` control message is
+128 bytes and holds 31 per-channel values. `ini_checker.py` rejects
+`num_ch = 32` in every mode:
+
+```
+ERROR:root:Number of channels must be at most 31: the 128-byte :1130 control message holds 31 per-channel values. Currently it is: '32'
+```
+
+Rules for a large array in one instance:
+
+- **Coherence needs shared hardware.** All tuners must share one reference
+  clock, and one noise source must reach every input. rtl_daq switches the
+  noise source only through GPIO 0 of the control channel. Two independent
+  KrakenSDR units have separate clocks and noise sources. Run them as two
+  instances instead (section 3).
+- **Serials continue.** Program the tuners `serial_base` to
+  `serial_base + num_ch - 1`, or list them in `device_serials`.
+- **Per-channel lists grow.** Every per-channel key needs `num_ch` values:
+  `en_bias_tee`, `[amplification]` lists, `[adpis] adpis_gains_init`.
+  `iq_adjust_amplitude` and `iq_adjust_time_delay_ns` need `num_ch - 1`
+  values (section 6).
+- **Bias tees stop at channel 6.** Channel m drives GPIO m+1 of the control
+  tuner. The RTL2832U has GPIOs 0 to 7, so only channels 0 to 6 have a
+  bias-tee line.
+- **USB budget.** Check the bus budget in section 5 for every bus the
+  array uses.
+
+## 5. USB topology and bandwidth
+
+Every tuner streams 8-bit I and Q, so one instance moves
+`num_ch * sample_rate * 2` bytes per second over USB.
+
+| Channels | `sample_rate` | USB ingress |
+|---|---|---|
+| 4 | 2.4 MS/s | 19.2 MB/s |
+| 5 | 2.4 MS/s | 24.0 MB/s |
+| 5 | 1.024 MS/s | 10.2 MB/s |
+| 10 | 2.4 MS/s | 48.0 MB/s |
+
+A KrakenSDR connects its five tuners through one USB 2.0 link, so they
+share one high-speed (480 Mbit/s) bus. Plan for one 5-channel unit at
+2.4 MS/s per high-speed bus.
+
+<!-- verify-after: WP-13 -->
+
+The design's capacity model uses a default budget of 35 MB/s per
+high-speed bus. At defaults one unit uses 69 % of it, and two units on one
+bus exceed it. The pre-flight tool (`daq_preflight.py`, also
+`heimdall-ctl capacity`) reports this per bus as `usb_bus:<n>` with a
+verdict of `ok`, `warn`, `fail` or `skip` (not probed). Measured per-host throughput rows are
+TBD until the CI `pipeline` job has produced a `throughput.json`. See
+[capacity_planning.md](capacity_planning.md).
+
+### Finding the bus of each unit
+
+```bash
+lsusb -t                                  # tree of buses, hubs and devices
+python3 _daq_core/hw_discover.py --sdr    # "busnum" per tuner (section 1)
+```
+
+Guidelines:
+
+- Put each unit on its own bus, which usually means its own host
+  controller. Ports that share a controller often share one USB 2.0 bus,
+  even when they are USB 3 ports.
+- Avoid unpowered hubs and long passive extensions. A brown-out shows up as
+  USB disconnects or ring-buffer overruns.
+- On a Raspberry Pi 4 every USB port goes through one controller. On a
+  Raspberry Pi 5 the RP1 chip has two independent USB buses, but its four
+  cores still limit the host to one hardware instance (section 3.3).
+
+### Power
+
+- Power the receiver from its own supply, not from the host's USB port.
+- Size the host supply too. A Raspberry Pi 4 needs its official 5.1 V,
+  3 A supply.
+- When overruns or USB disconnects appear on a Pi, check for
+  under-voltage:
+
+  ```bash
+  vcgencmd get_throttled     # throttled=0x0 means no under-voltage or throttling
+  ```
+
+  Any other value means the Pi saw under-voltage or throttling. Fix the
+  supply before you tune the USB keys below.
+
+### usbfs memory
+
+The kernel caps libusb buffer memory at 16 MB by default (usbfs). Each
+instance needs `num_ch * usb_async_transfers * 2 * daq_buffer_size` bytes
+in flight: 30 MiB at the defaults (5 x 12 x 512 KiB). With the default
+`[host] host_tuning = always`, `daq_start_sm.sh` removes the cap on every
+start:
+
+```bash
+echo 0 > /sys/module/usbcore/parameters/usbfs_memory_mb
+```
+
+It prints `WARN: /sys/module/usbcore/parameters/usbfs_memory_mb not
+present, skipping` when the file does not exist. You do not need to set
+this yourself.
+
+### USB depth keys and the overrun counter
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `[daq] usb_ring_buffers` | `8` | 2..64 | Slots in rtl_daq's per-channel ring. Memory: `num_ch * usb_ring_buffers * 2 * daq_buffer_size` (20 MiB at defaults), locked with `mlockall` |
+| `[daq] usb_async_transfers` | `12` | 2..64 | librtlsdr asynchronous transfers in flight per channel |
+
+rtl_daq exits with `Invalid [daq] usb_ring_buffers: <n> (allowed 2..64)`
+for a value out of range.
+
+An overrun means the reader threads lapped the main loop and overwrote
+unread data. Channel coherence of that frame is not guaranteed. rtl_daq
+logs the first five overruns and then every hundredth. This is a WARN
+line, visible only at `log_level` 3 or lower:
+
+```
+USB ring-buffer overrun (affected frame #1): reader lag reached 8 transfers. Channel coherence is not guaranteed. Consider increasing the number of buffers. - raise [daq] usb_ring_buffers (now 8)
+```
+
+Every frame header carries the cumulative count in reserved slot 102
+(`IQH_RSV_BUFFER_OVERRUN_CNT`; Python `IQHeader.get_buffer_overrun_cnt()`).
+The counter is stamped at every log level. To read it without a log, turn
+on the status server with the extended STATUS reply (opt-in):
+
+```ini
+[monitoring]
+en_status_server = 1
+status_extended = 1
+```
+
+Then `heimdall-ctl status --json` carries the count as
+`counters.buffer_overrun_cnt`.
+
+A count that keeps rising points to USB bandwidth, power or CPU
+contention. Raise `usb_ring_buffers` only after you have checked those.
+The opt-in `[calibration] invalidate_on_overrun = 1` clears the sync flags
+on frames after an overrun.
+
+### Optional: IRQ affinity
+
+With the default `[host] host_tuning = always`, `daq_start_sm.sh` runs
+`../util/irq_tuning.sh` when it is executable. On aarch64 and x86_64 it
+pins USB controller interrupts to core 0. That is rtl_daq's core for
+instance 0 only. `[host] usb_irq_core` picks another core. On other
+architectures the script exits 1 unless it gets `--any-arch`.
+
+## 6. Antennas and cables
+
+Calibration aligns the channels up to the point where the noise source is
+injected. Everything between that point and the antenna is outside the
+loop. Unequal cables leave a residual phase error that calibration cannot
+see.
+
+1. Use cables of equal length and type on every channel.
+2. If they differ, enter the difference with one of the two
+   `[calibration] iq_adjust_source` modes below. A wrong sign doubles the
+   error instead of removing it, so read the sign rules.
+
+### `explicit-time-delay` (default)
+
+| Key | Values | Meaning |
+|---|---|---|
+| `iq_adjust_source` | `explicit-time-delay` | Select this mode |
+| `iq_adjust_amplitude` | `num_ch - 1` values, dB | Amplitude correction per channel |
+| `iq_adjust_time_delay_ns` | `num_ch - 1` values, ns | Delay correction per channel |
+
+The lists cover every channel except the reference `std_ch_ind`, in
+channel order. delay_sync multiplies each channel's samples by
+`10^(amplitude/20) * exp(+j*2*pi*center_freq*delay)`. It recomputes the
+phase after every retune. The default zeros apply no correction.
+Hardware-mode `ini_checker.py` requires exactly `num_ch - 1` values.
+
+Sign rules:
+
+| Value | Enter | Example |
+|---|---|---|
+| `iq_adjust_time_delay_ns` | How many ns longer this channel's path is than the reference path. Positive = longer, negative = shorter | `0.12` |
+| `iq_adjust_amplitude` | How many dB more loss this channel's path has than the reference path. Positive = more loss | `0.5` |
+
+Delay in ns = length difference in m / (velocity factor * 0.2998). For
+example, 0.12 ns is about 2.4 cm of coax with velocity factor 0.66.
+
+```ini
+[calibration]
+std_ch_ind = 0
+iq_adjust_source = explicit-time-delay
+iq_adjust_amplitude = 0,0,0,0
+iq_adjust_time_delay_ns = 0, 0.12, 0, -0.08
+```
+
+With `std_ch_ind = 0` the four items belong to channels 1 to 4. Here
+channel 2's cable is 0.12 ns (about 2.4 cm at VF 0.66) longer than
+channel 0's, and channel 4's is 0.08 ns (about 1.6 cm) shorter.
+
+### `touchstone` (measured cables)
+
+Use this mode when you have measured each channel's path with a VNA over
+the band.
+
+| Item | Requirement |
+|---|---|
+| Files | `Firmware/_calibration/cable_ch0.s1p` .. `cable_ch<num_ch-1>.s1p`, one per channel including the reference |
+| Format | 1-port Touchstone; the code reads the S11 column |
+| Grid | Every file on the same frequency grid (the table is built from the first file) |
+| Dependency | `scikit-rf` (`pip install .[rf]`, or `util/install.sh`) |
+
+delay_sync picks the row nearest the center frequency and divides every
+channel's value by the reference channel's value. It multiplies each
+channel's samples by the result, `S11_m / S11_ref`. It picks the row
+again after every retune.
+
+The file therefore holds the correction, not the measurement. If you
+measured the path transmission `S21_m` of channel m, store `1/S21_m` in
+the S11 column. Storing `S21_m` itself doubles the error. The tree ships `cable_ch0.s1p` to `cable_ch4.s1p` with the header
+`# HZ S RI R 50`. They do not describe your cables; replace them with your
+own measurements.
+
+### Antenna profile (`[antenna]`, opt-in)
+
+`[antenna]` describes the antenna for the link budget and the rotator
+boresight. It does not change the IQ data. Enable it with
+`en_antenna_profile = 1`.
+
+| Key | Default | Used for |
+|---|---|---|
+| `element_gain_dbi` | `0` | Total system gain (signal only, not a noise stage) |
+| `cable_loss_db`, `connector_loss_db` | `0`, `0` | Feed loss: summed and placed ahead of the LNA in the noise budget |
+| `beamwidth_az_deg`, `beamwidth_el_deg`, `polarization` | `360`, `360`, `vertical` | Descriptive only; not used or reported by the chain today |
+| `boresight_az_offset_deg`, `boresight_el_offset_deg` | `0`, `0` | Added to every commanded bearing before the rotator moves |
+
+## 7. LNAs and bias tees
+
+**Safety first.** A bias tee puts DC on the antenna input.
+
+- Check the current draw of your LNAs against the bias-tee rating of your
+  receiver before you switch them on.
+- Do not enable a bias tee on an input that has a DC-shorted antenna
+  (loop, folded dipole, some Yagis), a passive splitter or test equipment
+  (signal generator, VNA) without a DC block.
+- rtl_daq applies `[hw] en_bias_tee` at every start. Check that it is all
+  zeros before a start with such equipment connected.
+
+### Which key powers the bias tees
+
+Two different keys exist. Only one of them drives the hardware at start.
+
+| Key | Who reads it | Effect |
+|---|---|---|
+| `[hw] en_bias_tee` | rtl_daq at start | Sets GPIO m+1 of the control tuner for each channel m. This is the hardware state after start |
+| `[amplification] bias_tee_state` | hw_controller | The state hw_controller reports (header slot 97 and the `bias_tee` field of `heimdall-ctl hwc-status --json`). It does not touch the hardware at start by default |
+| `[amplification] en_bias_tee_runtime` | hw_controller | `1` allows the runtime `BIAS` command |
+| `[amplification] apply_bias_tee_at_init` | hw_controller | Opt-in, default `0`. With `1` (and `en_amplification = 1`, `en_bias_tee_runtime = 1`) hw_controller sends `bias_tee_state` to rtl_daq at start when it differs from `[hw] en_bias_tee` |
+
+Runtime control, the reported `bias_tee_state` and
+`apply_bias_tee_at_init` all require `[amplification] en_amplification = 1`.
+Without it hw_controller ignores all three `[amplification]` keys and
+rejects `BIAS` with `disabled`. With `apply_bias_tee_at_init = 1` but
+`en_bias_tee_runtime = 0`, hw_controller logs
+`[amplification] apply_bias_tee_at_init = 1 requires en_bias_tee_runtime = 1; ignored`.
+
+A `bias_tee_change` event is emitted only when a runtime `BIAS` command is
+applied. The configured state at start emits no event.
+
+Keep `[hw] en_bias_tee` and `bias_tee_state` equal, or set
+`apply_bias_tee_at_init = 1`. Otherwise the reported state can differ from
+the hardware.
+
+### GPIO discipline
+
+- GPIO 0 of the control tuner switches the calibration noise source.
+- Channel m's bias tee is GPIO m+1 of the control tuner, so bias power
+  never collides with the noise source.
+- rtl_daq defers a runtime bias change while a noise burst is active and
+  logs `Bias-tee change deferred: noise-source calibration burst active`.
+
+Runtime control, with `en_amplification = 1` and `en_bias_tee_runtime = 1`:
+
+```bash
+heimdall-ctl bias-tee 1,1,1,1,1
+heimdall-ctl bias-tee --all off
+```
+
+hw_controller rejects `BIAS` with the reason `disabled` when
+`en_amplification = 0` or `en_bias_tee_runtime = 0`, and with
+`not_confirmed` when rtl_daq did not answer. See
+[protocols.md](protocols.md) for how a client receives the reason.
+
+### Link budget (`[amplification]`, opt-in)
+
+Enable with `en_amplification = 1`. The budget is advisory. It never
+changes a gain.
+
+| Key | Default | Where to get the value |
+|---|---|---|
+| `ext_lna_gains_db` | `0,...` | LNA datasheet gain at your frequency, minus any cable loss after the LNA |
+| `ext_lna_nf_db` | `0,...` | LNA datasheet noise figure |
+| `ext_lna_p1db_dbm` | `99,...` | LNA datasheet output-referred P1dB; `99` = not modelled |
+| `tuner_nf_db` | `3.5` | R820T reference value |
+| `expected_input_dbm` | `-60` | Your strongest expected signal at the antenna port |
+| `p1db_margin_db` | `3` | Headroom below which a channel is flagged |
+| `max_total_gain_db` | `80` | Gain ceiling that raises a warning |
+| `lna_freq_table` | empty | `"fMHz:gain_db:nf_db;..."`; the nearest entry is added to the static values |
+
+Formulas (`gain_budget.py`):
+
+| Quantity | Formula |
+|---|---|
+| Total system gain | `element_gain_dbi - feed_loss + ext_lna_gain + tuner_gain` |
+| System noise figure | Friis cascade: feed loss, then LNA, then tuner |
+| P1dB headroom | `ext_lna_p1db_dbm - (expected_input_dbm + ext_lna_gain - feed_loss)` |
+| Compression flag | headroom <= `p1db_margin_db` |
+
+The model always places the feed loss ahead of the LNA. If the LNA sits at
+the antenna, enter only the loss in front of it in `[antenna]`. Subtract
+the cable loss behind it from `ext_lna_gains_db`.
+
+Worked example: 12 dBi antenna, 3 dB feed loss, 20 dB LNA with 1 dB NF and
++10 dBm P1dB, tuner at 29.7 dB.
+
+| Result | Value |
+|---|---|
+| Total system gain | 58.7 dB |
+| System noise figure | 4.04 dB (6.5 dB without the LNA) |
+| P1dB headroom at -60 dBm input | 53 dB |
+
+Read the live budget with:
+
+```bash
+heimdall-ctl rf-budget
+```
+
+## 8. Rotators and pan-tilt heads (`[orientation]`, opt-in)
+
+Enable with `[orientation] en_orientation = 1` and pick a `backend`.
+hw_controller owns the rotator. It moves only when the frame header shows
+`sync_state >= min_sync_state` (default 5) and the noise source is off.
+
+| Backend | Hardware | Python dependency | Position feedback |
+|---|---|---|---|
+| `mock` | none, simulated | none | simulated |
+| `gs232` | Yaesu GS-232 compatible controller on a serial port | `pyserial` | closed loop |
+| `pwm_servo` | two hobby servos on Raspberry Pi GPIO | `pigpio` with the `pigpiod` daemon running | none (time estimate) |
+| `i2c_pantilt` | PCA9685 servo driver on I2C | `smbus2` | none (time estimate) |
+
+Install the backend's Python module into the interpreter the chain runs
+under. The start script runs hw_controller as
+`sudo env "PATH=$PATH" python3`, so that is the `python3` first on your
+`PATH` when you start the chain (for example the `kraken` conda env).
+`util/install.sh` does not install `pyserial`, `pigpio` or `smbus2`.
+
+If a real backend fails to initialise, hw_controller falls back to `mock`
+and logs `Rotator backend '<name>' unavailable; falling back to mock` in
+`_logs/hwc.log`. The chain still starts. Check that log after you wire a
+rotator.
+
+### `gs232`
+
+| Key | Default |
+|---|---|
+| `device` | `/dev/ttyUSB0` |
+| `baud` | `9600` |
+
+Commands sent: `Waaa eee\r` to slew, `C2\r` to read the position
+(`+0aaa+0eee`), `S\r` to stop. `home` slews to 0, 0.
+
+### `pwm_servo`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `az_pwm_channel`, `el_pwm_channel` | `0`, `1` | BCM GPIO numbers of the two servo signal pins |
+| `az_min_deg`..`az_max_deg`, `el_min_deg`..`el_max_deg` | `0`..`360`, `0`..`90` | Angle range mapped to 500-2500 us pulses |
+| `slew_rate_dps` | `6.0` | Used to estimate when a move ends |
+
+Set real pin numbers. BCM GPIO 0 and 1 are the HAT ID EEPROM pins on a
+Raspberry Pi. Power the servos from their own supply and join its ground
+to the Pi ground.
+
+### `i2c_pantilt`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `i2c_bus` | `1` | `/dev/i2c-<n>` |
+| `i2c_address` | `0x40` | PCA9685 address |
+| `az_pwm_channel`, `el_pwm_channel` | `0`, `1` | PCA9685 output channels (0..15) |
+
+The backend programs the PCA9685 for a 50 Hz frame and maps the angle range
+to 1.0-2.0 ms pulses. Enable I2C on the Pi first.
+
+### Commands
+
+```bash
+heimdall-ctl bearing 120 10     # slew to az 120, el 10
+heimdall-ctl park
+heimdall-ctl orientation        # OQRY reply: {"az":..,"el":..,"state":0-3}
+```
+
+The [directional DF tutorial](tutorial_directional_df.md) walks through a
+complete GS-232 setup with `config_files/directional_df/`.
+
+## 9. Raspberry Pi antenna-switch builds (`USEPIGPIO`)
+
+This build drives third-party KerberosSDR antenna switches from two
+Raspberry Pi GPIO pins. It is off by default.
+
+Install the pigpio C library and headers first (for example
+`sudo apt install pigpio`, or `libpigpio-dev` where the headers are
+packaged separately). The build includes `<pigpio.h>` and links
+`-lpigpio`. `util/install.sh` does not install pigpio.
+
+Enable it in `Firmware/_daq_core/Makefile`:
+
+```make
+PIGPIO=-lpigpio -DUSEPIGPIO
+```
+
+or pass it on the command line. Run `make clean` after you toggle it.
+
+```bash
+cd Firmware/_daq_core
+make clean && make PIGPIO='-lpigpio -DUSEPIGPIO'
+```
+
+Behaviour of a `USEPIGPIO` rtl_daq:
+
+- It initialises pigpio before it reads the main config.
+- It drives pins A and B: A = 1, B = 0 at start (antenna input 1).
+- While the noise source is on, it sets both pins to 0 (antennas
+  disconnected), then restores them.
+
+`[hw] antenna_switch_gpio` (optional; ignored by builds without
+`USEPIGPIO`):
+
+| Value | Effect |
+|---|---|
+| absent | Pins 23 and 24, as before |
+| `A,B` | Two distinct BCM GPIO numbers 0..27 |
+| `none` | pigpio is not initialised; rtl_daq logs `antenna switch GPIO: none (skipped)` (logged before `log_level` is read, so it appears at any level) |
+
+An invalid value is fatal: `Invalid [hw] antenna_switch_gpio '<value>': use
+'none' or two distinct GPIO numbers 0..27 as 'A,B'`.
+
+**Single-instance limit.** pigpio lets one process own the GPIO hardware.
+When another process holds it, `gpioInitialise()` fails and rtl_daq exits
+with `pigpio init failed`. This applies to:
+
+- a second `USEPIGPIO` instance on the same Pi: set
+  `antenna_switch_gpio = none` on every instance except the one that owns
+  the switches;
+- the `pigpiod` daemon that the `pwm_servo` rotator backend needs: use
+  `antenna_switch_gpio = none`, or another rotator backend.
+
+## 10. Raspberry Pi 4 host notes
+
+- Use a 64-bit OS. `make` then selects the KFR engine (`ENGINE=auto` on
+  aarch64), and `util/install.sh` builds KFR from source.
+- `util/install.sh` builds the krakenrf librtlsdr, installs its udev rule
+  (`rtl-sdr.rules` into `/etc/udev/rules.d/`), and blacklists the kernel
+  DVB driver `dvb_usb_rtl28xxu`. Reboot afterwards.
+- The Pi 4 has four cores: one hardware instance (section 3.3).
+- All Pi 4 USB ports share one controller (section 5).
+- Measured throughput per Pi model: TBD until `throughput.json` exists. See
+  [capacity_planning.md](capacity_planning.md).
+
+### udev rule
+
+The chain runs as root through `sudo`, so it does not need a udev rule. The
+rule lets a normal user run `rtl_eeprom`, `rtl_test` and the hardware-mode
+`ini_checker.py`.
+
+<!-- verify-after: WP-16 -->
+
+The design adds an optional rule file
+`packaging/udev/99-heimdall-rtlsdr.rules`, installed by
+`util/install.sh --udev`:
+
+```
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0664"
+```
+
+## 11. Bring-up checklist
+
+Run these from `Firmware/` unless stated otherwise.
+
+1. **Build and install.** `util/install.sh`, then reboot. Confirm that
+   `lsmod | grep dvb_usb_rtl28xxu` prints nothing. `util/install.sh` does
+   not install `heimdall-ctl`. Install it with `pip install .` from the
+   repository root, or run the in-tree launcher `util/bin/heimdall-ctl`.
+2. **Plug in one unit.** Confirm that `python3 _daq_core/hw_discover.py
+   --sdr` lists `num_ch` tuners with the serials you expect.
+3. **Program serials if needed** (section 2). Power-cycle the unit. Check
+   again.
+4. **Check the bus.** `lsusb -t`. One unit per high-speed bus (section 5).
+5. **Edit the config.** Copy a preset:
+
+   ```bash
+   cp ../config_files/kraken_default/daq_chain_config.ini daq_chain_config.ini
+   ```
+
+   For KerberosSDR use `../config_files/kerberos_default/` instead. That
+   preset ships 4 values each for `iq_adjust_amplitude` and
+   `iq_adjust_time_delay_ns`. Trim both to 3 values (`num_ch - 1`), or
+   hardware-mode `ini_checker.py` fails in step 8.
+
+   Set `num_ch`, `ctr_channel_serial_no`, and on multi-unit hosts
+   `serial_base` (or `device_serials`), `unit_id = auto` and
+   `[federation] instance_id`. For step 10, add a `[monitoring]` section
+   with `en_status_server = 1` (the presets have none or set it to `0`).
+   Keep `[hw] en_bias_tee` all zeros for now (section 7).
+6. **Turn on bring-up logging.** Set `[daq] log_level = 2` (INFO). The
+   shipped value 5 logs only fatal errors, which hides the serial,
+   control-channel and overrun lines checked below. Restore it afterwards
+   if you want quiet logs.
+7. **Validate offline.** `python3 ini_checker.py no_hw` must exit 0.
+8. **Validate against the hardware.**
+   `python3 ini_checker.py no_hw attached` must exit 0. With the chain
+   stopped, also run `python3 ini_checker.py` (hardware mode).
+9. **Start.** `sudo ./daq_start_sm.sh`. In `_logs/rtl_daq.log` (or
+   `_logs/inst<N>/rtl_daq.log`) check one `Device serial:` line per channel
+   and no `Failed to identify control channel` warning. Both need the
+   `log_level` of step 6.
+10. **Check calibration.** `heimdall-ctl status` (instance 0) or
+    `heimdall-ctl --instance N status` should show `Sync:` 5 or 6. It needs
+    the status server of step 5; without it the command cannot connect. If
+    the sync state stays lower, check that a consumer is attached
+    (`kraken_default`, `kerberos_default` and the shipped
+    `daq_chain_config.ini` use `out_data_iface_type = shmem`, which waits
+    for a consumer), then see [operations_runbook.md](operations_runbook.md).
+11. **Watch overruns.** The `USB ring-buffer overrun` warning should not
+    appear in steady state (section 5). It needs `log_level` 3 or lower.
+    At any log level, the count is in header slot 102 and, with
+    `status_extended = 1`, in `counters.buffer_overrun_cnt` of
+    `heimdall-ctl status --json`.
+12. **Add accessories one at a time.** LNAs and bias tees (section 7), then
+    the rotator (section 8). Before you enable a bias tee, check that the
+    input has no DC-shorted antenna, passive splitter or test equipment
+    without a DC block. After each accessory, check `_logs/hwc.log` for
+    errors and fallbacks.
+13. **Second unit.** Stop the chain. Plug in only the new unit and program
+    it as unit 1. Plug in both. Create the instance 1 directory
+    ([scaling_and_clustering.md section 4.4](scaling_and_clustering.md#44-the-instance-directory-model)).
+    Edit its `daq_chain_config.ini` with the step 5 values for unit 1. Run
+    steps 6 to 11 from that directory, using `heimdall-ctl --instance 1` in
+    step 10.

@@ -1,0 +1,1 @@
+<p class="legend">{%- for _s in site.data.pkg_states -%}{%- unless include.compact and _s.class == "risk" -%}<span class="legend-i"><span class="badge badge-{{ _s.class }}">{{ _s.badge }}</span> {{ _s.meaning }}</span>{%- endunless -%}{%- endfor -%}</p>

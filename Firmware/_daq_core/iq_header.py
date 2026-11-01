@@ -50,6 +50,21 @@ class IQHeader():
     RSV_BUFFER_OVERRUN_CNT = 102 # cumulative USB ring-buffer overrun events since start
                                  # (stamped by rtl_daq; 0 = none/unsupported)
 
+    # Scaling / clustering telemetry slots (still header_version 8). Each slot
+    # is zero unless its own opt-in key or flag is set. Byte offset of slot k
+    # inside the header = 252 + 4*k (lockstep with IQH_RSV_* in iq_header.h).
+    RSV_ROUTER_SEQ = 103         # IQ router per-source forwarded-frame counter (u32, wraps)
+    RSV_ROUTER_RX_TS_LO = 104    # router receive time, Unix ms, low 32 bits
+    RSV_ROUTER_RX_TS_HI = 105    # router receive time, Unix ms, high 32 bits
+    RSV_SOURCE_INSTANCE = 106    # source instance_id + 1 (0 = untagged)
+    RSV_SOURCE_KEY_CRC32 = 107   # crc32 of the source node key "host:N"
+    RSV_NODE_ID_CRC32 = 108      # crc32 of [federation] node_id (stamped by delay_sync)
+    RSV_DECIMATOR_DROP_CNT = 109 # cumulative decimator output frames dropped
+    RSV_CAL_QUALITY_MDB = 110    # calibration quality, milli-dB (SIGNED)
+    RSV_IQ_COMP_CNT = 111        # IQ (amplitude/phase) compensation count
+    RSV_SAMPLE_COMP_CNT = 112    # sample-delay compensation count
+    RSV_RECAL_GEN = 113          # recalibration generation
+
     def __init__(self):
 
         self.logger = logging.getLogger(__name__)
@@ -252,6 +267,104 @@ class IQHeader():
     def get_buffer_overrun_cnt(self):
         """Cumulative USB ring-buffer overrun count (unsigned; 0 = none/unsupported)."""
         return int(self.reserved[self.RSV_BUFFER_OVERRUN_CNT]) & 0xFFFFFFFF
+
+    # ---- scaling / clustering slots 103-113 ----
+    # Unsigned slots: setters mask to uint32 (counters wrap), getters return the
+    # unsigned value. Slot 110 is signed (two's complement on the wire).
+    def _set_u32(self, slot, value):
+        self.reserved[slot] = int(value) & 0xFFFFFFFF
+
+    def _get_u32(self, slot):
+        return int(self.reserved[slot]) & 0xFFFFFFFF
+
+    def set_router_seq(self, seq):
+        """IQ router per-source forwarded-frame counter (u32, wraps)."""
+        self._set_u32(self.RSV_ROUTER_SEQ, seq)
+
+    def get_router_seq(self):
+        return self._get_u32(self.RSV_ROUTER_SEQ)
+
+    def set_router_rx_ts_ms(self, ts_ms):
+        """Router receive time, Unix ms, stored as a u64 split over slots
+        104 (low 32 bits) and 105 (high 32 bits)."""
+        ts = int(ts_ms) & 0xFFFFFFFFFFFFFFFF
+        self.reserved[self.RSV_ROUTER_RX_TS_LO] = ts & 0xFFFFFFFF
+        self.reserved[self.RSV_ROUTER_RX_TS_HI] = ts >> 32
+
+    def get_router_rx_ts_ms(self):
+        """Router receive time, Unix ms (0 = not stamped)."""
+        return (self._get_u32(self.RSV_ROUTER_RX_TS_HI) << 32) | \
+            self._get_u32(self.RSV_ROUTER_RX_TS_LO)
+
+    def set_source_instance(self, value):
+        """Raw slot value: source instance_id + 1 (0 = untagged)."""
+        self._set_u32(self.RSV_SOURCE_INSTANCE, value)
+
+    def get_source_instance(self):
+        """Raw slot value: source instance_id + 1 (0 = untagged)."""
+        return self._get_u32(self.RSV_SOURCE_INSTANCE)
+
+    def set_source_key_crc32(self, crc):
+        """zlib.crc32 of the source node key "host:N"."""
+        self._set_u32(self.RSV_SOURCE_KEY_CRC32, crc)
+
+    def get_source_key_crc32(self):
+        return self._get_u32(self.RSV_SOURCE_KEY_CRC32)
+
+    def set_node_id_crc32(self, crc):
+        """zlib.crc32 of [federation] node_id."""
+        self._set_u32(self.RSV_NODE_ID_CRC32, crc)
+
+    def get_node_id_crc32(self):
+        return self._get_u32(self.RSV_NODE_ID_CRC32)
+
+    def set_decimator_drop_cnt(self, count):
+        """Cumulative decimator output frames dropped (stamped by decimate.out)."""
+        self._set_u32(self.RSV_DECIMATOR_DROP_CNT, count)
+
+    def get_decimator_drop_cnt(self):
+        return self._get_u32(self.RSV_DECIMATOR_DROP_CNT)
+
+    def set_cal_quality_mdb(self, mdb):
+        """Calibration quality in milli-dB (signed). Accepts an int or a float
+        (rounded to the nearest integer); values beyond the int32 range
+        saturate and NaN is stored as 0, so a non-finite quality never wraps
+        into a misleading value."""
+        mdb = float(mdb)
+        if mdb != mdb:  # NaN
+            value = 0
+        elif mdb >= 2147483647.0:
+            value = 2147483647
+        elif mdb <= -2147483648.0:
+            value = -2147483648
+        else:
+            value = int(round(mdb))
+        self.reserved[self.RSV_CAL_QUALITY_MDB] = value & 0xFFFFFFFF
+
+    def get_cal_quality_mdb(self):
+        """Calibration quality in milli-dB (signed, sign-extended)."""
+        return self._sx32(self.reserved[self.RSV_CAL_QUALITY_MDB])
+
+    def set_iq_comp_cnt(self, count):
+        """IQ (amplitude/phase) compensation count."""
+        self._set_u32(self.RSV_IQ_COMP_CNT, count)
+
+    def get_iq_comp_cnt(self):
+        return self._get_u32(self.RSV_IQ_COMP_CNT)
+
+    def set_sample_comp_cnt(self, count):
+        """Sample-delay compensation count."""
+        self._set_u32(self.RSV_SAMPLE_COMP_CNT, count)
+
+    def get_sample_comp_cnt(self):
+        return self._get_u32(self.RSV_SAMPLE_COMP_CNT)
+
+    def set_recal_gen(self, generation):
+        """Recalibration generation."""
+        self._set_u32(self.RSV_RECAL_GEN, generation)
+
+    def get_recal_gen(self):
+        return self._get_u32(self.RSV_RECAL_GEN)
 
     def check_sync_word(self):
         """

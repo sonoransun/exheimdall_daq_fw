@@ -54,6 +54,16 @@ EVT_ORIENTATION_SCAN_START = "orientation_scan_start"
 EVT_ORIENTATION_SCAN_PEAK = "orientation_scan_peak"
 EVT_ORIENTATION_PARK = "orientation_park"
 EVT_ORIENTATION_LIMIT = "orientation_limit"
+# Cluster / calibration-robustness events (design spec G.7b). Emitters in
+# other modules use getattr(daq_events, "EVT_...", "<literal>") so they keep
+# working against an older daq_events.
+EVT_PEER_RECOVERED = "peer_recovered"
+EVT_PEER_FLAPPING = "peer_flapping"
+EVT_RECAL_REQUESTED = "recal_requested"
+EVT_CAL_STALLED = "cal_stalled"
+EVT_COORDINATOR_COMMAND = "coordinator_command"
+EVT_NODE_KEY_COLLISION = "node_key_collision"
+EVT_SCHEDULE_RECONCILE_FAILED = "schedule_reconcile_failed"
 
 # Severity string → logging level
 _SEVERITY_MAP = {
@@ -66,15 +76,26 @@ _SEVERITY_MAP = {
 
 @dataclass
 class DAQEvent:
-    """A single structured event emitted by the DAQ pipeline."""
+    """A single structured event emitted by the DAQ pipeline.
+
+    ``source`` is the emitter identity (``{"instance_id", "node_id", "host",
+    "cluster_id"}``) set by an EventBus built with ``source=`` ([monitoring]
+    event_tag_identity = 1). It is omitted from ``to_dict()``/``to_json()``
+    when None, so untagged events serialise exactly as before the field
+    existed.
+    """
     timestamp: float = 0.0
     severity: str = "info"
     module: str = ""
     event_type: str = ""
     payload: dict = field(default_factory=dict)
+    source: dict = None
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        if d["source"] is None:
+            del d["source"]
+        return d
 
     def to_json(self):
         return json.dumps(self.to_dict())
@@ -140,9 +161,15 @@ class SysLogEventHandler:
 
 
 class ZMQPubHandler:
-    """Publishes events on a ZMQ PUB socket for external subscribers."""
+    """Publishes events on a ZMQ PUB socket for external subscribers.
 
-    def __init__(self, port=5003, listen_address="*"):
+    The multipart topic is ``topic_prefix + event_type``; the prefix is empty
+    by default ([monitoring] event_topic_prefix = 1 makes delay_sync pass
+    ``"inst<N>."``).
+    """
+
+    def __init__(self, port=5003, listen_address="*", topic_prefix=""):
+        self._topic_prefix = topic_prefix or ""
         self._socket = None
         try:
             import zmq
@@ -158,7 +185,7 @@ class ZMQPubHandler:
         if self._socket is None:
             return
         try:
-            topic = event.event_type.encode()
+            topic = (self._topic_prefix + event.event_type).encode()
             data = event.to_json().encode()
             self._socket.send_multipart([topic, data], flags=1)  # NOBLOCK
         except Exception:
@@ -181,10 +208,14 @@ class EventBus:
     """Non-blocking event dispatcher with background delivery thread.
 
     When ``enabled=False`` all methods are zero-cost no-ops.
+
+    ``source`` (a dict, default None) is attached to every emitted event
+    that does not already carry one ([monitoring] event_tag_identity = 1).
     """
 
-    def __init__(self, enabled=False, ring_size=500, queue_size=2000):
+    def __init__(self, enabled=False, ring_size=500, queue_size=2000, source=None):
         self._enabled = enabled
+        self._source = dict(source) if source is not None else None
         self._handlers = []
         self._ring = []
         self._ring_size = ring_size
@@ -210,6 +241,8 @@ class EventBus:
             return
         if event.timestamp == 0.0:
             event.timestamp = time.time()
+        if self._source is not None and event.source is None:
+            event.source = self._source
         try:
             self._queue.put_nowait(event)
         except queue.Full:
@@ -224,6 +257,8 @@ class EventBus:
                     payload={"dropped_total": self.dropped_events},
                 )
                 drop_event.timestamp = time.time()
+                if self._source is not None:
+                    drop_event.source = self._source
                 self._store_ring(drop_event)
                 for handler in self._handlers:
                     try:

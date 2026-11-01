@@ -1,0 +1,61 @@
+<svg class="fig fig-wide has-tall fig-w950" viewBox="0 0 950 420" role="img" aria-labelledby="ar-t ar-d">
+<title id="ar-t">Processes, shared-memory rings and control channels of one instance</title>
+<desc id="ar-d">Data plane, left to right: rtl_daq writes a stdout pipe read by rebuffer; rebuffer fills the decimator_in ring; decimate converts to complex float (filtering only when decimating) and fills decimator_out; delay_sync fills delay_sync_iq, which iq_server streams on TCP port 5000. Control plane: hw_controller drives rtl_daq over ZMQ port 1130, reads frame headers from delay_sync through the delay_sync_hwc ring, and accepts 128-byte commands on TCP port 5001. delay_sync serves JSON status on port 5002 and publishes events on port 5003.</desc>
+<defs>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow"/></marker>
+<marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="fig-arrow-ctl"/></marker>
+</defs>
+<rect x="220" y="40" width="400" height="60" rx="10" class="fig-box fig-ctlbox"/>
+<text x="420" y="65" class="fig-t" text-anchor="middle">hw_controller.py</text>
+<text x="420" y="84" class="fig-s" text-anchor="middle">calibration FSM · gain lock · scheduler · RF front end · orientation</text>
+<path d="M420 6 V36" class="fig-ctl" marker-end="url(#arc)"/>
+<text x="430" y="22" class="fig-s">TCP :5001 · 128-byte frames, FNSD replies</text>
+<path d="M220 70 H74 V192" class="fig-ctl" marker-end="url(#arc)"/>
+<text x="84" y="62" class="fig-s">ZMQ REQ/REP :1130</text>
+<path d="M674 196 V70 H624" class="fig-ctl" marker-end="url(#arc)"/>
+<text x="684" y="128" class="fig-s">delay_sync_hwc</text>
+<text x="684" y="142" class="fig-s">(header only)</text>
+<rect x="20" y="196" width="108" height="60" rx="10" class="fig-box fig-hot"/>
+<text x="74" y="222" class="fig-t" text-anchor="middle">rtl_daq</text>
+<text x="74" y="240" class="fig-s" text-anchor="middle">C · USB readers</text>
+<rect x="220" y="196" width="108" height="60" rx="10" class="fig-box"/>
+<text x="274" y="222" class="fig-t" text-anchor="middle">rebuffer</text>
+<text x="274" y="240" class="fig-s" text-anchor="middle">C · CPI frames</text>
+<rect x="420" y="196" width="108" height="60" rx="10" class="fig-box"/>
+<text x="474" y="218" class="fig-t" text-anchor="middle">decimate</text>
+<text x="474" y="234" class="fig-s" text-anchor="middle">C · u8 → cf32</text>
+<text x="474" y="248" class="fig-s" text-anchor="middle">FIR if decimating</text>
+<rect x="620" y="196" width="108" height="60" rx="10" class="fig-box fig-hot"/>
+<text x="674" y="222" class="fig-t" text-anchor="middle">delay_sync</text>
+<text x="674" y="240" class="fig-s" text-anchor="middle">Python · sync FSM</text>
+<rect x="820" y="196" width="108" height="60" rx="10" class="fig-box"/>
+<text x="874" y="222" class="fig-t" text-anchor="middle">iq_server</text>
+<text x="874" y="240" class="fig-s" text-anchor="middle">C · TCP out</text>
+<path d="M130 226 H216" class="fig-flow" marker-end="url(#ara)"/>
+<text x="174" y="216" class="fig-s" text-anchor="middle">stdout pipe</text>
+<text x="174" y="246" class="fig-s" text-anchor="middle">back-pressure</text>
+<path d="M330 226 H416" class="fig-flow" marker-end="url(#ara)"/>
+<text x="374" y="216" class="fig-s" text-anchor="middle">decimator_in</text>
+<text x="374" y="246" class="fig-s" text-anchor="middle">back-pressure</text>
+<path d="M530 226 H616" class="fig-flow" marker-end="url(#ara)"/>
+<text x="574" y="216" class="fig-s" text-anchor="middle">decimator_out</text>
+<text x="574" y="246" class="fig-s" text-anchor="middle">drop mode</text>
+<path d="M730 226 H816" class="fig-flow" marker-end="url(#ara)"/>
+<text x="774" y="216" class="fig-s" text-anchor="middle">delay_sync_iq</text>
+<text x="774" y="246" class="fig-s" text-anchor="middle">drop mode</text>
+<path d="M674 258 V288 H619 V316" class="fig-ctl" marker-end="url(#arc)"/>
+<path d="M674 288 H729 V316" class="fig-ctl" marker-end="url(#arc)"/>
+<rect x="569" y="320" width="100" height="52" rx="9" class="fig-box fig-soft"/>
+<text x="619" y="342" class="fig-t" text-anchor="middle">:5002</text>
+<text x="619" y="359" class="fig-s" text-anchor="middle">JSON status</text>
+<rect x="679" y="320" width="100" height="52" rx="9" class="fig-box fig-soft"/>
+<text x="729" y="342" class="fig-t" text-anchor="middle">:5003</text>
+<text x="729" y="359" class="fig-s" text-anchor="middle">ZMQ PUB events</text>
+<path d="M874 258 V316" class="fig-flow" marker-end="url(#ara)"/>
+<text x="882" y="292" class="fig-m">:5000</text>
+<rect x="802" y="320" width="144" height="52" rx="9" class="fig-box fig-soft"/>
+<text x="874" y="342" class="fig-t" text-anchor="middle">consumers</text>
+<text x="874" y="359" class="fig-s" text-anchor="middle">DoA · radar · GNU Radio</text>
+<path d="M20 396 H56" class="fig-flow"/><text x="64" y="400" class="fig-s">data: pipe and shared-memory rings</text>
+<path d="M270 396 H306" class="fig-ctl"/><text x="314" y="400" class="fig-s">control and telemetry</text>
+</svg>

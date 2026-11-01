@@ -20,6 +20,8 @@ firmware_path       = os.path.join(os.path.dirname(current_path),"Firmware")
 sys.path.insert(0, firmware_path)
 
 import ini_checker
+# ini_checker configures the root logger at ERROR; this tool reports at INFO
+logging.getLogger().setLevel(logging.INFO)
 
 """
 
@@ -27,14 +29,15 @@ Prepare config file template
 
 """
 #[meta]
-meta={"ini_version":"2",
+meta={"ini_version":"8",
       "config_name":"autogenV1"
     }
 #[hw]
 hw={"name"    :"k5",
     "unit_id" :"0",
     "ioo_type":"0",
-    "num_ch"  :"5"
+    "num_ch"  :"5",
+    "en_bias_tee":"0,0,0,0,0"
 }
 #[daq]
 daq = {
@@ -44,12 +47,7 @@ daq = {
     "sample_rate"           :"1000000",
     "gain"                  :"0",
     "en_noise_source_ctr"   :"1",
-    "ctr_channel_serial_no" :"1004"
-}
-#[squelch]
-squelch = {
-    "en_squelch"         :"1",
-    "amplitude_threshold":"0.5"
+    "ctr_channel_serial_no" :"1000"
 }
 #[pre_processing]
 pre_processing = {
@@ -65,9 +63,9 @@ pre_processing = {
 calibration = {
     "corr_size"                       :"65536",
     "std_ch_ind"                      :"0",
-    "en_frac_cal"                     :"0",
     "en_iq_cal"                       :"1",
     "amplitude_cal_mode"              :"channel_power",
+    "en_gain_tune_init"               :"0",
     "gain_lock_interval"              :"20",
     "unified_gain_control"            :"0",
     "require_track_lock_intervention" :"0",
@@ -77,11 +75,13 @@ calibration = {
     "amplitude_tolerance"             :"1",
     "phase_tolerance"                 :"2",
     "maximum_sync_fails"              :"5",
+    "iq_adjust_source"                :"explicit-time-delay",
+    "iq_adjust_amplitude"             :"0,0,0,0",
+    "iq_adjust_time_delay_ns"         :"0,0,0,0",
 }
 #[adpis]
 adpis = {
     "en_adpis"         :"0",
-    "en_gain_tune_init":"0",
     "adpis_proc_size"  :"8192",
     "adpis_gains_init" :"0,0,0,0,0",
 }
@@ -261,7 +261,6 @@ orientation = {
 daq_chain_ini_cfg = {"meta"           : meta,
                      "hw"             : hw,
                      "daq"            : daq,
-                     "squelch"        : squelch,
                      "pre_processing" : pre_processing,
                      "calibration"    : calibration,
                      "adpis"          : adpis,
@@ -342,6 +341,7 @@ if len(error_list):
     for e in error_list:
         logging.error(e)
     logging.critical("Config file generation failed")
+    sys.exit(1)
 
 else:
     parser = ConfigParser()
