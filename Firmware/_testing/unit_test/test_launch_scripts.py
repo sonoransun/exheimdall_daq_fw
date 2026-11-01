@@ -49,7 +49,7 @@ OWN_SCRIPTS = ["daq_start_sm.sh", "daq_synthetic_start.sh", "daq_stop.sh", "daq_
 REAL_TOOLS = ["sh", "bash", "dash", "cat", "ls", "rm", "mkdir", "mkfifo", "ps", "kill", "head",
               "tail", "awk", "sed", "tr", "cut", "grep", "date", "id", "readlink", "dirname",
               "basename", "env", "find", "xargs", "mv", "chmod", "touch", "wc", "sort", "ln",
-              "cp", "rmdir", "nohup", "true", "false", "expr", "stat", "uniq", "tee"]
+              "cp", "rmdir", "nohup", "true", "false", "expr", "stat", "uniq", "tee", "mktemp"]
 SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 TODAY_TERM = ["-TERM rtl_daq.out", "-TERM decimate.out", "-TERM rebuffer.out", "-TERM iq_server.out",
@@ -130,7 +130,7 @@ exit 0
 SYSCTL_STUB = "#!/bin/sh\nprintf 'sysctl %s\\n' \"$*\" >> \"$FAKE_DIR/calls.log\"\n"
 
 SS_STUB = r"""#!/usr/bin/env python3
-# ss -ltn[p]H "sport = :P": one LISTEN line when P is in $FAKE_DIR/busy_ports
+# ss -ltn[p][H] "sport = :P": one LISTEN line when P is in $FAKE_DIR/busy_ports
 import os, sys
 fake = os.environ["FAKE_DIR"]
 with open(os.path.join(fake, "ss.log"), "a") as f:
@@ -141,6 +141,10 @@ except OSError:
     busy = []
 port = sys.argv[-1].rsplit(":", 1)[-1] if "sport" in sys.argv[-1] else None
 flags = "".join(a for a in sys.argv[1:-1] if a.startswith("-"))
+# FAKE_SS_OLD=1: an iproute2 < 4.13 without -H; FAKE_SS_FAIL=1: ss always fails
+if os.environ.get("FAKE_SS_FAIL") == "1" or (os.environ.get("FAKE_SS_OLD") == "1" and "H" in flags):
+    sys.stderr.write("ss: invalid option\n")
+    sys.exit(255)
 if port in busy:
     line = "LISTEN 0      128          0.0.0.0:%s        0.0.0.0:*" % port
     if "p" in flags:
@@ -269,6 +273,20 @@ d="_logs/inst${FAKE_N:-0}/pids"
 mkdir -p "$d"
 rm -f "$d"/*.pid
 for r in ${FAKE_ROLES:-rtl_daq rebuffer decimate delay_sync hw_controller iq_server}; do
+    if [ "$r" = "${FAKE_ZOMBIE_ROLE:-}" ]; then
+        # Held by a parent that never reaps it (a container PID 1 that never
+        # waits): once killed it stays a zombie.
+        python3 -c 'import os, subprocess, sys, time
+p = subprocess.Popen(["%s.fake" % sys.argv[2], "300"], executable=sys.argv[1])
+with open(sys.argv[3], "w") as f:
+    f.write("%d\n" % p.pid)
+with open(sys.argv[4], "w") as f:
+    f.write("%d\n" % os.getpid())
+time.sleep(300)' "$FAKE_REAL_SLEEP" "$r" "$d/$r.pid.tmp" "$FAKE_DIR/zombie_holder.pid" < /dev/null > /dev/null 2>&1 &
+        while [ ! -s "$d/$r.pid.tmp" ]; do "$FAKE_REAL_SLEEP" 0.05; done
+        mv "$d/$r.pid.tmp" "$d/$r.pid"
+        continue
+    fi
     ( exec -a "$r.fake" "$FAKE_REAL_SLEEP" 300 ) < /dev/null > /dev/null 2>&1 &
     echo $! > "$d/$r.pid"
 done
@@ -652,8 +670,8 @@ class TestStartDefault(_Sandbox):
         # probed the three blocking ports with the listener-only ss
         ss = self.log("ss.log")
         for port in (5000, 5001, 5002):
-            self.assertIn("-ltnH sport = :%d" % port, ss)
-        self.assertNotIn("-ltnH sport = :5003", ss)
+            self.assertIn("-ltn sport = :%d" % port, ss)
+        self.assertNotIn("-ltn sport = :5003", ss)
 
     def test_instance_1_today_core_warning_and_prefixed_files(self):
         self.write_ini(iid=1)
@@ -664,7 +682,7 @@ class TestStartDefault(_Sandbox):
         self.assertTrue(stat.S_ISFIFO(os.stat(os.path.join(self.fw, "_data_control", "inst1_fw_decimator_in")).st_mode))
         self.assertEqual(_read(os.path.join(self.fw, "_data_control", "inst1_iq_track_lock")), "0")
         self.assertTrue(os.path.isdir(os.path.join(self.fw, "_logs", "inst1")))
-        self.assertIn("-ltnH sport = :5102", self.log("ss.log"))
+        self.assertIn("-ltn sport = :5102", self.log("ss.log"))
 
     def test_existing_track_lock_is_kept(self):
         _write(os.path.join(self.fw, "_data_control", "iq_track_lock"), "1", 0o644)
@@ -868,7 +886,24 @@ class TestRunDirAndLock(_Sandbox):
             if not existed:
                 shutil.rmtree(fallback, ignore_errors=True)
 
-    def test_lock_open_failure_warns_and_continues(self):
+    def test_registry_dirs_skip_untrusted_hints(self):
+        # A run_dir hint (like the /tmp fallback) is read only when it is a
+        # real directory owned by this uid: a symlink is skipped
+        os.makedirs(self.run_dir)
+        real = os.path.join(self.tmp, "hint_real")
+        os.makedirs(real)
+        link = os.path.join(self.tmp, "hint_link")
+        os.symlink(real, link)
+        for n, d in ((7, real), (8, link)):
+            _write(os.path.join(self.fw, "_logs", "inst%d" % n, "pids", "run_dir"), d + "\n", 0o644)
+        rc, out = self.lib('hd_registry_dirs; hd_registry_dir_trusted "$HEIMDALL_RUN_DIR" && echo PRIMARY_OK')
+        self.assertEqual(rc, 0, out)
+        lines = out.split()
+        self.assertIn(self.run_dir, lines)
+        self.assertIn(real, lines)
+        self.assertNotIn(link, lines)
+        self.assertIn("PRIMARY_OK", lines)
+
         os.makedirs(os.path.join(self.run_dir, "inst0.lock"))
         rc, out = self.lib('HD_RUN="$HEIMDALL_RUN_DIR"; HD_INSTANCE_GUARD=refuse; hd_instance_lock 0; '
                            'echo "LOCKED=$HD_LOCKED LOCKVAR=${HEIMDALL_INSTANCE_LOCK:-none}"; echo still-here')
@@ -1075,7 +1110,7 @@ class TestPortCheck(_Sandbox):
         self.assertIn("passed", out)
         ss = self.log("ss.log")
         for p in (5000, 5001, 5002, 1130):
-            self.assertIn("-ltnH sport = :%d" % p, ss)
+            self.assertIn("-ltn sport = :%d" % p, ss)
         lsof = self.log("lsof.log")
         self.assertIn("-nP -iTCP:5000 -sTCP:LISTEN", lsof)
         self.assertEqual(self.log("daq_stop.log"), "")
@@ -1086,6 +1121,30 @@ class TestPortCheck(_Sandbox):
         rc, out = self._check(FAKE_FAST_SLEEP=1, FAKE_STOP_FREES=1)
         self.assertEqual(rc, 0, out)
         self.assertIn("WARN:Ports used by the DAQ chain instance 0 are not free! (5000, 5001 & 5002)", out)
+
+    def test_ss_without_no_header_option(self):
+        # iproute2 < 4.13 has no -H: busy ports are still found by ss alone
+        os.remove(os.path.join(self.bin, "lsof"))
+        self.busy(5001)
+        rc, out = self._check(FAKE_FAST_SLEEP=1, FAKE_STOP_FREES=1, FAKE_SS_OLD=1)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN:Ports used by the DAQ chain instance 0 are not free! (5000, 5001 & 5002)", out)
+        self.assertEqual(self.log("daq_stop.log").count("\n"), 1, out)
+        self.assertNotIn("H", "".join(l.split(" sport")[0] for l in self.log("ss.log").splitlines()))
+
+    def test_failing_ss_falls_back_to_lsof(self):
+        self.busy(5001)
+        rc, out = self._check(FAKE_FAST_SLEEP=1, FAKE_STOP_FREES=1, FAKE_SS_FAIL=1)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN:Ports used by the DAQ chain instance 0 are not free! (5000, 5001 & 5002)", out)
+
+    def test_failing_ss_without_lsof_skips_check(self):
+        os.remove(os.path.join(self.bin, "lsof"))
+        self.busy(5001)
+        rc, out = self._check(FAKE_SS_FAIL=1)
+        self.assertIn("WARN: Neither lsof nor ss available - skipping port availability check", out)
+        self.assertIn("passed", out)
+        self.assertEqual(self.log("daq_stop.log"), "")
 
     def test_no_tool_skips_check(self):
         os.remove(os.path.join(self.bin, "ss"))
@@ -1232,6 +1291,22 @@ class TestAbortLaunch(_Sandbox):
         rc, _ = self.lib("hd_arm_abort 4; hd_disarm_abort; exit 1", shell="bash")
         self.assertEqual(rc, 1)
         self.assertEqual(self.log("daq_stop.log"), "")
+
+
+class TestPidRoleAlive(_Sandbox):
+
+    def test_running_zombie_and_role_mismatch(self):
+        child = subprocess.Popen(["decimate.fake", "300"], executable=shutil.which("sleep", path=SYSTEM_PATH))
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        rc, _ = self.lib("hd_pid_role_alive %d decimate" % child.pid)
+        self.assertEqual(rc, 0)
+        rc, _ = self.lib("hd_pid_role_alive %d rebuffer" % child.pid)
+        self.assertEqual(rc, 1)
+        os.kill(child.pid, signal.SIGKILL)
+        # Not reaped: a zombie until child.wait()
+        self.assertTrue(_wait_for(lambda: self.lib("hd_pid_role_alive %d decimate" % child.pid)[0] == 1,
+                                  timeout=10))
 
 
 class TestReadConfig(_Sandbox):
@@ -1605,6 +1680,110 @@ class TestSupervisor(_Sandbox):
         self._kill_pair("synthesizer", "rebuffer")
         self.assertEqual(p.wait(timeout=30), 10, _read(p.out_path))
 
+    def _kill_stages(self, roles):
+        for r in roles:
+            try:
+                os.kill(self.pid_of(r), signal.SIGKILL)
+            except OSError:
+                pass
+
+    def test_downstream_death_reported_before_upstream(self):
+        # Deaths cascade upstream too (rebuffer loses its consumer, the
+        # synthesizer gets a broken pipe): the stage seen dead first is the
+        # one reported, even when its upstream follows within the interval.
+        all_roles = ("rtl_daq", "rebuffer", "decimate", "delay_sync", "hw_controller", "iq_server")
+        for down, up, code in (("decimate", "rebuffer", 12), ("delay_sync", "rtl_daq", 13),
+                               ("iq_server", "delay_sync", 15)):
+            with self.subTest(down=down, up=up):
+                p = self.supervise("--interval", "3")
+                self.wait_out(p, "supervising instance 0")
+                pid = self.pid_of(down)
+                os.kill(pid, signal.SIGKILL)
+                time.sleep(0.8)
+                os.kill(self.pid_of(up), signal.SIGKILL)
+                self.assertEqual(p.wait(timeout=30), code, _read(p.out_path))
+                self.assertIn("stage %s (pid %d) died" % (down, pid), _read(p.out_path))
+                self.assertNotIn("stage %s " % up, _read(p.out_path))
+                self._kill_stages(all_roles)
+
+    def test_synthetic_downstream_death_before_synthesizer(self):
+        p = self.supervise("--synthetic", "--interval", "3",
+                           FAKE_ROLES="synthesizer rebuffer decimate delay_sync")
+        self.wait_out(p, "supervising instance 0")
+        pid = self.pid_of("delay_sync")
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.8)
+        os.kill(self.pid_of("synthesizer"), signal.SIGKILL)
+        self.assertEqual(p.wait(timeout=30), 13, _read(p.out_path))
+        self.assertIn("stage delay_sync (pid %d) died" % pid, _read(p.out_path))
+
+    def test_death_detected_within_a_tick(self):
+        # Liveness is polled well below --interval
+        p = self.supervise("--interval", "30")
+        self.wait_out(p, "supervising instance 0")
+        os.kill(self.pid_of("decimate"), signal.SIGKILL)
+        t0 = time.monotonic()
+        self.assertEqual(p.wait(timeout=20), 12, _read(p.out_path))
+        self.assertLess(time.monotonic() - t0, 10)
+
+    def test_zombie_stage_counts_as_dead(self):
+        p = self.supervise("--interval", "3", FAKE_ZOMBIE_ROLE="decimate")
+        self.wait_out(p, "supervising instance 0")
+        holder = int(_read(os.path.join(self.fake, "zombie_holder.pid")).strip())
+        self._pids.append(holder)
+        pid = self.pid_of("decimate")
+        os.kill(pid, signal.SIGKILL)
+        self.assertEqual(p.wait(timeout=30), 12, _read(p.out_path))
+        self.assertIn("stage decimate (pid %d) died" % pid, _read(p.out_path))
+        self._kill_stages(("rtl_daq", "rebuffer", "delay_sync", "hw_controller", "iq_server"))
+
+    def test_slow_status_probe_does_not_pause_polling(self):
+        # A STATUS server that accepts but never answers holds the probe for
+        # its timeouts; a stage death meanwhile is still seen first.
+        hang = socket.socket()
+        hang.bind(("127.0.0.1", 0))
+        hang.listen(8)
+        self.addCleanup(hang.close)
+        self.write_ini(en_mon=1, en_status=1, status_port=hang.getsockname()[1])
+        p = self.supervise("--healthcheck", "on", "--interval", "1", "--grace", "60")
+        self.wait_out(p, "supervising instance 0")
+        time.sleep(1.5)
+        pid = self.pid_of("decimate")
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.8)
+        os.kill(self.pid_of("rebuffer"), signal.SIGKILL)
+        self.assertEqual(p.wait(timeout=30), 12, _read(p.out_path))
+        self.assertIn("stage decimate (pid %d) died" % pid, _read(p.out_path))
+
+    def test_temp_dir_failure_stops_instance(self):
+        p = self.supervise("--interval", "1", TMPDIR=os.path.join(self.tmp, "no_such_dir"))
+        self.assertEqual(p.wait(timeout=30), 1, _read(p.out_path))
+        self.assertIn("cannot create a temporary directory - stopping instance 0",
+                      _read(p.out_path))
+        self.assertEqual(self.log("daq_stop.log").strip(), "%s|0" % self.fw)
+        self._kill_stages(("rtl_daq", "rebuffer", "decimate", "delay_sync", "hw_controller", "iq_server"))
+
+    def test_lost_watcher_falls_back_to_interval_check(self):
+        p = self.supervise("--interval", "1")
+        self.wait_out(p, "supervising instance 0")
+
+        def watcher():
+            ps = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+            rows = [line.split(None, 2) for line in ps.splitlines()]
+            kids = {int(r[0]) for r in rows if len(r) == 3 and int(r[1]) == p.pid}
+            for r in rows:
+                if len(r) == 3 and "pidfd_open" in r[2] and (int(r[1]) == p.pid or int(r[1]) in kids):
+                    return int(r[0])
+            return None
+        self.assertTrue(_wait_for(lambda: watcher() is not None, timeout=20))
+        os.kill(watcher(), signal.SIGKILL)
+        self.wait_out(p, "WARN: stage watcher exited; dead stages are checked every 1 s")
+        pid = self.pid_of("delay_sync")
+        os.kill(pid, signal.SIGKILL)
+        self.assertEqual(p.wait(timeout=30), 13, _read(p.out_path))
+        self.assertIn("stage delay_sync (pid %d) died" % pid, _read(p.out_path))
+        self._kill_stages(("rtl_daq", "rebuffer", "decimate", "hw_controller", "iq_server"))
+
     def test_unknown_pid_file_ignored(self):
         os.makedirs(os.path.join(self.fw, "_logs", "inst0", "pids"), exist_ok=True)
         p = self.supervise("--interval", "1", FAKE_EXTRA_PID="other")
@@ -1934,14 +2113,26 @@ class TestHostTuningScript(_Sandbox):
         rc, out = self.irq()
         self.assertEqual(rc, 1)
         self.assertIn("IRQ tuning requires root privileges. Run with sudo.", out)
+        # The fake-EUID hook is honoured only together with the fake tree
+        env = self.env(HEIMDALL_TUNING_FAKE_EUID="0", FAKE_UNAME="aarch64")
+        env.pop("HEIMDALL_TUNING_ROOT", None)
+        rc, out = self.run_script(["bash", os.path.join(self.util, "irq_tuning.real")], env=env)
+        self.assertEqual(rc, 1)
+        self.assertIn("IRQ tuning requires root privileges. Run with sudo.", out)
 
-    @unittest.skipUnless(IS_ROOT, "writes the fake /proc as root (container lane)")
+    def irq_root(self, *args, **env):
+        """irq() as root: the real EUID in the container lane, the
+        HEIMDALL_TUNING_FAKE_EUID hook (fake tree only) everywhere else."""
+        if not IS_ROOT:
+            env.setdefault("HEIMDALL_TUNING_FAKE_EUID", "0")
+        return self.irq(*args, **env)
+
     def test_irq_tuning_default_and_flags(self):
         for rel in ("proc/irq/40/smp_affinity", "proc/irq/41/smp_affinity", "proc/irq/42/smp_affinity"):
             _write(os.path.join(self.hroot, rel), "f\n", 0o644)
         _write(os.path.join(self.hroot, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"), "ondemand\n", 0o644)
         _write(os.path.join(self.hroot, "sys/class/net/eth0/queues/rx-0/rps_cpus"), "f\n", 0o644)
-        rc, out = self.irq()
+        rc, out = self.irq_root()
         self.assertEqual(rc, 0, out)
         self.assertIn("USB IRQ 40 -> core mask 1", out)
         self.assertIn("Network IRQ 42 -> core mask 8", out)
@@ -1952,7 +2143,7 @@ class TestHostTuningScript(_Sandbox):
                          "performance\n")
         self.assertIn("IRQ affinity tuning completed", out)
         _write(os.path.join(self.hroot, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"), "ondemand\n", 0o644)
-        rc, out = self.irq("--usb-core", "2", "--controller", "usb3", "--eth-core", "35", "--no-governor")
+        rc, out = self.irq_root("--usb-core", "2", "--controller", "usb3", "--eth-core", "35", "--no-governor")
         self.assertEqual(rc, 0, out)
         self.assertEqual(_read(os.path.join(self.hroot, "proc/irq/41/smp_affinity")), "4\n")
         self.assertEqual(_read(os.path.join(self.hroot, "proc/irq/40/smp_affinity")), "1\n")
@@ -1960,24 +2151,23 @@ class TestHostTuningScript(_Sandbox):
         self.assertEqual(_read(os.path.join(self.hroot, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")),
                          "ondemand\n")
 
-    @unittest.skipUnless(IS_ROOT, "writes the fake /proc as root (container lane)")
     def test_irq_tuning_failure_handling_and_arch(self):
         bad = os.path.join(self.hroot, "proc/irq/40/smp_affinity")
         os.remove(bad)
         os.makedirs(bad)
         _write(os.path.join(self.hroot, "proc/irq/41/smp_affinity"), "f\n", 0o644)
-        rc, out = self.irq()
+        rc, out = self.irq_root()
         self.assertEqual(rc, 1, out)
         self.assertEqual(_read(os.path.join(self.hroot, "proc/irq/41/smp_affinity")), "f\n", "set -e did not abort")
-        rc, out = self.irq("--keep-going")
+        rc, out = self.irq_root("--keep-going")
         self.assertEqual(rc, 1, out)
         self.assertIn("completed with 1 failed write(s)", out)
         self.assertEqual(_read(os.path.join(self.hroot, "proc/irq/41/smp_affinity")), "1\n")
         os.rmdir(bad)
-        rc, out = self.irq(FAKE_UNAME="armv7l")
+        rc, out = self.irq_root(FAKE_UNAME="armv7l")
         self.assertEqual(rc, 1)
         self.assertIn("Unsupported architecture: armv7l", out)
-        rc, out = self.irq("--any-arch", FAKE_UNAME="armv7l", FAKE_NPROC=4)
+        rc, out = self.irq_root("--any-arch", FAKE_UNAME="armv7l", FAKE_NPROC=4)
         self.assertEqual(rc, 0, out)
         self.assertIn("Network IRQ 42 -> core mask 8", out)
 

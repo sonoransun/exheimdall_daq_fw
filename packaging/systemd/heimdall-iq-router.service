@@ -1,0 +1,39 @@
+# HeIMDALL federation IQ router (federation_iq_router.py, ports 7000/7001).
+#
+#   sudo util/install.sh --extras-only --federation-user   # creates "heimdall"
+#   sudo install -d -m 0755 /etc/heimdall
+#   sudo install -m 0640 -o root -g heimdall federation.ini /etc/heimdall/federation.ini
+#   (0640 root:heimdall: the service user reads the [federation] auth_token,
+#   other local users cannot)
+#   sudo systemctl enable --now heimdall-iq-router
+#
+# Runs unprivileged. systemd creates and owns the directories for the
+# service user:
+#   /var/log/heimdall              router.log
+#   /run/heimdall-federation       router.pid (kept across restarts, shared
+#                                  with heimdall-coordinator.service)
+# Overrides (PATH, HEIMDALL_FED_*): /etc/default/heimdall-federation.
+
+[Unit]
+Description=HeIMDALL federation IQ router
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/heimdall/federation.ini
+
+[Service]
+Type=simple
+# Any unprivileged user works; util/install.sh --federation-user creates "heimdall".
+User=heimdall
+Group=heimdall
+WorkingDirectory=/opt/heimdall/Firmware
+LogsDirectory=heimdall
+RuntimeDirectory=heimdall-federation
+RuntimeDirectoryPreserve=yes
+EnvironmentFile=-/etc/default/heimdall-federation
+ExecStart=/opt/heimdall/Firmware/federation_start.sh router --foreground --config /etc/heimdall/federation.ini --log-dir /var/log/heimdall --pid-dir /run/heimdall-federation
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -39,8 +39,17 @@ HALF_POWER_DB = 10.0 * math.log10(0.5)
 _MAIN_LOBE_TOL_DB = 0.3             # plateau tolerance of the main-lobe flood fill
 _PEAK_PENALTY_GRID = 1e-3           # dB / deg^2 pull toward the look on the coarse grid
 _EDGE_WARN_MAX = 4                  # edge-of-visible-space warnings listed per report
+_EDGE_TX_EVAL = 6                   # TX edge lobes re-measured with the element patterns per report
+TX_EDGE_LOBE_DB = -3.0              # TX set: an edge lobe at or above this is an error (solve_beam refuses it)
 _PEAK_PENALTY_FINE = 1e-6           # dB / deg^2 during the exact refinement (bias ~1e-5 deg/deg)
 _GRID_MAX_POINTS = 1_300_000
+_PATCH_TRIGGER = 6.0                # local re-grid when the sphere grid step > HPBW / this
+_PATCH_HPBW_STEP = 10.0             # local grid step = HPBW / this
+_PATCH_HALF_HPBW = 10.0             # local patch half-width in beamwidths ...
+_PATCH_MAX_HALF_DEG = 30.0          # ... capped at this
+_PATCH_MAX_SIDE = 401               # points per patch axis
+_SEEDS_MAX = 32                     # sidelobe local maxima refined exactly
+_SEED_WINDOW_DB = 6.0               # ... within this of the strongest grid sample
 _CHUNK = 4_000_000                  # complex elements per evaluation chunk
 
 
@@ -92,33 +101,100 @@ def ttd_delays_s(pos, u0) -> np.ndarray:
     return (proj - proj.min()) / C0
 
 
+def ttd_delays_nf_s(pos, p_focus_m) -> np.ndarray:
+    """Near-field true-time delays toward a focus point ``p_focus_m`` (ENU, relative to the
+    phase reference): ``tau_n = (max_m |p - r_m| - |p - r_n|)/c >= 0``; the same sign
+    as ``steering_nf`` and equal to ``ttd_delays_s`` in the far-field limit."""
+    pos = np.asarray(pos, dtype=float).reshape(-1, 3)
+    if pos.shape[0] == 0:
+        return np.zeros(0)
+    p = np.asarray(p_focus_m, dtype=float).reshape(3)
+    rn = np.linalg.norm(p[np.newaxis, :] - pos, axis=1)
+    if np.any(rn <= 0.0):
+        raise ValueError("near-field focus coincides with an element")
+    return (rn.max() - rn) / C0
+
+
 # ---------------------------------------------------------------------------
 # Element patterns
 # ---------------------------------------------------------------------------
-def _table_eval(table, az, el):
+TABLE_MAX_AZ_GAP_DEG = 90.0         # a wider azimuth gap is "not tabulated"
+TABLE_EDGE_TAPER_DEG = 10.0         # dB ramp to the floor beyond a tabulated edge
+TABLE_FLOOR_REL_DB = 30.0           # default floor: lowest tabulated gain minus this
+
+
+def _table_grid(table, floor_db=None, extend="taper"):
+    """(els (E,), azs (A,), grid (E, A, 3) of [gain_db, cos phase, sin phase]) with the
+    coverage extension of ``ElementPattern`` (virtual floor rows / columns)."""
     rows = np.asarray(table, dtype=float)
     raz = np.asarray(ac.wrap_az(rows[:, 0]), dtype=float).reshape(-1)
     rel = rows[:, 1]
     azs = np.unique(raz)
     els = np.unique(rel)
-    vals = rows[:, 2:4]                                        # gain_db, phase_deg
+    ph = np.radians(rows[:, 3])
+    grid = np.empty((els.size, azs.size, 3))
+    grid[np.searchsorted(els, rel), np.searchsorted(azs, raz)] = np.stack([rows[:, 2], np.cos(ph), np.sin(ph)], -1)
+    if extend != "taper" or rows.shape[0] == 1:
+        return els, azs, grid
+    floor = float(rows[:, 2].min()) - TABLE_FLOOR_REL_DB if floor_db is None else float(floor_db)
 
-    def interp_az(a, keys, v):
-        if keys.size == 1:
-            return np.broadcast_to(v[0], a.shape + (2,)).copy()
-        o = np.argsort(keys)
-        return np.stack([np.interp(a, keys[o], v[o, k], period=360.0) for k in range(2)], axis=-1)
+    def virtual(src):                               # floor gain, the edge sample's phase
+        v = src.copy()
+        v[..., 0] = floor
+        return v
 
-    if els.size == 1:
-        return interp_az(az, raz, vals)
+    # azimuth coverage
     if azs.size == 1:
-        o = np.argsort(rel)
-        return np.stack([np.interp(el, rel[o], vals[o, k]) for k in range(2)], axis=-1)
-    grid = np.empty((els.size, azs.size, 2))
-    ie = np.searchsorted(els, rel)
-    ia = np.searchsorted(azs, raz)
-    grid[ie, ia] = vals
-    # periodic in az, clamped in el
+        add_az = [(ac.wrap_az(azs[0] + 180.0), virtual(grid[:, 0]))]
+    else:
+        gaps = np.diff(np.concatenate([azs, [azs[0] + 360.0]]))
+        k = int(np.argmax(gaps))
+        add_az = []
+        if gaps[k] > TABLE_MAX_AZ_GAP_DEG:
+            k1 = (k + 1) % azs.size
+            add_az = [(ac.wrap_az(azs[k] + TABLE_EDGE_TAPER_DEG), virtual(grid[:, k])),
+                      (ac.wrap_az(azs[k1] - TABLE_EDGE_TAPER_DEG), virtual(grid[:, k1]))]
+    if add_az:
+        azs = np.concatenate([azs, [a for a, _ in add_az]])
+        grid = np.concatenate([grid, np.stack([c for _, c in add_az], axis=1)], axis=1)
+        o = np.argsort(azs, kind="stable")
+        azs, grid = azs[o], grid[:, o]
+    # elevation coverage
+    lo, hi = [], []
+    if els.size == 1:
+        if els[0] > -90.0:
+            lo = [(-90.0, virtual(grid[0]))]
+        if els[0] < 90.0:
+            hi = [(90.0, virtual(grid[-1]))]
+    else:
+        if els[0] > -90.0:
+            lo = [(max(-90.0, els[0] - TABLE_EDGE_TAPER_DEG), virtual(grid[0]))]
+            if lo[0][0] > -90.0:
+                lo.insert(0, (-90.0, virtual(grid[0])))
+        if els[-1] < 90.0:
+            hi = [(min(90.0, els[-1] + TABLE_EDGE_TAPER_DEG), virtual(grid[-1]))]
+            if hi[0][0] < 90.0:
+                hi.append((90.0, virtual(grid[-1])))
+    if lo or hi:
+        els = np.concatenate([[e for e, _ in lo], els, [e for e, _ in hi]])
+        grid = np.concatenate([np.stack([r for _, r in lo]) if lo else grid[:0], grid,
+                               np.stack([r for _, r in hi]) if hi else grid[:0]], axis=0)
+    return els, azs, grid
+
+
+def _table_eval(table, az, el, floor_db=None, extend="taper"):
+    """Interpolated (gain_db, phase_deg) of a pattern table at body az/el -> (..., 2).
+
+    Bilinear in (el, az): periodic in azimuth, clamped in elevation; the gain in
+    dB and the phase as a unit phasor (renormalized), so a +-180 deg wrap
+    between samples interpolates correctly.
+    """
+    els, azs, grid = _table_grid(table, floor_db, extend)
+    az = np.asarray(az, dtype=float)
+    el = np.asarray(el, dtype=float)
+    if els.size == 1:                                   # constant along elevation
+        els = np.array([els[0], els[0] + 1.0])
+        grid = np.concatenate([grid, grid], axis=0)
     azx = np.concatenate([azs, [azs[0] + 360.0]])
     gx = np.concatenate([grid, grid[:, :1]], axis=1)
     a = np.mod(az - azs[0], 360.0) + azs[0]
@@ -128,8 +204,9 @@ def _table_eval(table, az, el):
     i = np.clip(np.searchsorted(els, e, side="right") - 1, 0, els.size - 2)
     te = (e - els[i]) / (els[i + 1] - els[i])
     ta, te = ta[..., None], te[..., None]
-    return ((1 - te) * ((1 - ta) * gx[i, j] + ta * gx[i, j + 1])
-            + te * ((1 - ta) * gx[i + 1, j] + ta * gx[i + 1, j + 1]))
+    v = ((1 - te) * ((1 - ta) * gx[i, j] + ta * gx[i, j + 1])
+         + te * ((1 - ta) * gx[i + 1, j] + ta * gx[i + 1, j + 1]))
+    return np.stack([v[..., 0], np.degrees(np.arctan2(v[..., 2], v[..., 1]))], axis=-1)
 
 
 def element_gain(pattern: ElementPattern, u_body) -> np.ndarray:
@@ -143,7 +220,8 @@ def element_gain(pattern: ElementPattern, u_body) -> np.ndarray:
     kind = pattern.kind
     if kind == "table":
         az, el = direction_angles(u.reshape(-1, 3))
-        ge = _table_eval(pattern.table, np.atleast_1d(az), np.atleast_1d(el))
+        ge = _table_eval(pattern.table, np.atleast_1d(az), np.atleast_1d(el),
+                         pattern.table_floor_db, pattern.table_extend)
         g_db = ge[..., 0]
         if pattern.gain_dbi is not None:
             g_db = g_db + (float(pattern.gain_dbi) - max(r[2] for r in pattern.table))
@@ -175,6 +253,23 @@ def _all_isotropic(geom, which) -> bool:
     return all(e.pattern.kind == "isotropic" for e in geom.elements_for(which))
 
 
+def _element_gains(geom, U, which, n_out):
+    """Element field gains (..., N) (or (..., 1) for one shared pattern) toward ENU directions U (..., 3)."""
+    els = geom.elements_for(which)
+    if not els:
+        return None
+    ub = geom.enu_to_body(np.asarray(U, dtype=float))
+    groups = {}
+    for n, e in enumerate(els):
+        groups.setdefault(e.pattern, []).append(n)
+    if len(groups) == 1:
+        return element_gain(next(iter(groups)), ub)[..., np.newaxis]
+    G = np.empty(tuple(ub.shape[:-1]) + (n_out,), dtype=np.complex128)
+    for pat, idx in groups.items():
+        G[..., idx] = element_gain(pat, ub)[..., np.newaxis]
+    return G
+
+
 def array_manifold(geom, U_enu, f_hz, which="rx", include_pattern=True) -> np.ndarray:
     """Steering vectors including element patterns: (P, N) for U (P, 3) (or (N,) for U (3,))."""
     els = geom.elements_for(which)
@@ -183,17 +278,8 @@ def array_manifold(geom, U_enu, f_hz, which="rx", include_pattern=True) -> np.nd
     A = steering_ff(pos, U, f_hz)
     if not include_pattern or not els:
         return A
-    ub = geom.enu_to_body(U)
-    groups = {}
-    for n, e in enumerate(els):
-        groups.setdefault(e.pattern, []).append(n)
-    if len(groups) == 1:
-        pat = next(iter(groups))
-        return A * element_gain(pat, ub)[..., np.newaxis]
-    G = np.empty(A.shape, dtype=np.complex128)
-    for pat, idx in groups.items():
-        G[..., idx] = element_gain(pat, ub)[..., np.newaxis]
-    return A * G
+    G = _element_gains(geom, U, which, A.shape[-1])
+    return A if G is None else A * G
 
 
 def az_el_grid(az_step=0.25, el_step=0.25, az_range=(0, 360), el_range=(-90, 90)) -> tuple:
@@ -417,6 +503,8 @@ class Lobe:
     kind: str                       # grating | ambiguity | sidelobe
     scan_az_deg: float = None       # numeric search: the look direction that exposes the lobe
     scan_el_deg: float = None
+    intrinsic: bool = False         # the cone / mirror image of the main lobe (linear / planar set)
+    edge: bool = False              # partial lobe at the edge of visible space (endfire / in-plane horizon)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -438,6 +526,10 @@ class BeamMetrics:
     squint_ok: bool
     fill_time_bw_product: float
     lobes: list = field(default_factory=list)
+    grid_step_deg: float = 0.0      # sphere grid step actually used
+    local_refine: bool = False      # near-in sidelobes re-gridded at HPBW/10 (large apertures)
+    near_field_m: float = 0.0       # > 0: measured on the focal sphere of this radius (focused beam)
+    look_level_db: float = 0.0      # level toward the commanded look u0 relative to the peak
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -467,14 +559,330 @@ def _tangents(u):
     return e, up / np.linalg.norm(up)
 
 
+class _LocalPatch:
+    """Gnomonic (tangent-plane) grid around the beam peak at HPBW/10, for apertures whose
+    near-in sidelobes the sphere grid cannot resolve. The main lobe (and, for linear /
+    planar sets, its cone / mirror image) is flooded on this grid; the strongest local
+    maxima outside it are refined exactly."""
+
+    def __init__(self, P, u_pk, e_az, e_el, hp_az, hp_el, p_pk, rank, B, comp):
+        self.P, self.u, self.e1, self.e2, self.p_pk = P, u_pk, e_az, e_el, p_pk
+        fin = [h for h in (hp_az, hp_el) if h < 360.0]
+        # isotropic step (an anisotropic grid lets the flood skip tilted nulls diagonally)
+        st = min(fin) / _PATCH_HPBW_STEP
+        half, stp = [], []
+        for h in (hp_az, hp_el):
+            hh = min(_PATCH_MAX_HALF_DEG, _PATCH_HALF_HPBW * (h if h < 360.0 else max(fin)),
+                     0.5 * (_PATCH_MAX_SIDE - 1) * st)
+            n = max(1, int(math.ceil(hh / st)))
+            half.append(n * st)
+            stp.append(st)
+        self.half, self.step = half, stp
+        self.x = np.linspace(-half[0], half[0], 2 * int(round(half[0] / stp[0])) + 1)
+        self.y = np.linspace(-half[1], half[1], 2 * int(round(half[1] / stp[1])) + 1)
+        X, Y = np.meshgrid(self.x, self.y)                      # (ny, nx)
+        self.U = self._dir(X, Y)
+        self.L = _db10(P(self.U) / p_pk)
+        c = (self.y.size // 2, self.x.size // 2)
+        seed = np.zeros(self.L.shape, dtype=bool)
+        seed[c] = True
+        main = _widest_flood(self.L, seed, _box_shifts(self.L.shape), _MAIN_LOBE_TOL_DB, self.L.size)
+        if rank == 2:
+            n_ = comp[:, 0]
+            Um = self.U - 2.0 * (self.U @ n_)[..., None] * n_
+            ok, iy, ix = self._index(Um)
+            img = np.zeros_like(main)
+            img[ok] = main[iy[ok], ix[ok]]
+            main = main | img
+        elif rank == 1:
+            v = self.U @ B[:, 0]
+            vm = v[main]
+            main = main | ((v >= vm.min() - 1e-12) & (v <= vm.max() + 1e-12))
+        self.main = main
+        self._side = None
+
+    def _dir(self, X, Y):
+        U = (self.u + np.tan(np.radians(X))[..., None] * self.e1 + np.tan(np.radians(Y))[..., None] * self.e2)
+        return U / np.linalg.norm(U, axis=-1, keepdims=True)
+
+    def _coords(self, U):
+        U = np.asarray(U, dtype=float).reshape(-1, 3)
+        c = U @ self.u
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x = np.degrees(np.arctan((U @ self.e1) / c))
+            y = np.degrees(np.arctan((U @ self.e2) / c))
+        front = c > 1e-9
+        return front, x, y
+
+    def contains(self, U):
+        front, x, y = self._coords(U)
+        return front & (np.abs(x) <= self.half[0]) & (np.abs(y) <= self.half[1])
+
+    def _index(self, U):
+        shape = np.asarray(U).shape[:-1]
+        front, x, y = self._coords(U)
+        ok = front & (np.abs(x) <= self.half[0]) & (np.abs(y) <= self.half[1])
+        ix = np.clip(np.rint((np.nan_to_num(x) + self.half[0]) / self.step[0]).astype(int), 0, self.x.size - 1)
+        iy = np.clip(np.rint((np.nan_to_num(y) + self.half[1]) / self.step[1]).astype(int), 0, self.y.size - 1)
+        return ok.reshape(shape), iy.reshape(shape), ix.reshape(shape)
+
+    def sidelobes(self, k=8):
+        """[(level_db, az, el)] of the ``k`` strongest local maxima outside the main lobe."""
+        if self._side is not None:
+            return self._side
+        out = []
+        Lo = np.where(self.main, -np.inf, self.L)
+        if np.isfinite(Lo).any():
+            nb = np.full(Lo.shape, -np.inf)
+            for v in _box_shifts(Lo.shape)(Lo):
+                np.maximum(nb, v, out=nb)
+            pk = np.argwhere(np.isfinite(Lo) & (Lo >= nb))
+            pk = pk[np.argsort(-Lo[pk[:, 0], pk[:, 1]], kind="stable")[:k]]
+            for iy, ix in pk:
+                x0 = np.array([self.x[ix], self.y[iy]])
+                best = (float(self.L[iy, ix]), x0)
+
+                def obj(z):
+                    return -float(_db10(self.P(self._dir(np.array(z[0]), np.array(z[1]))) / self.p_pk))
+
+                st = [self.step[0] / 2.0, self.step[1] / 2.0]
+                r = optimize.minimize(obj, x0, method="Nelder-Mead",
+                                      options={"xatol": 1e-5, "maxiter": 300,
+                                               "initial_simplex": [x0, x0 + [st[0], 0], x0 + [0, st[1]]]})
+                if -r.fun > best[0]:
+                    ok, jy, jx = self._index(self._dir(np.array(r.x[0]), np.array(r.x[1]))[np.newaxis, :])
+                    if ok[0] and not self.main[jy[0], jx[0]]:
+                        best = (-float(r.fun), r.x)
+                az, el = direction_angles(self._dir(np.array(best[1][0]), np.array(best[1][1])))
+                out.append((best[0], float(az), float(el)))
+        self._side = out
+        return out
+
+
+def _hpbw_cut(P, u_pk, p_pk, e, dth) -> float:
+    """-3 dB width (deg) of the great-circle cut through ``u_pk`` along tangent ``e``; 360 = no crossing."""
+    def lev(th):
+        t = math.radians(th)
+        return _db10(P(math.cos(t) * u_pk + math.sin(t) * e) / p_pk) - HALF_POWER_DB
+
+    sides = []
+    for sgn in (1.0, -1.0):
+        prev, found = 0.0, None
+        th = dth
+        while th <= 180.0:
+            if lev(sgn * th) < 0.0:
+                found = optimize.brentq(lambda t: lev(sgn * t), prev, th, xtol=1e-6)
+                break
+            prev, th = th, th + dth
+        if found is None:
+            return 360.0
+        sides.append(found)
+    return float(sum(sides))
+
+
+def _edge_of_visible(u, rank, B, tol_deg) -> bool:
+    """True when ``u`` lies within ``tol_deg`` of the visible-space boundary of a linear /
+    planar set (|B^T u| = 1: endfire for a line, the in-plane horizon for a plane)."""
+    if rank not in (1, 2):
+        return False
+    return float(np.linalg.norm(B.T @ np.asarray(u, dtype=float).reshape(3))) >= math.cos(math.radians(tol_deg))
+
+
+def _cone_ridge_lobe(P, u_pk, p_pk, axis, n=720):
+    """Strongest point of the intrinsic cone ridge ``{u : u.axis = u_pk.axis}`` of a linear set
+    outside the ridge's own main lobe, as an intrinsic ``ambiguity`` Lobe (None when the ridge
+    degenerates, is all main lobe or stays below -6 dB). The array factor is constant along
+    the ridge, so only the element patterns shape it. The ridge main lobe is the stretch
+    reached from the peak by descending (``_MAIN_LOBE_TOL_DB`` plateau tolerance, as the
+    flood fill): a flat ridge (isotropic elements) is all main lobe; a ridge rising away from
+    the peak exposes its stronger part (level > 0 dB)."""
+    e = np.asarray(axis, dtype=float).reshape(3)
+    e = e / np.linalg.norm(e)
+    c = float(u_pk @ e)
+    s_ = math.sqrt(max(0.0, 1.0 - c * c))
+    if s_ < 1e-6:
+        return None
+    m1 = u_pk - c * e
+    m1 = m1 / np.linalg.norm(m1)
+    m2 = np.cross(e, m1)
+    phi = 2.0 * math.pi * np.arange(n) / n                   # phi = 0 is the peak
+    U = c * e + s_ * (np.cos(phi)[:, None] * m1 + np.sin(phi)[:, None] * m2)
+    lv = _db10(np.asarray(P(U), dtype=float) / p_pk)
+    main = np.zeros(n, dtype=bool)
+    main[0] = True
+    for sgn in (1, -1):
+        low = float(lv[0])
+        for k in range(1, n):
+            j = (sgn * k) % n
+            if lv[j] > low + _MAIN_LOBE_TOL_DB:
+                break
+            main[j] = True
+            low = min(low, float(lv[j]))
+    if main.all():
+        return None
+    best = float(np.max(lv[~main]))
+    if best <= -6.0:
+        return None
+    k = int(np.flatnonzero(~main)[np.argmax(lv[~main])])
+    az, el = direction_angles(U[k])
+    return Lobe(float(az), float(el), best, "ambiguity", intrinsic=True)
+
+
+def _nf_field_fn(geom, w, f_hz, r_m, which, include_pattern):
+    """E(U) on the sphere of radius ``r_m`` around the phase reference: spherical waves
+    ``(r/R_n) exp(-j k0 (R_n - r))`` (``steering_nf``) times the element gains toward U, and
+    the distance (..., ) from each point to its nearest element."""
+    pos = geom.positions(which)
+    wc = np.conj(np.asarray(w, dtype=np.complex128).reshape(-1))
+    k = ac.k0(f_hz)
+    r = float(r_m)
+
+    def E(U):
+        U = np.asarray(U, dtype=float)
+        flat = U.reshape(-1, 3)
+        out = np.empty(flat.shape[0], dtype=np.complex128)
+        dmin = np.empty(flat.shape[0])
+        step = max(1, _CHUNK // max(1, pos.shape[0]))
+        for s0 in range(0, flat.shape[0], step):
+            Uc = flat[s0:s0 + step]
+            R = np.linalg.norm((r * Uc)[:, None, :] - pos[None, :, :], axis=2)
+            dmin[s0:s0 + step] = R.min(axis=1)
+            R = np.maximum(R, 1e-12)
+            a = (r / R) * np.exp(-1j * k * (R - r))
+            if include_pattern:
+                g = _element_gains(geom, Uc, which, pos.shape[0])
+                if g is not None:
+                    a = a * g
+            out[s0:s0 + step] = a @ wc
+        return out.reshape(U.shape[:-1]), dmin.reshape(U.shape[:-1])
+    return E
+
+
+def _near_field_metrics(geom, w, f_hz, u0, r_m, nulls, which, bw_hz, cal_phase_rms_deg, cal_amp_rms_db,
+                        include_pattern) -> BeamMetrics:
+    """``beam_metrics`` of a beam focused at ``r_m u0`` (see there): evaluated on the focal
+    sphere of radius ``r_m`` around the phase reference, locally around the focus."""
+    pos = geom.positions(which)
+    lam = ac.wavelength(f_hz)
+    E = _nf_field_fn(geom, w, f_hz, r_m, which, include_pattern)
+
+    def P(U):
+        return np.abs(E(U)[0]) ** 2
+
+    D_ap = max(geom.aperture_m(which), 1e-6)
+    bw_est = math.degrees(min(math.pi, lam / D_ap))
+    az0, el0 = direction_angles(u0)
+
+    def obj(x):
+        el = float(np.clip(x[1], -90.0, 90.0))
+        u = direction_vector(x[0], el)
+        th = math.degrees(math.acos(max(-1.0, min(1.0, float(u @ u0)))))
+        return -(_db10(P(u)) - _PEAK_PENALTY_FINE * th * th)
+
+    x0 = np.array([float(az0), float(el0)])
+    st = max(0.05, bw_est / 8.0)
+    res = optimize.minimize(obj, x0, method="Nelder-Mead",
+                            options={"xatol": 1e-6, "fatol": 1e-9, "maxiter": 800,
+                                     "initial_simplex": [x0, x0 + [st, 0], x0 + [0, st]]})
+    xp = res.x if res.fun <= obj(x0) else x0
+    pk_el = float(np.clip(xp[1], -90.0, 90.0))
+    pk_az = float(ac.wrap_az(xp[0]))
+    u_pk = direction_vector(pk_az, pk_el)
+    p_pk = float(P(u_pk))
+    if p_pk <= 0:
+        raise ValueError("beam has no response (all-zero weights?)")
+    dth = max(1e-3, min(0.5, math.degrees(0.886 * lam / D_ap) / 4.0))
+    e_az, e_el = _tangents(u_pk)
+    hpbw_az = _hpbw_cut(P, u_pk, p_pk, e_az, dth)
+    hpbw_el = _hpbw_cut(P, u_pk, p_pk, e_el, dth)
+    finite = [h for h in (hpbw_az, hpbw_el) if h < 360.0]
+    # PSLL along the two principal cuts out to 6 beamwidths (90 deg at most), stopping where
+    # the focal sphere comes closer to an element than half the focus-to-nearest-element
+    # distance (beyond that point the 1/R field of that single element dominates: a
+    # proximity effect, not a beam lobe)
+    th_max = min(90.0, 6.0 * max(finite)) if finite else 90.0
+    th = np.arange(dth, th_max + 0.5 * dth, dth)
+    d_stop = 0.5 * float(np.min(np.linalg.norm(r_m * u0[None, :] - pos, axis=1)))
+    rank, B, comp = ag.position_subspace(pos)
+    # main lobe and its intrinsic cone / mirror images: within ~ the first null of the peak in
+    # the position subspace (|B^T (u - u_pk)| < (1 - 1/N) lambda / D); never a sidelobe
+    delta = (1.0 - 1.0 / max(pos.shape[0], 2)) * lam / D_ap
+    psll = FLOOR_DB
+    for e in (e_az, e_el):
+        for sgn in (1.0, -1.0):
+            t = np.radians(sgn * th)
+            U = np.cos(t)[:, None] * u_pk + np.sin(t)[:, None] * e
+            f, dmin = E(U)
+            bad = np.flatnonzero(dmin < d_stop)
+            m = int(bad[0]) if bad.size else th.size
+            L = _db10(np.abs(f[:m]) ** 2 / p_pk)
+            if L.size < 3:
+                continue
+            mins = np.flatnonzero((L[1:-1] < L[:-2]) & (L[1:-1] <= L[2:])) + 1
+            if not mins.size:
+                continue
+            # true lobes only: interior local maxima past the first null, plus the last sample
+            # when the walk ended at th_max (not when it rises into an element's proximity zone)
+            Lp = np.concatenate([[np.inf], L, [np.inf if m < th.size else -np.inf]])
+            pk = np.flatnonzero((L >= Lp[:-2]) & (L >= Lp[2:]))
+            pk = pk[pk > mins[0]]
+            if rank in (1, 2) and pk.size:
+                pk = pk[np.linalg.norm((U[:m][pk] - u_pk) @ B, axis=1) >= delta]
+            if pk.size:
+                psll = max(psll, float(L[pk].max()))
+    lobes = []
+    excl = 0.5 * max(finite) if finite else 90.0
+    if rank == 1:
+        lb = _cone_ridge_lobe(P, u_pk, p_pk, B[:, 0])
+        if lb is not None:
+            lobes.append(lb)
+    elif rank == 2:
+        n_ = comp[:, 0]
+        um = u_pk - 2.0 * float(u_pk @ n_) * n_
+        if _angle_deg(um, u_pk) > excl:
+            lv = _db10(P(um) / p_pk)
+            if lv > -6.0:
+                az_m, el_m = direction_angles(um)
+                lobes.append(Lobe(float(az_m), float(el_m), float(lv), "ambiguity", intrinsic=True))
+    a_nf = steering_nf(pos, r_m * u0, f_hz)
+    wv = np.asarray(w, dtype=np.complex128).reshape(-1)
+    den = float(np.sum(np.abs(wv) ** 2) * np.sum(np.abs(a_nf) ** 2))
+    gain = _db10(pos.shape[0] * float(abs(np.vdot(wv, a_nf)) ** 2) / den) if den > 0 else FLOOR_DB
+    nd = [float(_db10(np.abs(_field(geom, wv, f_hz, direction_vector(float(az), float(el)), which,
+                                     include_pattern)) ** 2 / p_pk)) for az, el in nulls]
+    rn = np.linalg.norm(r_m * u0[None, :] - pos, axis=1)
+    fill = float(bw_hz) * float(np.ptp(rn)) / C0 if rn.size else 0.0
+    return BeamMetrics(
+        peak_az_deg=pk_az, peak_el_deg=pk_el, pointing_error_deg=_angle_deg(u_pk, u0),
+        hpbw_az_deg=hpbw_az, hpbw_el_deg=hpbw_el, psll_db=float(psll), islr_db=FLOOR_DB,
+        directivity_dbi=float(gain), taper_eff=taper_efficiency(wv, np.exp(1j * np.angle(a_nf))),
+        null_depths_db=nd,
+        cal_limited_null_floor_db=cal_limited_null_floor_db(cal_phase_rms_deg, cal_amp_rms_db, wv),
+        squint_ok=bool(fill <= 0.1), fill_time_bw_product=fill, lobes=lobes,
+        grid_step_deg=float(dth), local_refine=False, near_field_m=float(r_m),
+        look_level_db=float(_db10(P(u0) / p_pk)))
+
+
 def beam_metrics(geom, w, f_hz, u0, nulls=(), which="rx", bw_hz=0.0, cal_phase_rms_deg=0.0,
-                 cal_amp_rms_db=0.0, grid_step_deg=None, include_pattern=True) -> BeamMetrics:
+                 cal_amp_rms_db=0.0, grid_step_deg=None, include_pattern=True, focus_range_m=0.0) -> BeamMetrics:
     """Metrics of the beam ``E(u) = w^H a(u)`` steered toward ``u0`` (ENU unit vector).
 
     For TX weights ``t`` pass ``w = conj(t)`` (reciprocity). The main lobe is the
     region reached from the peak by descending (0.3 dB plateau tolerance); for
     linear / planar sets its intrinsic image (cone / mirror) is also part of the
-    main lobe and reported as an ``ambiguity`` lobe when separate.
+    main lobe and reported as an intrinsic ``ambiguity`` lobe when separate (for a
+    line: the strongest point of the cone ridge away from the peak). Lobes whose
+    maximum sits on the visible-space boundary carry ``edge = True``.
+
+    ``focus_range_m > 0`` (weights focused at ``focus_range_m u0``): the far-field
+    pattern of focused weights is defocused and meaningless inside the Fraunhofer
+    distance, so the beam is measured on the focal sphere of that radius around the
+    phase reference with spherical-wave steering: peak / pointing / HPBW near the
+    focus, PSLL along the two principal cuts (out to 6 HPBW, stopping where a point is
+    closer to an element than half the focus-to-nearest-element distance), the intrinsic cone / mirror image only in ``lobes``, ``islr_db``
+    -300 (not evaluated), ``directivity_dbi`` the coherent array gain at the focus
+    (dB over one element), null depths in the far field (nulls are far-field
+    constraints) relative to the focal peak. ``near_field_m`` records the range.
     """
     w = np.asarray(w, dtype=np.complex128).reshape(-1)
     u0 = np.asarray(u0, dtype=float).reshape(3)
@@ -482,6 +890,12 @@ def beam_metrics(geom, w, f_hz, u0, nulls=(), which="rx", bw_hz=0.0, cal_phase_r
     pos = geom.positions(which)
     if pos.shape[0] != w.size:
         raise ValueError("weights have %d entries but the %s set has %d elements" % (w.size, which, pos.shape[0]))
+    fr = float(focus_range_m or 0.0)
+    if not (math.isfinite(fr) and fr >= 0.0):
+        raise ValueError("focus_range_m must be finite and >= 0")
+    if fr > 0.0:
+        return _near_field_metrics(geom, w, f_hz, u0, fr, nulls, which, bw_hz, cal_phase_rms_deg,
+                                   cal_amp_rms_db, include_pattern)
     step = float(grid_step_deg) if grid_step_deg else _default_step(geom, f_hz, which)
     g = _Grid(step)
 
@@ -531,27 +945,11 @@ def beam_metrics(geom, w, f_hz, u0, nulls=(), which="rx", bw_hz=0.0, cal_phase_r
     L = _db10(Pg / p_pk)
 
     # --- HPBW in two orthogonal great-circle cuts through the peak
-    def width(e):
-        def lev(th):
-            t = math.radians(th)
-            return _db10(P(math.cos(t) * u_pk + math.sin(t) * e) / p_pk) - HALF_POWER_DB
-
-        sides = []
-        for sgn in (1.0, -1.0):
-            prev, found = 0.0, None
-            th = step / 2.0
-            while th <= 180.0:
-                if lev(sgn * th) < 0.0:
-                    found = optimize.brentq(lambda t: lev(sgn * t), prev, th, xtol=1e-6)
-                    break
-                prev, th = th, th + step / 2.0
-            if found is None:
-                return 360.0
-            sides.append(found)
-        return float(sum(sides))
+    D_ap = max(geom.aperture_m(which), 1e-6)
+    dth = max(1e-3, min(step / 2.0, math.degrees(0.886 * ac.wavelength(f_hz) / D_ap) / 4.0))
 
     e_az, e_el = _tangents(u_pk)
-    hpbw_az, hpbw_el = width(e_az), width(e_el)
+    hpbw_az, hpbw_el = _hpbw_cut(P, u_pk, p_pk, e_az, dth), _hpbw_cut(P, u_pk, p_pk, e_el, dth)
 
     # --- main lobe: widest-path flood from the peak cell (a path never climbs more than
     # the tolerance above its lowest point, so it stops at the minima around the lobe).
@@ -592,27 +990,63 @@ def beam_metrics(geom, w, f_hz, u0, nulls=(), which="rx", bw_hz=0.0, cal_phase_r
                 return float(ac.wrap_az(r.x[0])), float(np.clip(r.x[1], -90, 90)), _db10(-r.fun / p_pk)
         return float(g.az[jj]), float(g.el[ii]), float(L[ii, jj])
 
+    # --- local re-grid of the near-in sidelobes when the sphere grid cannot resolve them
+    cell_pk = max(g.d_el, g.d_az * max(math.cos(math.radians(pk_el)), 0.05))
+    patch = None
+    if finite and cell_pk > min(finite) / _PATCH_TRIGGER:
+        patch = _LocalPatch(P, u_pk, e_az, e_el, hpbw_az, hpbw_el, p_pk, rank, B, comp)
+
+    # --- PSLL: exact refinement seeded from every strong local maximum outside the main lobe
+    cands = []                                              # (level_db, az, el)
+    kind_hi = "grating" if lattice["periodic"] else "ambiguity"
+    if patch is not None:
+        cands.extend(patch.sidelobes())
     psll = FLOOR_DB
     if outside.any():
         flat = np.where(outside, L, -np.inf)
-        ii, jj = np.unravel_index(int(np.argmax(flat)), flat.shape)
-        az_s, el_s, psll = refine(ii, jj)
+        nb = np.full(flat.shape, -np.inf)
+        for v in g.shifts(flat):
+            np.maximum(nb, v, out=nb)
+        seeds = np.argwhere(outside & (flat >= nb) & (flat >= float(flat.max()) - _SEED_WINDOW_DB))
+        if patch is not None and seeds.size:
+            keep = ~patch.contains(g.U[seeds[:, 0], seeds[:, 1]])
+            seeds = seeds[keep]
+        if seeds.size:
+            order = np.argsort(-flat[seeds[:, 0], seeds[:, 1]], kind="stable")[:_SEEDS_MAX]
+            for ii, jj in seeds[order]:
+                az_s, el_s, lv = refine(int(ii), int(jj))
+                cands.append((lv, az_s, el_s))
         lab, nlab = g.label(outside & (L > -6.0))
-        kind_hi = "grating" if lattice["periodic"] else "ambiguity"
         for k in range(1, nlab + 1):
             sel = np.where(lab == k, L, -np.inf)
             a, b = np.unravel_index(int(np.argmax(sel)), sel.shape)
+            if patch is not None and patch.contains(g.U[a, b][np.newaxis, :])[0]:
+                continue                                    # the patch is authoritative there
             az_k, el_k, lv = refine(a, b)
             lobes.append(Lobe(az_k, el_k, lv, kind_hi))
+            cands.append((lv, az_k, el_k))
+    if patch is not None:
+        for lv, az_k, el_k in patch.sidelobes():
+            if lv > -6.0:
+                lobes.append(Lobe(az_k, el_k, lv, kind_hi))
+    if cands:
+        psll, az_s, el_s = max(cands)
         if psll <= -6.0:
             lobes.append(Lobe(az_s, el_s, psll, "sidelobe"))
+    edge_tol = max(1.0, 2.0 * step)
+    for lb in lobes:
+        lb.edge = _edge_of_visible(direction_vector(lb.az_deg, lb.el_deg), rank, B, edge_tol)
     img_only = M_img & ~M
     if rank == 2 and img_only.any():
         lab, nlab = g.label(img_only & (L > -6.0))
         for k in range(1, nlab + 1):
             sel = np.where(lab == k, L, -np.inf)
             a, b = np.unravel_index(int(np.argmax(sel)), sel.shape)
-            lobes.append(Lobe(float(g.az[b]), float(g.el[a]), float(L[a, b]), "ambiguity"))
+            lobes.append(Lobe(float(g.az[b]), float(g.el[a]), float(L[a, b]), "ambiguity", intrinsic=True))
+    elif rank == 1:
+        lb = _cone_ridge_lobe(P, u_pk, p_pk, B[:, 0])
+        if lb is not None:
+            lobes.append(lb)
 
     side = float(np.sum((Pg * g.w)[outside]))
     mainp = float(np.sum((Pg * g.w)[main]))
@@ -631,7 +1065,9 @@ def beam_metrics(geom, w, f_hz, u0, nulls=(), which="rx", bw_hz=0.0, cal_phase_r
         hpbw_az_deg=hpbw_az, hpbw_el_deg=hpbw_el, psll_db=float(psll), islr_db=float(islr),
         directivity_dbi=float(direct), taper_eff=taper_efficiency(w, a0), null_depths_db=nd,
         cal_limited_null_floor_db=cal_limited_null_floor_db(cal_phase_rms_deg, cal_amp_rms_db, w),
-        squint_ok=bool(fill <= 0.1), fill_time_bw_product=fill, lobes=lobes)
+        squint_ok=bool(fill <= 0.1), fill_time_bw_product=fill, lobes=lobes,
+        grid_step_deg=float(max(g.d_el, g.d_az)), local_refine=patch is not None,
+        look_level_db=float(_db10(P(u0) / p_pk)))
 
 
 # ---------------------------------------------------------------------------
@@ -931,13 +1367,27 @@ class GeometryReport:
         return d
 
 
+def _tx_lobe_with_patterns_db(geom, f_hz, saz, sel, which):
+    """Strongest non-intrinsic grating / ambiguity lobe (dB) of the uniform beam steered to
+    (saz, sel) with the element patterns: what ``solve_beam`` measures for that TX look."""
+    u = direction_vector(saz, sel)
+    m = beam_metrics(geom, array_manifold(geom, u, f_hz, which, True), f_hz, u, which=which)
+    return max((lb.level_db for lb in m.lobes if lb.kind in ("grating", "ambiguity") and not lb.intrinsic),
+               default=FLOOR_DB)
+
+
 def geometry_report(geom, f_min_hz, f_max_hz, scan_limit_deg, which="rx", step_deg=2.0, look=None,
                     beacon_range_m=None) -> GeometryReport:
     """Analytic + numeric geometry validation for one element set (spec 10.6).
 
     Issues: ``validate_geometry`` (GEOMETRY / GRATING_LOBE) plus the numeric
     search at f_max (AMBIGUITY error >= -3 dB, warning -3..-6 dB) and an info
-    line with the beamwidth at f_min.
+    line with the beamwidth at f_min. Partial lobes at the edge of visible space
+    (endfire / in-plane horizon) >= -3 dB are warnings for the RX set; for the TX
+    set they are AMBIGUITY errors, because ``solve_beam`` refuses such a TX beam
+    (``TX_EDGE_LOBE_DB``). With directional elements the strongest TX edge lobes
+    (up to ``_EDGE_TX_EVAL``) are re-measured with the element patterns, as
+    ``solve_beam`` does, and only those still >= -3 dB are errors.
     """
     f_min, f_max = ag._freqs(f_min_hz, f_max_hz)
     els = geom.elements_for(which)
@@ -954,10 +1404,23 @@ def geometry_report(geom, f_min_hz, f_max_hz, scan_limit_deg, which="rx", step_d
         allv = _visible_lobes(geom, f_max, scan_limit_deg, which, step_deg, -40.0, include_edge=True)
         worst = max((t[2] for t in allv), default=FLOOR_DB)
         hi = "grating" if lat["periodic"] else "ambiguity"
-        edge_warn = []
+        edge_warn, edge_err = [], []
+        iso = _all_isotropic(geom, which)
+        n_eval = 0
         for az, el, lv, saz, sel, edge in sorted(allv, key=lambda t: -t[2]):
             if edge:
                 if lv >= -3.0:
+                    if which == "tx" and lv >= TX_EDGE_LOBE_DB:
+                        lvp = lv
+                        if not iso:
+                            if n_eval >= _EDGE_TX_EVAL:
+                                lvp = FLOOR_DB              # the strongest ones were checked: warn only
+                            else:
+                                n_eval += 1
+                                lvp = _tx_lobe_with_patterns_db(geom, f_max, saz, sel, which)
+                        if lvp >= TX_EDGE_LOBE_DB:
+                            edge_err.append((az, el, lv, saz, sel, lvp))
+                            continue
                     edge_warn.append((az, el, lv, saz, sel))
                 continue
             if lv >= -6.0:
@@ -966,8 +1429,20 @@ def geometry_report(geom, f_min_hz, f_max_hz, scan_limit_deg, which="rx", step_d
                 level = "error" if lv >= -3.0 else "warning"
                 issues.append(Issue(level, "AMBIGUITY", "%s lobe %.1f dB at az %.1f el %.1f when steered to "
                                     "az %.1f el %.1f (%.6g Hz)" % (kind, lv, az, el, saz, sel, f_max), where))
+        if len(edge_err) > _EDGE_WARN_MAX:
+            issues.append(Issue("error", "AMBIGUITY", "TX set: %d more partial lobes >= %.0f dB at the edge of "
+                                "visible space" % (len(edge_err) - _EDGE_WARN_MAX, TX_EDGE_LOBE_DB), where))
+        for az, el, lv, saz, sel, lvp in edge_err[:_EDGE_WARN_MAX]:
+            lobes.append(Lobe(az, el, lv, hi, saz, sel, edge=True))
+            issues.append(Issue("error", "AMBIGUITY", "TX set: partial %s lobe %.1f dB at the edge of visible "
+                                "space (az %.1f el %.1f, endfire / in-plane horizon) when steered to az %.1f el "
+                                "%.1f (%.6g Hz)%s: solve_beam refuses such TX beams (>= %.0f dB); reduce "
+                                "scan_limit_deg or use directional elements"
+                                % (hi, lv, az, el, saz, sel, f_max,
+                                   "" if iso else ", %.1f dB with the element patterns" % lvp, TX_EDGE_LOBE_DB),
+                                where))
         for az, el, lv, saz, sel in edge_warn[:_EDGE_WARN_MAX]:
-            lobes.append(Lobe(az, el, lv, "sidelobe", saz, sel))
+            lobes.append(Lobe(az, el, lv, "sidelobe", saz, sel, edge=True))
             issues.append(Issue("warning", "AMBIGUITY", "partial lobe %.1f dB at the edge of visible space "
                                 "(az %.1f el %.1f, endfire / in-plane horizon) when steered to az %.1f el %.1f "
                                 "(%.6g Hz); isotropic array factor: element patterns or a smaller scan_limit_deg "

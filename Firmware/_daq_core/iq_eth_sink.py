@@ -34,15 +34,20 @@ sys.path.insert(0, os.path.join(rootPath, "_daq_core"))
 from iq_header import IQHeader
 
 class IQRecorder():
-    def __init__(self, frame_count = 10000):
+    def __init__(self, frame_count = 10000, host = "127.0.0.1", port = 5000,
+                 connect_attempts = 0):
         """
             Initialzes the IQ Frame receiver module
+
+            connect_attempts: listen() gives up (returns -1) after this many
+                              failed connection attempts; 0 = retry forever
         """
         self.logger = logging.getLogger(__name__)
         
         self.receiver_connection_status = False        
-        self.port = 5000
-        self.rec_ip_addr = "127.0.0.1"
+        self.port = port
+        self.rec_ip_addr = host
+        self.connect_attempts = connect_attempts
         self.socket_inst = socket.socket()
         
         self.receiverBufferSize = 2 ** 18  # Size of the Ethernet receiver buffer measured in bytes        
@@ -67,14 +72,16 @@ class IQRecorder():
         try:
             self.socket_inst.connect((self.rec_ip_addr, self.port))            
             self.socket_inst.sendall(str.encode('streaming'))                                
-            test_iq=self.receive_iq_frame()
+            self.receive_iq_frame()
             self.receiver_connection_status = True
             self.logger.info("Connection established")
-        except:
-            errorMsg = sys.exc_info()[0]
-            self.logger.error("Error message: "+str(errorMsg))
+        except (OSError, ValueError) as err:
+            self.logger.error("Error message: %s", err)
             self.receiver_connection_status = False
-            self.logger.info("Failed to connect to the IQ server")                
+            self.logger.info("Failed to connect to the IQ server")
+            # A socket whose connect failed cannot be reused for the retry
+            self.socket_inst.close()
+            self.socket_inst = socket.socket()
     
         
     def close_eth(self):  
@@ -87,9 +94,8 @@ class IQRecorder():
                 self.socket_inst.close()  # close connection   
                 self.receiver_connection_status = False
                 self.socket_inst = socket.socket()
-            except:
-                errorMsg = sys.exc_info()[0]
-                self.logger.error("Error message: "+str(errorMsg))                
+            except OSError as err:
+                self.logger.error("Error message: %s", err)
                 return -1                 
         self.logger.info("Ethernet connection closed")
         return 0
@@ -98,7 +104,13 @@ class IQRecorder():
         """
             Starts receiving IQ Frames through the IQ data interface
         """
+        attempts = 0
         while not self.receiver_connection_status:
+            if self.connect_attempts and attempts >= self.connect_attempts:
+                self.logger.error("No connection after %d attempts, exiting..", attempts)
+                self.socket_inst.close()
+                return -1
+            attempts += 1
             time.sleep(1)
             self.connect_eth()
             
@@ -110,7 +122,7 @@ class IQRecorder():
             # Check Rec control character                    
             try:
                 self.socket_inst.sendall(str.encode("IQDownload")) # Send iq request command
-                iq_frame_bytes = self.receive_iq_frame()
+                self.receive_iq_frame()
                 if self.iq_header.check_sync_word():
                     self.logger.critical("Sync word error")
                     return -1
@@ -143,10 +155,12 @@ class IQRecorder():
                         self.logger.info("Total dropped frames: {:d}".format(self.dropped_frames))
                         self.logger.info("First received frame: {:d}".format(self.first_frame))
                         self.logger.info("Current frame index: {:d}".format(self.iq_header.cpi_index))
-            except:
-                errorMsg = sys.exc_info()[0]
-                self.logger.error("Error message: "+str(errorMsg))
+            except (OSError, ValueError) as err:  # ConnectionError: server closed; ValueError: undecodable header
+                self.logger.error("Error message: %s", err)
                 self.logger.error("Unable to get new IQ samples, exiting..")
+                self.socket_inst.close()
+                self.receiver_connection_status = False
+                self.socket_inst = socket.socket()
                 return -1
         self.close_eth()
         return 0
@@ -165,6 +179,8 @@ class IQRecorder():
         while total_received_bytes < self.iq_header.header_size:
             # Receive into buffer
             recv_bytes_count = self.socket_inst.recv_into(view, self.iq_header.header_size-total_received_bytes)
+            if recv_bytes_count == 0:
+                raise ConnectionError("IQ server closed the connection inside a header")
             view = view[recv_bytes_count:]  # reset memory region
             total_received_bytes += recv_bytes_count
         
@@ -179,14 +195,17 @@ class IQRecorder():
         
         total_received_bytes = 0
         recv_bytes_count = 0
-        iq_data_bytes = bytearray(total_bytes_to_receive + receiver_buffer_size)  # allocate array
+        iq_data_bytes = bytearray(total_bytes_to_receive)  # allocate array
         view = memoryview(iq_data_bytes)  # Get buffer
         
         self.logger.debug("Starting IQ reception")
         
         while total_received_bytes < total_bytes_to_receive:
             # Receive into buffer
-            recv_bytes_count = self.socket_inst.recv_into(view, receiver_buffer_size)
+            recv_bytes_count = self.socket_inst.recv_into(
+                view, min(receiver_buffer_size, total_bytes_to_receive - total_received_bytes))
+            if recv_bytes_count == 0:
+                raise ConnectionError("IQ server closed the connection inside a payload")
             view = view[recv_bytes_count:]  # reset memory region
             total_received_bytes += recv_bytes_count
         
@@ -195,7 +214,7 @@ class IQRecorder():
         # Dump IQ header        
         #self.iq_header.dump_header()
         # Enable here to get access to the received data
-        #iq_frame_bytes=bytearray()+iq_header_bytes+iq_data_bytes[:total_bytes_to_receive]
+        #iq_frame_bytes=bytearray()+iq_header_bytes+iq_data_bytes
         return 0#iq_frame_bytes
 
 if __name__ == "__main__":

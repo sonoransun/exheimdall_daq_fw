@@ -50,6 +50,36 @@ STALL_AUTO_HISTORY = 5
 
 _ALIVE_STATES = frozenset({STATE_UP, STATE_DEGRADED, STATE_STALE, STATE_FLAPPING})
 
+#: Largest :5002 STATUS reply read from a peer (replies are a few kB).
+STATUS_REPLY_MAX = 4 * 1024 * 1024
+
+
+def recv_until_close(sock, timeout, max_bytes=STATUS_REPLY_MAX):
+    """Read until the peer closes, within an overall *timeout* and *max_bytes*.
+
+    Raises socket.timeout when the deadline passes first (a peer that
+    trickles bytes cannot hold the reader) and ValueError when the reply
+    grows past *max_bytes*.
+    """
+    deadline = time.monotonic() + max(0.001, float(timeout))
+    settimeout = getattr(sock, "settimeout", None)   # connect hooks may return stand-ins
+    chunks = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("no complete reply within {:.3f} s".format(timeout))
+        if settimeout is not None:
+            settimeout(remaining)
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("reply larger than {} bytes".format(max_bytes))
+    return b"".join(chunks)
+
 
 class DnsUnavailable(OSError):
     """Raised by a connect hook when a member host has no cached address."""
@@ -325,12 +355,7 @@ class FederationHealth:
     def _fetch_status(self, host, port):
         with self._connect((host, port), timeout=self.peer_timeout) as sock:
             sock.sendall(b"STATUS\n")
-            data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            data = recv_until_close(sock, self.peer_timeout)
         response = json.loads(data.decode("utf-8", errors="replace"))
         if not isinstance(response, dict):
             raise ValueError("STATUS reply is not a JSON object")

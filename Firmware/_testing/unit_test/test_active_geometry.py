@@ -138,7 +138,20 @@ class TestPresets(unittest.TestCase):
         uca = G.preset_uca(5, radius_m=0.2)
         self.assertEqual(uca.rank(), 2)
         self.assertEqual(uca.ambiguity(), "mirror_elevation")
-        self.assertEqual(G.preset_ura(2, 2, 0.1, 0.1).ambiguity(), "mirror_plane")
+        self.assertEqual(uca.plane_kind(), "horizontal")
+        ura = G.preset_ura(2, 2, 0.1, 0.1)                                  # vertical panel
+        self.assertEqual(ura.ambiguity(), "mirror_elevation")              # frozen label (spec 4.4 / 10.6)
+        self.assertEqual(ura.plane_kind(), "vertical")
+        self.assertEqual(ura.with_orientation(G.Orientation(pitch_deg=40)).plane_kind(), "tilted")
+        self.assertIsNone(G.preset_ula(4, 0.1).plane_kind())
+        for g in (uca, ura, G.preset_tri(2, 2, 0.1), G.preset_ula(4, 0.1)):
+            self.assertIn(g.ambiguity(), G.AMBIGUITY_LABELS)
+        # the +el / -el warning applies to horizontal planes only
+        lam = 3 * 0.1
+        self.assertFalse(any("indistinguishable" in i.message and i.level == "warning"
+                             for i in G.validate_geometry(ura, C0 / lam, C0 / lam, 30, look=(0, 10))))
+        self.assertTrue(any("+el and -el" in i.message
+                            for i in G.validate_geometry(uca, C0 / lam, C0 / lam, 30, look=(0, 10))))
         tet = G.ArrayGeometry([G.Element(0, (0, 0, 0)), G.Element(1, (0.2, 0, 0)),
                                G.Element(2, (0, 0.2, 0)), G.Element(3, (0, 0, 0.2))])
         self.assertEqual(tet.rank("all"), 3)
@@ -458,6 +471,171 @@ class TestFiles(unittest.TestCase):
             G.load_geometry(self.write("d.csv", "id,x_m,y_m,z_m,rx_device,rx_channel\n0,0,0,0,sim0,\n1,1,0,0,,\n"))
         with self.assertRaisesRegex(GeometryError, "duplicate"):
             G.load_geometry(self.write("e.csv", "id,x_m,y_m,z_m\n0,0,0,0\n0,1,0,0\n"))
+
+
+class TestPhysicalGeometryPinning(unittest.TestCase):
+    """Physical element positions never follow the configured operating frequency."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_lambda_units_need_the_files_design_freq(self):
+        cfg = C.default_config(rf={"center_freq_hz": 2.4e9}, geometry={"design_freq_hz": 2.4e9},
+                               devices={"sim0": {"family": "sim", "rx_channels": "0..3"}})
+        doc = {"schema": G.GEOMETRY_SCHEMA, "units": "lambda",
+               "elements": [{"id": i, "pos": [0.5 * i, 0, 0], "rx": {"device": "sim0", "channel": i}}
+                            for i in range(4)]}
+        for c in (None, cfg, C.default_config(rf={"center_freq_hz": 2.4e9},
+                                              devices={"sim0": {"family": "sim", "rx_channels": "0..3"}})):
+            with self.assertRaisesRegex(GeometryError, "units = lambda requires design_freq_hz") as cm:
+                G.geometry_from_dict(doc, cfg=c)
+            self.assertEqual(cm.exception.code, "GEOMETRY")
+        doc["design_freq_hz"] = 915e6                     # the array was built for 915 MHz
+        g = G.geometry_from_dict(doc, cfg=cfg)
+        self.assertAlmostEqual(g.min_spacing_m(), 0.5 * C0 / 915e6)
+        # ... so at 2.4 GHz the grating check now fires (1.31 lambda pitch)
+        iss = G.validate_geometry(g, 2.4e9, 2.4e9, 60)
+        self.assertIn("GRATING_LOBE", codes(iss, "error"))
+        # CSV: same rule for the '# units=lambda' header
+        p = os.path.join(self.d, "l.csv")
+        with open(p, "w") as fh:
+            fh.write("# units=lambda\nid,x_m,y_m,z_m,rx_device,rx_channel\n0,0,0,0,sim0,0\n1,0.5,0,0,sim0,1\n")
+        for c in (None, cfg):
+            with self.assertRaisesRegex(GeometryError, "units = lambda requires design_freq_hz"):
+                G.load_geometry(p, c)
+        with open(p, "w") as fh:
+            fh.write("# units=lambda design_freq_hz=915e6\nid,x_m,y_m,z_m,rx_device,rx_channel\n"
+                     "0,0,0,0,sim0,0\n1,0.5,0,0,sim0,1\n")
+        self.assertAlmostEqual(G.load_geometry(p).min_spacing_m(), 0.5 * C0 / 915e6)
+
+    def test_metre_files_do_not_inherit_center_freq(self):
+        cfg = C.default_config(rf={"center_freq_hz": 2.4e9}, devices={"a": {"family": "sim", "rx_channels": "0..1"}})
+        g = G.geometry_from_dict(base_doc(), cfg=cfg)
+        self.assertEqual(g.design_freq_hz, 0.0)           # label only; never the operating frequency
+        self.assertAlmostEqual(g.min_spacing_m(), 0.15)
+
+    def test_preset_pitch_derived_from_operating_freq(self):
+        cfg = C.default_config()                          # spacing_m 0, design_freq_hz 0
+        out = []
+        g = G.geometry_from_config(cfg, issues=out)
+        self.assertEqual(codes(out, "warning"), ["GEOMETRY"])
+        self.assertIn("derived from the operating frequency", out[0].message)
+        self.assertEqual(g.provenance_issues, tuple(out))
+        self.assertAlmostEqual(g.preset_spacing_m, 0.5 * C0 / 915e6)
+        self.assertIn("derived from the operating frequency",
+                      " ".join(i.message for i in G.validate_geometry(g, 915e6, 915e6, 60)))
+        tx = C.default_config(tx={"en_tx": 1})
+        self.assertEqual(codes(G.geometry_config_issues(tx), "error"), ["GEOMETRY"])
+        self.assertIn("GEOMETRY", codes(G.validate_geometry(G.geometry_from_config(tx), 915e6, 915e6, 60),
+                                        "error"))
+        for pinned in ({"spacing_m": 0.16}, {"design_freq_hz": 915e6}):
+            c = C.default_config(tx={"en_tx": 1}, geometry=pinned)
+            self.assertEqual(G.geometry_config_issues(c), [])
+            self.assertEqual(G.geometry_from_config(c).provenance_issues, ())
+        # the provenance survives derived geometries
+        self.assertEqual(g.with_orientation(G.Orientation(10)).provenance_issues, g.provenance_issues)
+
+    def test_uca_pinned_by_radius_is_not_frequency_derived(self):
+        dev = {"sim0": {"family": "sim", "rx_channels": "0..7", "tx_channels": "0..7"}}
+        geo = {"preset": "uca", "num_elements": 8, "radius_m": 0.3}
+        cfg = C.default_config(geometry=geo, devices=dev, tx={"en_tx": 1})
+        self.assertEqual(G.geometry_config_issues(cfg), [])
+        out = []
+        g = G.geometry_from_config(cfg, issues=out)
+        self.assertEqual((out, g.provenance_issues), ([], ()))
+        self.assertNotIn("GEOMETRY", codes(G.validate_geometry(g, 915e6, 915e6, 90, which="tx"), "error"))
+        self.assertAlmostEqual(g.preset_spacing_m, 2 * 0.3 * math.sin(math.pi / 8))        # the arc pitch used
+        self.assertAlmostEqual(g.min_spacing_m(), g.preset_spacing_m)
+        g24 = G.geometry_from_config(C.default_config(geometry=geo, devices=dev, rf={"center_freq_hz": 2.4e9}))
+        np.testing.assert_allclose(g24.positions(), g.positions())
+        # a UCA sized by spacing_lambda (radius_m = 0) still follows the operating frequency
+        loose = C.default_config(geometry={"preset": "uca", "num_elements": 8}, devices=dev, tx={"en_tx": 1})
+        self.assertEqual(codes(G.geometry_config_issues(loose), "error"), ["GEOMETRY"])
+        self.assertEqual(g.scan_limit_deg, 60.0)
+
+
+class TestEnuFrameAttitude(unittest.TestCase):
+    """enu / lla geometries keep their positions but take the platform attitude as boresight."""
+
+    def _east_panel(self):
+        d = 0.6 * LAM
+        return G.preset_ura(3, 3, d, d).with_orientation(G.Orientation(heading_deg=90))
+
+    def test_body_and_equivalent_enu_validate_identically(self):
+        import active_pattern as AP
+        body = self._east_panel()
+        enu_pos = body.positions("all") + body.reference_point_enu()
+        doc = {"schema": G.GEOMETRY_SCHEMA, "frame": "enu", "platform": {"heading_deg": 90.0},
+               "elements": [{"id": i, "pos": [float(c) for c in p], "rx": {"device": "sim0", "channel": i},
+                             "tx": {"device": "sim0", "channel": i}} for i, p in enumerate(enu_pos)]}
+        enu = G.geometry_from_dict(doc)
+        np.testing.assert_allclose(enu.positions(), body.positions(), atol=1e-12)
+        np.testing.assert_allclose(enu.boresight_enu(), [1, 0, 0], atol=1e-12)
+        vb = G.validate_geometry(body, F, F, 30)
+        ve = G.validate_geometry(enu, F, F, 30)
+        self.assertEqual([(i.level, i.code, i.message) for i in vb], [(i.level, i.code, i.message) for i in ve])
+        self.assertEqual(codes(ve, "error"), [])
+        self.assertAlmostEqual(G.grating_free_scan_deg(enu, F), G.grating_free_scan_deg(body, F))
+        rb = AP.geometry_report(body, F, F, 30, step_deg=5.0)
+        re_ = AP.geometry_report(enu, F, F, 30, step_deg=5.0)
+        self.assertEqual(rb.grating_free_scan_deg, re_.grating_free_scan_deg)
+        self.assertEqual([(i.level, i.code) for i in rb.issues], [(i.level, i.code) for i in re_.issues])
+        self.assertEqual(len(rb.lobes), len(re_.lobes))
+        # element patterns follow the attitude too (body +y = East)
+        pat = G.ElementPattern("cos_q", q=2)
+        els = [G.Element(i, (0.15 * i, 0, 0), rx=ChannelRef("s", i), pattern=pat) for i in range(2)]
+        ge = G.ArrayGeometry(els, orientation=G.Orientation(heading_deg=90), frame="enu")
+        np.testing.assert_allclose(ge.enu_to_body([1, 0, 0]), [0, 1, 0], atol=1e-12)
+        np.testing.assert_allclose(ge.positions()[1], [0.15, 0, 0], atol=1e-12)          # not rotated
+
+    def test_with_orientation_on_enu_changes_only_boresight(self):
+        doc = base_doc(frame="enu")
+        g = G.geometry_from_dict(doc)
+        np.testing.assert_allclose(g.boresight_enu(), [0, 1, 0], atol=1e-12)
+        g2 = g.with_orientation(G.Orientation(heading_deg=180))
+        np.testing.assert_allclose(g2.positions(), g.positions(), atol=1e-15)
+        np.testing.assert_allclose(g2.boresight_enu(), [0, -1, 0], atol=1e-12)
+        self.assertAlmostEqual(g2.angle_from_boresight_deg(G.direction_vector(90, 0)), 90.0)
+
+    def test_lla_attitude(self):
+        lla = {"schema": G.GEOMETRY_SCHEMA, "frame": "lla",
+               "platform": {"site_lla": [47.0, 19.0, 100.0], "heading_deg": 180.0},
+               "elements": [{"id": 0, "lla": [47.0, 19.0, 100.0], "rx": {"device": "a", "channel": 0}},
+                            {"id": 1, "lla": [47.0, 19.000002, 100.0], "rx": {"device": "a", "channel": 1}}]}
+        g = G.geometry_from_dict(lla)
+        np.testing.assert_allclose(g.boresight_enu(), [0, -1, 0], atol=1e-12)
+        self.assertGreater(g.positions()[1][0], 0.1)                                      # still East
+        self.assertAlmostEqual(g.positions()[1][1], 0.0, places=6)
+
+    def test_csv_round_trip_of_enu_geometry_with_config_heading(self):
+        cfg = C.default_config(geometry={"heading_deg": 90.0},
+                               devices={"sim0": {"family": "sim", "rx_channels": "0..3"}})
+        doc = {"schema": G.GEOMETRY_SCHEMA, "frame": "enu",
+               "elements": [{"id": i, "pos": [0.15 * i, 0, 0], "rx": {"device": "sim0", "channel": i}}
+                            for i in range(4)]}
+        g = G.geometry_from_dict(doc, cfg=cfg)
+        np.testing.assert_allclose(g.positions()[3], [0.45, 0, 0], atol=1e-12)
+        np.testing.assert_allclose(g.boresight_enu(), [1, 0, 0], atol=1e-12)            # config attitude
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "g.csv")
+            G.save_geometry(g, p)
+            with open(p) as fh:
+                self.assertIn("frame=enu", fh.readline())
+            g2 = G.load_geometry(p, cfg)
+        self.assertEqual(g2.frame, "enu")
+        np.testing.assert_allclose(g2.positions(), g.positions(), atol=1e-15)            # East-West kept
+        np.testing.assert_allclose(g2.boresight_enu(), g.boresight_enu(), atol=1e-12)
+        self.assertTrue(any("attitude" in w for w in G.csv_loss_warnings(g)))
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "bad.csv")
+            with open(p, "w") as fh:
+                fh.write("# frame=lla\nid,x_m,y_m,z_m\n0,0,0,0\n1,1,0,0\n")
+            with self.assertRaisesRegex(GeometryError, "frame"):
+                G.load_geometry(p)
 
 
 class TestFromConfig(unittest.TestCase):

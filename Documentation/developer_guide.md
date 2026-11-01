@@ -126,8 +126,6 @@ clean` after changing a block, then rebuild.
 
 ### PGO flow
 
-<!-- verify-after: WP-13 -->
-
 `benchmark_workload.sh` uses paths relative to `Firmware/`
 (`_testing/benchmark_results`, `../util/performance_monitor.py`). Run it from
 `Firmware/`, with the instrumented chain already running. The hint that `make
@@ -231,7 +229,7 @@ planned module up front. A registered module whose file does not exist yet is
 pending:
 
 ```text
-PEND  test_watchdog (not present yet)
+PEND  test_multi_instance (not present yet)
 ```
 
 The run summary counts the pending modules. The counts change as packages
@@ -241,7 +239,7 @@ A pending module does not count as a failure. `HEIMDALL_STRICT_MODULES=1`
 turns each pending module into a failure:
 
 ```text
-FAIL  test_watchdog (not present; HEIMDALL_STRICT_MODULES=1)
+FAIL  test_multi_instance (not present; HEIMDALL_STRICT_MODULES=1)
 ```
 
 | Variable | Values | Read by | Effect |
@@ -279,7 +277,7 @@ of `test_device_map`), `berkeleydb` (DB integration tests), `pyzmq` and
 | `test_frame_sizes` | the `frame_sizes.h` lockstep |
 | `test_capacity_model` | the capacity model |
 | `test_provisioning`, `test_set_unit_serials` | instance dirs, cluster config generator, serial tool |
-| `test_watchdog` | the systemd watchdog helper (pending, WP-16) <!-- verify-after: WP-16 --> |
+| `test_watchdog` | `util/heimdall_watchdog.py` against a fake status server, static checks of the systemd units, environment templates, udev rule and logrotate policy, the `install.sh` extras; `systemd-analyze verify` where available |
 | `test_iq_capture_format`, `test_iq_replay` | `.hcap` captures and replay (pending, WP-20) <!-- verify-after: WP-20 --> |
 
 Run `./unit_test.sh --list` for the current present/pending state.
@@ -301,7 +299,7 @@ start-script suites (`test_start_stop_legacy`, `test_multi_instance`,
 |---|---|---|
 | `test_rebuffer`, `test_decimator`, `test_delay_sync` | the stage pipelines | present |
 | `test_iq_server` | `iq_server.out` streaming | present |
-| `test_start_stop_legacy` | default-path start, re-run and stop identity | pending (WP-12) <!-- verify-after: WP-12 --> |
+| `test_start_stop_legacy` | default-path start, re-run and stop identity | present |
 | `test_multi_instance` | two synthetic instances on one host; `HEIMDALL_SOAK_SEC` sets the soak length | pending (WP-17b) <!-- verify-after: WP-17b --> |
 | `test_synthetic_chain` | one synthetic instance reaches lock; wire recal | pending (WP-17b) <!-- verify-after: WP-17b --> |
 | `test_bit_identity` | opt-in throughput levers produce identical output | pending (WP-17b) <!-- verify-after: WP-17b --> |
@@ -603,22 +601,45 @@ Every new behaviour must be dark by default. Use this checklist:
 
 ## Packaging
 
-<!-- verify-after: WP-16 -->
-
 - `pyproject.toml` installs only `util/heimdall_ctl` (packages `heimdall_ctl`
   and `heimdall_ctl.client`) with the `heimdall-ctl` console script.
   `Firmware/_daq_core` is intentionally not packaged. Extras: `[db]` =
   berkeleydb, `[rf]` = scikit-rf, `[dev]` = pytest. The in-tree launcher is
   `util/bin/heimdall-ctl`.
-- `packaging/systemd/` holds `heimdall-daq.service` (single instance, oneshot
-  with `RemainAfterExit`, wraps `daq_start_sm.sh`/`daq_stop.sh`) and the
-  per-instance template `heimdall-daq@.service`. The units grant
-  `LimitRTPRIO=99` and `LimitMEMLOCK=infinity` and set no `CPUAffinity`. The
-  tiered SCHED_FIFO priorities and affinity stay in the start script. See
+- `packaging/systemd/` holds these units. See
   [packaging/systemd/README.md](../packaging/systemd/README.md) for the
-  `/opt/heimdall` layout.
-- `packaging/logrotate/heimdall` rotates `_logs/*.log` and `_logs/inst*/*.log`
-  with `copytruncate`, because the processes keep their stderr fds open.
+  `/opt/heimdall` layout, the supervision modes and the install steps.
+
+  | Unit | Type | Runs |
+  |---|---|---|
+  | `heimdall-daq.service` | oneshot, `RemainAfterExit` | instance 0: `daq_start_sm.sh`, stopped with `daq_stop.sh 0` |
+  | `heimdall-daq@.service` | oneshot template | instance `%i` from `/opt/heimdall/instances/%i`, stopped with `daq_stop.sh %i` |
+  | `heimdall-daq-supervised.service` | simple, `Restart=on-failure` | instance 0 under `daq_supervise.sh --instance 0 --healthcheck auto` |
+  | `heimdall-daq-supervised@.service` | simple template | instance `%i` under `daq_supervise.sh` |
+  | `heimdall-daq-watchdog.service` + `.timer` | oneshot, timer every 30 s (first run 120 s after boot) | `util/heimdall_watchdog.py --run-dir /run/heimdall --fails 3`; optional, not enabled by the installer |
+  | `heimdall-host-tuning.service` | oneshot | `util/host_tuning.sh --apply` |
+  | `heimdall-coordinator.service` | simple, `Restart=always` | `federation_start.sh coordinator --foreground` |
+  | `heimdall-iq-router.service` | simple, `Restart=always` | `federation_start.sh router --foreground` |
+
+  The oneshot and supervised unit of one instance conflict, so enable only one
+  per instance. The DAQ units grant `LimitRTPRIO=99` and
+  `LimitMEMLOCK=infinity` and set no `CPUAffinity`. The tiered SCHED_FIFO
+  priorities and affinity stay in the start script.
+- `packaging/default/` holds the `EnvironmentFile` templates:
+  `heimdall-daq` (installed as `/etc/default/heimdall-daq`, read by the DAQ and
+  watchdog units; per-instance overrides go to `/etc/default/heimdall-daq@<N>`)
+  and `heimdall-federation` (`/etc/default/heimdall-federation`, read by the
+  coordinator and IQ router units). systemd reads `KEY=VALUE` lines only.
+- `packaging/udev/99-heimdall-rtlsdr.rules` is optional. It gives the
+  `plugdev` group read/write access to RTL2832U receivers (`0bda:2838`) for
+  tools such as `rtl_test`. The chain runs as root and does not need it.
+  `util/install.sh --extras-only --udev` installs it.
+- `packaging/logrotate/heimdall` rotates, under `/opt/heimdall`,
+  `Firmware/_logs/*.log`, `Firmware/_logs/inst*/*.log`, the same two globs
+  under `instances/*/Firmware/_logs/`, and `Firmware/_logs/federation/*.log`,
+  plus `/var/log/heimdall/*.log` (coordinator and IQ router). It uses
+  `copytruncate`, because the processes keep their log fds open. It does not
+  touch the per-run `archive/` directories the start scripts keep.
 
 ## Extending the abstractions
 
@@ -697,7 +718,7 @@ Every new behaviour must be dark by default. Use this checklist:
   elsewhere.
 - **Frame sizes.** `frame_sizes.h` is the one C definition of the shm segment
   sizes. `capacity_model.frame_sizes` mirrors it key for key, and
-  `test_frame_sizes` cross-checks both. <!-- verify-after: WP-13 -->
+  `test_frame_sizes` cross-checks both.
 - **`daq_block_index`** is the rtl_daq block counter. It rises by exactly 1
   per rtl_daq block, so it is continuous only on the rtl_daq -> rebuffer hop.
   Each later frame carries the index of the last block it contains. DATA

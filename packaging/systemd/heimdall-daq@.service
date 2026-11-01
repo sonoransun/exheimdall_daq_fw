@@ -1,25 +1,34 @@
-# HeIMDALL DAQ chain - per-federation-instance template unit (optional).
+# HeIMDALL DAQ chain - per-federation-instance template unit, oneshot.
 #
 #   systemctl start heimdall-daq@1     # starts the instance in
 #                                      # /opt/heimdall/instances/1/Firmware
 #
 # IMPORTANT: daq_start_sm.sh reads the instance id from daq_chain_config.ini
 # ([federation] instance_id), NOT from the command line. Each instance
-# therefore needs its own working copy (or at minimum its own Firmware/
-# directory with its own daq_chain_config.ini where instance_id = %i).
+# therefore needs its own instance directory with its own
+# daq_chain_config.ini where instance_id = %i - create it with
+#   sudo python3 /opt/heimdall/util/provision_instance.py --instance %i --write
 # See packaging/systemd/README.md for the expected layout.
 #
 # Stopping uses the per-instance PID files: daq_stop.sh %i.
+# heimdall-daq-supervised@.service is the supervised alternative; the two
+# conflict per instance, enable only one of them.
 
 [Unit]
 Description=HeIMDALL DAQ coherent acquisition chain (instance %i)
 After=network.target
 Documentation=https://github.com/krakenrf/heimdall_daq_fw
+Conflicts=heimdall-daq-supervised@%i.service
+ConditionPathExists=/opt/heimdall/instances/%i/Firmware/daq_chain_config.ini
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/heimdall/instances/%i/Firmware
+# Host-wide settings, then per-instance overrides; both optional
+EnvironmentFile=-/etc/default/heimdall-daq
+EnvironmentFile=-/etc/default/heimdall-daq@%i
+Environment=HEIMDALL_LAUNCHER=systemd-oneshot
 ExecStart=/opt/heimdall/instances/%i/Firmware/daq_start_sm.sh
 ExecStop=/opt/heimdall/instances/%i/Firmware/daq_stop.sh %i
 User=root

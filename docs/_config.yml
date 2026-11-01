@@ -10,23 +10,17 @@ description: >-
   RTL-SDR tuners on one clock, calibrated into a single phase-coherent receiver.
 as_of: "2026-11-01"
 
-# baseurl: left unset (YAML null) on purpose. On GitHub Pages the
-# jekyll-github-metadata plugin then fills it in: "/<repo>" for a project site
-# (https://<owner>.github.io/<repo>/), "" for a user site or a custom domain.
-# An explicit empty string ("") switches that detection off and breaks every
-# link on a project site, so do not write baseurl: "".
-# Override it only when the detection is wrong, for example:
-#   baseurl: "/exheimdall"
-# For a local preview of a project site, pass --baseurl /exheimdall to jekyll.
-# Every link and asset goes through the relative_url filter.
-baseurl:
+# Published at https://sonoransun.github.io/exheimdall_daq_fw/ (project site).
+# url + baseurl are set explicitly so links are right in local builds too;
+# every link and asset goes through the relative_url / absolute_url filters.
+# For a fork or a custom domain, change both (custom domain: baseurl: "").
+url: "https://sonoransun.github.io"
+baseurl: "/exheimdall_daq_fw"
 
 # repo_url: base URL of the source repository, used for the footer and for
 # links that point outside Documentation/ (for example ../CHANGELOG.md in a
 # guide page). Empty means those links render as plain code text.
-# Set it before publishing, for example:
-#   repo_url: "https://github.com/<owner>/exheimdall"
-repo_url: ""
+repo_url: "https://github.com/sonoransun/exheimdall_daq_fw"
 repo_branch: main
 
 markdown: kramdown

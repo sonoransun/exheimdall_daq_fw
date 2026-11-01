@@ -86,7 +86,7 @@ typedef struct
     int corr_size;                 /* [calibration], for size_segments_from_config */
     int size_segments_from_config; /* [pre_processing], 0 = map the worst case */
     int iq_server_max_clients;     /* [data_interface], 1 = legacy single-client loop */
-    int iq_server_frame_deadline_ms; /* [data_interface], 0 = auto (0.8 x frame period) */
+    int iq_server_frame_deadline_ms; /* [data_interface], 0 = auto (1.0 x frame period) */
     int decimation_ratio;          /* [pre_processing], auto deadline only */
     double sample_rate;            /* [daq], auto deadline only */
 } configuration;
@@ -529,8 +529,10 @@ static void multi_dispatch_frame(struct iq_multi_server* srv,
 }
 
 /* Frame deadline: explicit [data_interface] iq_server_frame_deadline_ms, or
- * 0.8 x the frame period cpi_size * decimation_ratio / sample_rate (floored
- * at IQ_MULTI_MIN_AUTO_DEADLINE_MS). Without a sample rate the single-client
+ * 1.0 x the frame period cpi_size * decimation_ratio / sample_rate (floored
+ * at IQ_MULTI_MIN_AUTO_DEADLINE_MS): a client that keeps up with the stream
+ * rate stays connected (at defaults the frame period is ~437 ms, which a
+ * GbE client can meet; a sub-period factor would drop every GbE client). Without a sample rate the single-client
  * per-frame send bound (SEND_FRAME_DEADLINE_S) is used. */
 static long multi_frame_deadline_ms(const configuration* config)
 {
@@ -540,7 +542,7 @@ static long multi_frame_deadline_ms(const configuration* config)
         return SEND_FRAME_DEADLINE_S * 1000L;
     int dec = (config->decimation_ratio > 0) ? config->decimation_ratio : 1;
     double period_ms = (double)config->cpi_size * (double)dec * 1000.0 / config->sample_rate;
-    long ms = (long)(0.8 * period_ms);
+    long ms = (long)period_ms;
     return (ms < IQ_MULTI_MIN_AUTO_DEADLINE_MS) ? IQ_MULTI_MIN_AUTO_DEADLINE_MS : ms;
 }
 

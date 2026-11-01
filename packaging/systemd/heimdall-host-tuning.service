@@ -1,0 +1,26 @@
+# HeIMDALL host-global tuning, once per boot (util/host_tuning.sh --apply):
+# kernel.sched_rt_runtime_us = -1, USB IRQ affinity (irq_tuning.sh),
+# usbfs_memory_mb = 0, drop_caches = 3 - the commands daq_start_sm.sh runs
+# on every start by default.
+#
+#   sudo systemctl enable --now heimdall-host-tuning
+#
+# Instances provisioned with "provision_instance.py --systemd" set
+# [host] host_tuning = 0 and rely on this unit; [host] host_tuning = auto
+# skips the per-start tuning while this unit is active. Check the result
+# with: sudo /opt/heimdall/util/host_tuning.sh --check
+
+[Unit]
+Description=HeIMDALL DAQ host tuning (RT throttling, USB IRQs, usbfs)
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+After=systemd-sysctl.service systemd-udevd.service
+Before=heimdall-daq.service heimdall-daq-supervised.service
+ConditionPathExists=/opt/heimdall/util/host_tuning.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/heimdall/util/host_tuning.sh --apply
+
+[Install]
+WantedBy=multi-user.target

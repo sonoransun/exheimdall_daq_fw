@@ -27,10 +27,6 @@ Related documents:
 - [theory_coherent_acquisition.md](theory_coherent_acquisition.html)
   explains the calibration that this hardware feeds.
 
-Some tools named here are still being implemented. Sections that describe
-them follow the design specification and carry a `verify-after` marker in
-the source of this page.
-
 ## 1. Receivers and serial numbers
 
 rtl_daq finds each channel by the EEPROM serial number of its RTL-SDR
@@ -99,9 +95,6 @@ ERROR:root:[daq] ctr_channel_serial_no 1000 is not one of the configured serials
 
 ### Diagnostic: read the serials that are attached {#diagnostic-read-the-serials-that-are-attached}
 
-{% include verify_note.html wp="WP-12" block=true %}
-
-
 Use one of these with the chain stopped.
 
 1. Hardware-mode validation. It runs `lsusb` and `rtl_eeprom -d <i>`:
@@ -164,7 +157,6 @@ Use one of these with the chain stopped.
 
    Section 3 shows its messages.
 
-
    The registry comparison sees only instances started with the opt-in
    `[host] instance_registry = 1` (default `0`). An instance started
    without it is not registered, so the check cannot report it.
@@ -191,13 +183,8 @@ channel.
 
 ### 2.2 `util/set_unit_serials.sh` (KrakenSDR, multi-unit)
 
-{% include verify_note.html wp="WP-14" block=true %}
-
-
-
-This tool is new in this release and still in review. It renumbers one
-unit to the multi-unit convention `1000 + 100*K + i`. Run
-`util/set_unit_serials.sh --help` to confirm that your tree has it.
+This tool renumbers one unit to the multi-unit convention
+`1000 + 100*K + i`. `util/set_unit_serials.sh --help` prints its usage.
 
 ```
 sudo util/set_unit_serials.sh --list
@@ -333,9 +320,6 @@ host.
 
 ### 3.2 What the checks report
 
-{% include verify_note.html wp="WP-12" block=true %}
-
-
 With serial keys set, problems block start. Without them, rtl_daq keeps its
 old first-match behaviour and the checks only warn.
 
@@ -347,7 +331,6 @@ old first-match behaviour and the checks only warn.
 | Same serial on two devices (two factory units) | `ini_checker.py ... attached`; rtl_daq before opening | error; rtl_daq fatal | `WARNING:` line; rtl_daq `log_warn`, opens the first match |
 | Serial used by another live registered instance (only instances started with `[host] instance_registry = 1`) | `ini_checker.py ... attached` | error | `WARNING:` line |
 | No sysfs (macOS, containers) | `ini_checker.py ... attached` | one `WARNING:` line | silent |
-
 
 Only instances started with `[host] instance_registry = 1` are
 registered. The default is `0`, so by default the registry row never
@@ -384,21 +367,16 @@ serial 1000 is present on 2 devices; program distinct serials with util/set_unit
 This line is fatal with serial keys. Without them it is a `log_warn`,
 visible only at `log_level` 3 or lower.
 
-
 `daq_start_sm.sh` runs `python3 ini_checker.py no_hw attached`, so these
 errors block a hardware start. `daq_synthetic_start.sh` runs `no_hw` only.
 
 ### 3.3 CPU cores per unit
-
-{% include verify_note.html wp="WP-12" block=true %}
-
 
 Each hardware instance runs four real-time tiers on four cores. By default
 `daq_start_sm.sh` places instance N on cores `(N*4 + k) % nproc` for
 k = 0..3. It prints a `WARN:` line when instances must share cores. A
 4-core Raspberry Pi therefore runs one hardware instance. An 8-core host
 runs two.
-
 
 The optional `[host]` section sets the layout per instance:
 `cpu_cores = c0,c1,c2,c3` (rtl_daq, rebuffer+decimate,
@@ -438,7 +416,7 @@ Rules for a large array in one instance:
 
 ## 5. USB topology and bandwidth
 
-{% include verify_note.html wp="WP-13" block=true %}
+{% include verify_note.html wp="WP-20/17b" block=true %}
 
 
 Every tuner streams 8-bit I and Q, so one instance moves
@@ -455,14 +433,17 @@ A KrakenSDR connects its five tuners through one USB 2.0 link, so they
 share one high-speed (480 Mbit/s) bus. Plan for one 5-channel unit at
 2.4 MS/s per high-speed bus.
 
-
-The design's capacity model uses a default budget of 35 MB/s per
-high-speed bus. At defaults one unit uses 69 % of it, and two units on one
+The capacity model (`_daq_core/capacity_model.py`) uses a default budget
+of 35 MB/s per high-speed bus (`daq_preflight.py --usb-budget` overrides
+it). At defaults one unit uses 69 % of it, and two units on one
 bus exceed it. The pre-flight tool (`daq_preflight.py`, also
 `heimdall-ctl capacity`) reports this per bus as `usb_bus:<n>` with a
-verdict of `ok`, `warn`, `fail` or `skip` (not probed). Measured per-host throughput rows are
-TBD until the CI `pipeline` job has produced a `throughput.json`. See
+verdict of `ok`, `warn`, `fail` or `skip` (not probed). See
 [capacity_planning.md](capacity_planning.html).
+
+
+Measured per-host throughput rows are TBD until the CI `pipeline` job has
+produced a `throughput.json`.
 
 ### Finding the bus of each unit {#finding-the-bus-of-each-unit}
 
@@ -878,17 +859,14 @@ with `pigpio init failed`. This applies to:
 
 ### udev rule {#udev-rule}
 
-{% include verify_note.html wp="WP-16" block=true %}
-
-
 The chain runs as root through `sudo`, so it does not need a udev rule. The
 rule lets a normal user run `rtl_eeprom`, `rtl_test` and the hardware-mode
 `ini_checker.py`.
 
-
-The design adds an optional rule file
-`packaging/udev/99-heimdall-rtlsdr.rules`, installed by
-`util/install.sh --udev`:
+The optional rule file `packaging/udev/99-heimdall-rtlsdr.rules` ships in
+the tree. Install it with `sudo util/install.sh --extras-only --udev`
+(or add `--udev` to a full install), which copies it to
+`/etc/udev/rules.d/` and reloads udev:
 
 ```
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0664"

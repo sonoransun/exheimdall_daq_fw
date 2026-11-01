@@ -1,0 +1,42 @@
+# HeIMDALL federation coordinator (federation_coordinator.py, port 6000).
+#
+#   sudo util/install.sh --extras-only --federation-user   # creates "heimdall"
+#   sudo install -d -m 0755 /etc/heimdall
+#   sudo install -m 0640 -o root -g heimdall federation.ini /etc/heimdall/federation.ini
+#   (0640 root:heimdall: the service user reads the [federation] auth_token,
+#   other local users cannot)
+#   sudo systemctl enable --now heimdall-coordinator
+#
+# Runs unprivileged (no RT priority, no CPU pinning, unprivileged ports).
+# systemd creates and owns the directories for the service user:
+#   /var/lib/heimdall/coordinator  election state (term file; a coordinator
+#                                  that cannot write it never claims leadership)
+#   /var/log/heimdall              coordinator.log
+#   /run/heimdall-federation       coordinator.pid (kept across restarts, shared
+#                                  with heimdall-iq-router.service)
+# Overrides (PATH, HEIMDALL_FED_*): /etc/default/heimdall-federation.
+
+[Unit]
+Description=HeIMDALL federation coordinator
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/heimdall/federation.ini
+
+[Service]
+Type=simple
+# Any unprivileged user works; util/install.sh --federation-user creates "heimdall".
+User=heimdall
+Group=heimdall
+WorkingDirectory=/opt/heimdall/Firmware
+StateDirectory=heimdall/coordinator
+LogsDirectory=heimdall
+RuntimeDirectory=heimdall-federation
+RuntimeDirectoryPreserve=yes
+EnvironmentFile=-/etc/default/heimdall-federation
+ExecStart=/opt/heimdall/Firmware/federation_start.sh coordinator --foreground --config /etc/heimdall/federation.ini --state-dir /var/lib/heimdall/coordinator --log-dir /var/log/heimdall --pid-dir /run/heimdall-federation
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -25,7 +25,11 @@
 # lint inputs (and optional targets with no Makefile rule) still print SKIP.
 # Set it to 1 once every work package has merged. Without it the changed-file rule applies: on a pull
 # request a finding is fatal when its file is in
-# `git diff --name-only origin/<base>...HEAD`, otherwise it is report-only.
+# `git diff --name-only origin/<base>...HEAD`; on a push to main/master the
+# same rule runs against the pushed range (CI_BASE_SHA = github.event.before,
+# fail-closed when that commit is unknown); on schedule / workflow_dispatch it
+# is report-only. Non-fatal findings are still emitted as ::warning::
+# annotations so regressions that reach main stay visible.
 # LIBRTLSDR_REF / KFR_REF can likewise be overridden by repository variables
 # (a branch, tag or commit sha); the defaults are master / 7.1.0.
 #
@@ -91,8 +95,10 @@ jobs:
 
       - name: Build (${{ matrix.lane }} lane)
         env:
-          # changed-file rule for the optional targets (empty on push)
+          # changed-file rule for the optional targets: PR base branch, or
+          # the pre-push commit on push (both empty on schedule/dispatch)
           CI_BASE_REF: ${{ github.base_ref }}
+          CI_BASE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
         run: ./ci/build.sh ${{ matrix.lane }}
 
       - name: Show binaries
@@ -263,7 +269,9 @@ jobs:
 
   deploy-lint:
     name: Deploy lint (scripts, units, configs)
-    runs-on: ubuntu-latest
+    # pinned: `udevadm verify` needs systemd >= 254 (24.04 ships 255); older
+    # images make build.sh print SKIP and the udev rules go unchecked
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -291,5 +299,6 @@ jobs:
       - name: Deploy lint
         env:
           CI_BASE_REF: ${{ github.base_ref }}
+          CI_BASE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
           PYTHON: python
         run: ./ci/build.sh deploy-lint

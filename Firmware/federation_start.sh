@@ -76,6 +76,7 @@ if [ -z "$CONFIG" ]; then
 fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=daq_common.sh
 . "$HERE/daq_common.sh"
 

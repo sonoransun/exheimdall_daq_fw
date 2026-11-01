@@ -28,10 +28,12 @@ An instance is one complete pipeline with its own receivers. Its channels share 
 <tr><td>Complex-float egress</td><td class="num">96&nbsp;MB/s (768&nbsp;Mbit/s)</td></tr>
 <tr><td>One frame on the wire, with header</td><td class="num">41,944,064&nbsp;B</td></tr>
 <tr><td>Resident shared memory</td><td class="num">180&nbsp;MiB</td></tr>
-<tr><td>Private memory of the C stages</td><td class="num">about 85&nbsp;MiB</td></tr>
+<tr><td>Private memory of the C stages</td><td class="num">about 81&nbsp;MiB</td></tr>
 <tr><td>Pinned cores</td><td class="num">4</td></tr>
 </tbody>
 </table>
+
+The C stages' private memory is the `rtl_daq` ring (20&nbsp;MiB), the usbfs transfers (30&nbsp;MiB), the `rebuffer` ring (15&nbsp;MiB) and the `decimate.out` FIR work buffers (16&nbsp;MiB); see [capacity planning, section 2.2]({{ '/guide/capacity_planning.html#22-formulas' | relative_url }}).
 
 </div>
 <figure class="figure-card figure-scroll" tabindex="0" aria-label="Cluster diagram">
@@ -95,7 +97,7 @@ The **IQ router** will read the instances' `:5000` streams as an ordinary client
 | Cross-package integration tests | WP-17b | {% include badge.html wp="WP-17b" %} |
 
 <div class="callout risk" markdown="1">
-**A known limit before WP-04 closes.** The multi-client `iq_server` waits for every client for at most 0.8 of a frame period by default, which is 349.5&nbsp;ms. Delivering a 40&nbsp;MiB frame in that time needs 120&nbsp;MB/s, slightly more than the 117.7&nbsp;MB/s that Gigabit Ethernet carries as TCP goodput. As specified, a GbE client would miss the deadline on every frame. The factor or its basis is being revisited.
+**A known limit of WP-04.** The multi-client `iq_server` waits for every client for at most 0.8 of a frame period by default, which is 349.5&nbsp;ms. Delivering a 40&nbsp;MiB frame in that time needs 120&nbsp;MB/s, slightly more than the 117.7&nbsp;MB/s that Gigabit Ethernet carries as TCP goodput. As shipped, a GbE client misses the deadline on every frame; set `iq_server_frame_deadline_ms` explicitly when clients sit behind Gigabit Ethernet. The factor or its basis is being revisited.
 </div>
 
 ## Read further

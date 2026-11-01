@@ -26,10 +26,9 @@ frames and the 1024-byte header are unchanged. The few deliberate exceptions
 are listed in the ledger in [upgrade_and_rollback.md](upgrade_and_rollback.md).
 This document marks each opt-in feature with the key or flag that enables it.
 
-**Packages still being implemented.** Two sections follow the design
-specification, not the code in this tree: the planned systemd units in
-[Supervision and systemd](#supervision-and-systemd) and
-[Recording and replay](#recording-and-replay). Each carries a visible
+**Packages still being implemented.** One section follows the design
+specification, not the code in this tree:
+[Recording and replay](#recording-and-replay). It carries a visible
 **Planned** note. Everything else describes the code in this tree.
 
 ## Process pipeline
@@ -670,19 +669,24 @@ cd <root>/instances/<N>/Firmware && sudo ./daq_start_sm.sh
 - Exit 2 also covers usage errors and misconfiguration (a bad flag value, an
   `--instance` mismatch, `--healthcheck on` with the status server off).
 
-<!-- verify-after: WP-16 -->
-**Planned, not yet in the tree.** `packaging/systemd/` holds only
-`heimdall-daq.service` and `heimdall-daq@.service` today. The design adds the
-units below; they are not shipped yet.
+`packaging/systemd/` ships these units:
 
-The planned set: `heimdall-daq-supervised@.service` (one supervised
-instance N > 0, `Restart=on-failure`, `ExecStopPost=daq_stop.sh %i --clean`),
-`heimdall-daq-supervised.service` (the same for instance 0, run from
-`<root>/Firmware`, conflicting with `heimdall-daq.service`),
-`heimdall-coordinator.service`, `heimdall-iq-router.service`,
-`heimdall-host-tuning.service` (oneshot) and `heimdall-daq-watchdog.service`. The existing `heimdall-daq.service` and
-`heimdall-daq@.service` stay oneshot units. See
-[packaging/systemd/README.md](../packaging/systemd/README.md).
+| Unit | What it runs |
+|---|---|
+| `heimdall-daq.service` | instance 0, oneshot (`daq_start_sm.sh`) |
+| `heimdall-daq@.service` | instance N > 0, oneshot (template) |
+| `heimdall-daq-supervised.service` | instance 0, supervised: `daq_supervise.sh --instance 0`, run from `<root>/Firmware`, `Restart=on-failure`, `ExecStopPost=daq_stop.sh 0 --clean` |
+| `heimdall-daq-supervised@.service` | instance N > 0, supervised (template): `daq_supervise.sh --instance %i`, `Restart=on-failure`, `ExecStopPost=daq_stop.sh %i --clean` |
+| `heimdall-coordinator.service` | federation coordinator (`federation_start.sh coordinator --foreground`) |
+| `heimdall-iq-router.service` | federation IQ router (`federation_start.sh router --foreground`) |
+| `heimdall-host-tuning.service` | host tuning, oneshot (`util/host_tuning.sh --apply`) |
+| `heimdall-daq-watchdog.service` + `heimdall-daq-watchdog.timer` | optional watchdog (`util/heimdall_watchdog.py`), run every 30 s by the timer, that restarts a supervised chain whose status server keeps reporting a failure |
+
+The oneshot and supervised units of one instance conflict, so starting one
+stops the other. `heimdall-daq.service` and `heimdall-daq@.service` are still
+oneshot units. See
+[packaging/systemd/README.md](../packaging/systemd/README.md) for deployment
+and for choosing a supervision mode.
 
 ## Federation components
 

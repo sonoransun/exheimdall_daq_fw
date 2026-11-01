@@ -60,7 +60,7 @@ Beside the data path, `hw_controller` runs the calibration loop. Every 687 frame
 
 ## What the scaling program adds
 
-6 of 19 packages are done; the line under each card shows the state of the packages it depends on.
+17 of 19 packages are done; the line under each card shows the state of the packages it depends on.
 
 The chain was built for one KrakenSDR on one computer. The scaling work lets it grow without changing what an existing station sees: every new feature sits behind a key or a flag that is off by default.
 
@@ -73,17 +73,17 @@ The chain was built for one KrakenSDR on one computer. The scaling work lets it 
   </article>
   <article class="card card-accent">
     <h3>Clustering across hosts</h3>
-    <p>A coordinator on port 6000 is designed to poll every member's status and fan commands out in parallel, with leases, fencing and a master schedule. An IQ router will merge many streams into one multi-client output.</p>
+    <p>A coordinator on port 6000 polls every member's status and fans commands out in parallel, with leases, fencing and a master schedule. An IQ router merges many streams into one multi-client output.</p>
     <div class="card-foot">{% include pkg_summary.html wps="WP-02,WP-08,WP-09,WP-15" %}</div>
   </article>
   <article class="card card-accent">
     <h3>Observability</h3>
-    <p>Opt-in header slots 103 to 113 for router sequence and receive time, source and node identity, decimator drops, and calibration quality and counters: defined now, stamped once the stages land. Then extended status with staleness, and acknowledged control.</p>
+    <p>Opt-in header slots 103 to 113 for router sequence and receive time, source and node identity, decimator drops, and calibration quality and counters, stamped by the stages that own them. Extended status with staleness, and acknowledged control.</p>
     <div class="card-foot">{% include pkg_summary.html wps="WP-01,WP-05,WP-04,WP-06,WP-09" %}</div>
   </article>
   <article class="card card-accent">
     <h3>Operations</h3>
-    <p>Configuration checks that catch port and serial collisions, now in review. To follow: a capacity pre-flight, provisioning of instance directories, supervised systemd units, and recording and replay.</p>
+    <p>Configuration checks that catch port and serial collisions, a capacity pre-flight, provisioning of instance directories and supervised systemd units. Recording and replay is still being implemented.</p>
     <div class="card-foot">{% include pkg_summary.html wps="WP-11,WP-13,WP-14,WP-16,WP-20" %}</div>
   </article>
   <article class="card card-warm card-wide">
@@ -97,7 +97,7 @@ The chain was built for one KrakenSDR on one computer. The scaling work lets it 
 {% include status_legend.html compact=true %}
 
 <div class="callout">
-<p><strong>Nothing changes until you ask.</strong> With every new key absent, the default 1024-byte header is byte-identical to the pre-program baseline (same SHA-1), and the seed-0 synthetic stream produces the same payloads (same SHA-256). The generic, KFR and ASan build lanes compile with zero warnings. Verified on 2026-11-01, before WP-04 and WP-06 land; to be re-checked when they close.</p>
+<p><strong>Nothing changes until you ask.</strong> With every new key absent, the default 1024-byte header is byte-identical to the pre-program baseline (same SHA-1), and the seed-0 synthetic stream produces the same payloads (same SHA-256). The generic, KFR and ASan build lanes compile with zero warnings. Re-checked on 2026-11-01 after WP-04 and WP-06 landed; to be re-checked when WP-20 closes.</p>
 </div>
 
 ## Where it stands
@@ -115,7 +115,7 @@ A verification pass checked 184 claims made by the design, the package reports a
   <li><i style="background:var(--planned)"></i>6 unverifiable</li>
 </ul>
 
-Of the 19 work packages, six are done, three are in review, seven are being implemented and three have not started. The hardware-free suite now registers 35 modules, up from 15; in the review snapshot 25 of the 27 then present passed, and the rest wait on packages still to land. One reviewed package has a two-line test defect that keeps the hardware-free suite red; see [Status]({{ '/status.html' | relative_url }}).
+Of the 19 work packages, seventeen are done and two (WP-17b, WP-20) are being implemented. The hardware-free suite now registers 35 modules, up from 15; all 35 are present and all 35 pass in a fresh run on 2026-11-01. The WP-10 test defect found in review is fixed; see [Status]({{ '/status.html' | relative_url }}).
 
 </div>
 <ul class="lib-list next-steps">

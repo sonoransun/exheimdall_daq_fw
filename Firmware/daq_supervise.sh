@@ -88,6 +88,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f ./daq_common.sh ] || die_usage "./daq_common.sh not found (run from the Firmware directory)"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=daq_common.sh
 . ./daq_common.sh
 
@@ -204,9 +205,11 @@ on_signal() {
 trap on_signal TERM INT
 
 # Stages to supervise: the PID files the start script wrote, in pipeline
-# order. A downstream stage dies right after its upstream one (EOF on its
-# input), so the first dead stage of a check is the most upstream one and
-# names the stage that failed.
+# order. A failure cascades both ways within milliseconds (a downstream
+# stage sees EOF on its input, an upstream one loses its consumer or gets a
+# broken pipe), so the stage that failed is the one that exited first. A
+# stage watcher (below) is woken by the kernel at each exit and records the
+# first one; pipeline order only breaks a tie within one wakeup.
 PID_DIR="_logs/inst${N}/pids"
 STAGE_ORDER="rtl_daq synthesizer rebuffer decimate delay_sync hw_controller iq_server"
 for f in "$PID_DIR"/*.pid; do
@@ -286,18 +289,126 @@ monotonic() {
     python3 -I -c 'import time; print(int(time.monotonic()))'
 }
 
-# first_dead_stage: print the index of the most upstream dead stage and
-# return 1; return 0 when every stage is alive.
-first_dead_stage() {
+TICK=0.2
+TICKS_PER_INTERVAL=$((INTERVAL * 5))
+
+# stage_watch ROLE PID...: print the index of the first stage that exits
+# and return. Linux >= 5.3: one pidfd per stage, woken by the kernel at the
+# exit (a zombie has exited). Elsewhere, or when pidfd_open is refused:
+# polls every 20 ms (kill -0; on Linux also the /proc state). Gives up
+# silently when its parent, the supervisor, is gone.
+stage_watch() {
+    python3 -I -c '
+import os, select, sys, time
+args = sys.argv[1:]
+pids = [int(p) for p in args[1::2]]
+parent = os.getppid()
+
+def done(i):
+    print(i, flush=True)
+    sys.exit(0)
+
+def gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except FileNotFoundError:
+        return os.path.isdir("/proc/self")
+    except (OSError, IndexError):
+        return False
+
+fds = {}
+try:
+    for i, pid in enumerate(pids):
+        try:
+            fds[os.pidfd_open(pid)] = i
+        except ProcessLookupError:
+            done(i)
+except (AttributeError, OSError):
+    for fd in fds:
+        os.close(fd)
+    fds = {}
+if fds:
+    poller = select.poll()
+    for fd in fds:
+        poller.register(fd, select.POLLIN)
+    while os.getppid() == parent:
+        ready = poller.poll(1000)
+        if ready:
+            done(min(fds[fd] for fd, _ in ready))
+else:
+    while os.getppid() == parent:
+        for i, pid in enumerate(pids):
+            if gone(pid):
+                done(i)
+        time.sleep(0.02)
+sys.exit(1)
+' "$@"
+}
+
+# find_dead: set DEAD to the index of the most upstream stage that fails the
+# role check (hd_pid_role_alive: exited, a zombie, or a reused pid), or to
+# "" when every stage is alive. The per-interval safety net of the watcher.
+find_dead() {
     local i
+    DEAD=""
     for i in "${!roles[@]}"; do
-        if ! hd_pid_role_alive "${pids[$i]}" "${roles[$i]}"; then
-            printf '%s\n' "$i"
-            return 1
-        fi
+        hd_pid_role_alive "${pids[$i]}" "${roles[$i]}" && continue
+        DEAD="$i"
+        return 0
     done
     return 0
 }
+
+report_dead() {
+    log "stage ${roles[$DEAD]} (pid ${pids[$DEAD]}) died"
+    stop_instance
+    exit "$(exit_code_of "${roles[$DEAD]}")"
+}
+
+# check_watch: report the watcher's verdict once it has one; when the
+# watcher is gone without one, fall back to the per-interval check.
+check_watch() {
+    if [ -s "$WATCH_OUT" ]; then
+        read -r DEAD < "$WATCH_OUT" || true
+        case "$DEAD" in
+            ''|*[!0-9]*) ;;
+            *) [ "$DEAD" -lt "${#roles[@]}" ] && report_dead ;;
+        esac
+        log "WARN: stage watcher gave an invalid verdict '$DEAD'; dead stages are checked every ${INTERVAL} s"
+        : > "$WATCH_OUT"
+        WATCH_PID=""
+    elif [ -n "$WATCH_PID" ] && ! kill -0 "$WATCH_PID" 2>/dev/null && [ ! -s "$WATCH_OUT" ]; then
+        log "WARN: stage watcher exited; dead stages are checked every ${INTERVAL} s"
+        WATCH_PID=""
+    fi
+}
+
+# Scratch files: the watcher's verdict and the STATUS probe's reply (the
+# probe takes up to a few seconds against a hung server, so it runs in the
+# background as well).
+SUP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/daq_supervise.XXXXXX") || {
+    log "cannot create a temporary directory - stopping instance $N"
+    stop_instance
+    exit 1
+}
+WATCH_OUT="$SUP_TMP/dead_stage"
+PROBE_OUT="$SUP_TMP/status"
+: > "$WATCH_OUT"
+WATCH_PID=""
+trap '[ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null; rm -rf "$SUP_TMP"' EXIT
+watch_args=()
+for i in "${!roles[@]}"; do
+    watch_args+=("${roles[$i]}" "${pids[$i]}")
+done
+stage_watch "${watch_args[@]}" > "$WATCH_OUT" 2>/dev/null &
+WATCH_PID=$!
 
 T0=$(monotonic)
 fails=0
@@ -305,18 +416,43 @@ last_fc=""
 last_change=""
 warned_no_fc=0
 while :; do
-    if ! first_dead=$(first_dead_stage); then
-        # Rescan: an upstream stage checked as alive above may have died
-        # (taking this one with it) while the scan ran.
-        first_dead=$(first_dead_stage) || true
-        i="$first_dead"
-        log "stage ${roles[$i]} (pid ${pids[$i]}) died"
-        stop_instance
-        exit "$(exit_code_of "${roles[$i]}")"
+    check_watch
+    find_dead
+    if [ -n "$DEAD" ]; then
+        # The watcher has the exit order: give it a moment to report
+        full_dead="$DEAD"
+        tick=0
+        while [ -n "$WATCH_PID" ] && [ "$tick" -lt 5 ]; do
+            sleep "$TICK" &
+            wait $!
+            check_watch
+            tick=$((tick + 1))
+        done
+        DEAD="$full_dead"
+        report_dead
     fi
+    probe_pid=""
     if [ "$HEALTHCHECK" = on ]; then
-        read -r state fc health has_age now reason <<< "$(status_probe)"
-        if [ "$now" = 0 ]; then
+        : > "$PROBE_OUT"
+        status_probe > "$PROBE_OUT" &
+        probe_pid=$!
+    fi
+    tick=0
+    while [ "$tick" -lt "$TICKS_PER_INTERVAL" ] ||
+          { [ -n "$probe_pid" ] && [ ! -s "$PROBE_OUT" ] && kill -0 "$probe_pid" 2>/dev/null; }; do
+        sleep "$TICK" &
+        wait $!
+        check_watch
+        tick=$((tick + 1))
+    done
+    if [ -n "$probe_pid" ]; then
+        wait "$probe_pid"
+        state="" now=0
+        read -r state fc health has_age now reason < "$PROBE_OUT"
+        if [ -z "$state" ]; then
+            state=fail reason="status probe produced no output"
+        fi
+        if [ "${now:-0}" = 0 ]; then
             now=$(monotonic)
         fi
         failure=""
@@ -353,6 +489,4 @@ while :; do
             fails=0
         fi
     fi
-    sleep "$INTERVAL" &
-    wait $!
 done

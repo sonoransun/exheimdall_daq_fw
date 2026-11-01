@@ -1,11 +1,15 @@
 """
     Description :
-    Offline analyzer/plotter for recorded .iqf IQ frame files
-    (as produced by iq_recorder.py).
+    Offline analyzer/plotter for recorded IQ frames: single-frame .iqf files
+    (iq_recorder.py without --hcap) and .hcap captures (iq_capture_format.py;
+    --frame selects the frame, default the first frame with samples).
 
     Now an argparse CLI — the historic module-level defaults are preserved,
     so running it with no arguments analyzes the same file with the same
-    plots enabled as before.
+    plots enabled as before. Without --fs the sample rate is the header's
+    sampling_freq (the module default 2.4 MHz when the header has none).
+    raw_u8 frames (sample_bit_depth 8) are converted to complex samples
+    ((u8 - 127.5) / 127.5).
 
     Project : HeIMDALL DAQ Firmware
     License : GNU GPL V3
@@ -21,7 +25,9 @@ import numpy as np
 currentPath = os.path.dirname(os.path.realpath(__file__))
 rootPath = os.path.dirname(currentPath)
 sys.path.insert(0, os.path.join(rootPath, "_daq_core"))
+sys.path.insert(0, currentPath)
 from iq_header import IQHeader
+import iq_capture_format as hcap
 
 logging.basicConfig(level=logging.INFO)
 
@@ -44,33 +50,76 @@ td_plot_ch_ind = 0
 xcorr_channels = [0, 1]
 
 
-def load_frame(fname):
-    """Read one [1024B header][payload] frame and return (header, iq_cf64)."""
-    with open(fname, "rb") as file_descr:
-        iq_header_bytes = file_descr.read(1024)
-        iq_header = IQHeader()
-        iq_header.decode_header(iq_header_bytes)
-        iq_header.dump_header()
+def samples_from_payload(iq_header, iq_data_bytes):
+    """(active_ant_chs, cpi_length) complex64 array of one frame's payload:
+    complex float32 for sample_bit_depth 32, offset-binary u8 I/Q pairs
+    (rtl_daq's raw format) for sample_bit_depth 8."""
+    M = iq_header.active_ant_chs
+    N = iq_header.cpi_length
+    if iq_header.sample_bit_depth == 32:
+        return np.frombuffer(iq_data_bytes, dtype=np.complex64).reshape(M, N).copy()
+    if iq_header.sample_bit_depth == 8:
+        raw = np.frombuffer(iq_data_bytes, dtype=np.uint8).reshape(M, N, 2).astype(np.float32)
+        raw = (raw - 127.5) / 127.5
+        return (raw[:, :, 0] + 1j * raw[:, :, 1]).astype(np.complex64)
+    raise ValueError("unsupported sample_bit_depth {:d}".format(iq_header.sample_bit_depth))
 
-        iq_data_length = int((iq_header.cpi_length * iq_header.active_ant_chs
-                              * (2 * iq_header.sample_bit_depth)) / 8)
-        iq_data_bytes = file_descr.read(iq_data_length)
 
-    iq_cf64 = np.frombuffer(iq_data_bytes, dtype=np.complex64).reshape(
-        iq_header.active_ant_chs, iq_header.cpi_length)
-    return iq_header, iq_cf64.copy()
+def load_frame(fname, frame_index=None):
+    """Read one frame and return (header, iq_cf64). A .hcap capture yields
+    frame `frame_index`, or its first frame with samples when None; any
+    other file is one [1024B header][payload] frame (.iqf)."""
+    if fname.endswith(".hcap"):
+        iq_header, iq_data_bytes = load_capture_frame(fname, frame_index)
+    else:
+        with open(fname, "rb") as file_descr:
+            iq_header_bytes = file_descr.read(1024)
+            iq_header = IQHeader()
+            iq_header.decode_header(iq_header_bytes)
+            iq_data_length = int((iq_header.cpi_length * iq_header.active_ant_chs
+                                  * (2 * iq_header.sample_bit_depth)) / 8)
+            iq_data_bytes = file_descr.read(iq_data_length)
+    iq_header.dump_header()
+    return iq_header, samples_from_payload(iq_header, iq_data_bytes)
+
+
+def load_capture_frame(fname, frame_index=None):
+    """(IQHeader, payload) of frame `frame_index` of a .hcap capture (the
+    first frame with samples when None)."""
+    for index, (iq_header, payload) in enumerate(hcap.HcapReader(fname)):
+        if frame_index is None and payload:
+            return iq_header, payload
+        if frame_index == index:
+            if not payload:
+                raise ValueError("frame {:d} of {} has no samples (frame_type {:d})".format(
+                    index, fname, iq_header.frame_type))
+            return iq_header, payload
+    if frame_index is None:
+        raise ValueError("{} has no frame with samples".format(fname))
+    raise ValueError("{} has no frame {:d}".format(fname, frame_index))
+
+
+def resolve_sample_rate(sample_rate, iq_header):
+    """--fs when given, else the header sampling_freq, else the module default."""
+    if sample_rate is not None:
+        return sample_rate
+    if iq_header.sampling_freq:
+        return float(iq_header.sampling_freq)
+    return fs
 
 
 def analyze(fname=file_name, sample_rate=fs, ref_ch=std_ch_ind,
             td_plot=en_td_plot, fd_plot=en_fd_plot, xcorr_plot=en_xcorr_plot,
             iq_diff_plot=en_iq_diff_plot, td_channel=td_plot_ch_ind,
-            xcorr_pair=None, show=True):
+            xcorr_pair=None, show=True, frame_index=None):
+    """Plot one frame. sample_rate=None takes the header's sampling_freq."""
     import matplotlib.pyplot as plt  # heavy/optional: import only when used
 
     if xcorr_pair is None:
         xcorr_pair = xcorr_channels
 
-    iq_header, iq_cf64 = load_frame(fname)
+    iq_header, iq_cf64 = load_frame(fname, frame_index)
+    sample_rate = resolve_sample_rate(sample_rate, iq_header)
     N = iq_header.cpi_length
     M = iq_header.active_ant_chs
 
@@ -130,11 +179,14 @@ def analyze(fname=file_name, sample_rate=fs, ref_ch=std_ch_ind,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Analyze/plot a recorded .iqf IQ frame file")
+        description="Analyze/plot a recorded .iqf IQ frame file or .hcap capture")
     parser.add_argument("file", nargs="?", default=file_name,
-                        help="input .iqf file (default: %(default)s)")
-    parser.add_argument("--fs", type=float, default=fs,
-                        help="sampling frequency in Hz (default: %(default)s)")
+                        help="input .iqf or .hcap file (default: %(default)s)")
+    parser.add_argument("--frame", type=int, default=None, metavar="K",
+                        help=".hcap: analyze frame K (default: the first frame with samples)")
+    parser.add_argument("--fs", type=float, default=None,
+                        help="sampling frequency in Hz (default: the header's "
+                             "sampling_freq, {:g} when it is 0)".format(fs))
     parser.add_argument("--ref-ch", type=int, default=std_ch_ind,
                         help="reference channel index (default: %(default)s)")
     parser.add_argument("--td-ch", type=int, default=td_plot_ch_ind,
@@ -158,7 +210,7 @@ def main(argv=None):
     analyze(fname=args.file, sample_rate=args.fs, ref_ch=args.ref_ch,
             td_plot=args.td, fd_plot=args.fd, xcorr_plot=args.xcorr,
             iq_diff_plot=args.iq_diff, td_channel=args.td_ch,
-            xcorr_pair=args.xcorr_pair)
+            xcorr_pair=args.xcorr_pair, frame_index=args.frame)
 
 
 if __name__ == "__main__":

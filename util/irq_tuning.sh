@@ -20,7 +20,9 @@
 #                         exit 1 at the end when any write failed
 #   --any-arch            on architectures not listed below (e.g. armv7l) use
 #                         nproc, core 0 for USB and the last core for network
-#   Test hook: HEIMDALL_TUNING_ROOT prefixes /proc and /sys (default: none).
+#   Test hook: HEIMDALL_TUNING_ROOT prefixes /proc and /sys (default: none);
+#   with it set, HEIMDALL_TUNING_FAKE_EUID overrides the root check so the
+#   fake-tree tests run unprivileged (ignored without HEIMDALL_TUNING_ROOT).
 
 set -e
 
@@ -95,7 +97,11 @@ write_value() {
 }
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then
+TUNING_EUID=$EUID
+if [ -n "${HEIMDALL_TUNING_ROOT:-}" ] && [ -n "${HEIMDALL_TUNING_FAKE_EUID:-}" ]; then
+    TUNING_EUID=$HEIMDALL_TUNING_FAKE_EUID
+fi
+if [ "$TUNING_EUID" -ne 0 ]; then
     echo "IRQ tuning requires root privileges. Run with sudo."
     exit 1
 fi

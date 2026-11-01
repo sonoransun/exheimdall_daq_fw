@@ -45,8 +45,8 @@ REPO = os.path.dirname(DOCS)
 # Guides that describe unreviewed work packages but carry no verify-after markers
 # in Documentation/. The guide layout shows a page-level note for them.
 PAGE_VERIFY = {
-    "capacity_planning": "WP-13,WP-04",
-    "glossary_faq": "WP-05,WP-08",
+    # capacity_planning (WP-13, WP-04) and glossary_faq (WP-05, WP-08) were listed
+    # here until those packages were done.
 }
 
 # Synced but not shown as a card in the library (library.md links it separately).

@@ -712,7 +712,12 @@ class TestAddressing(CliTestBase):
     def test_launcher_help(self):
         launcher = os.path.join(UTIL_DIR, "bin", "heimdall-ctl")
         if not os.path.isfile(launcher):
+            repo = os.path.dirname(UTIL_DIR)
+            if (os.path.exists(os.path.join(repo, ".git"))
+                    or os.path.isfile(os.path.join(repo, "pyproject.toml"))):
+                self.fail("util/bin/heimdall-ctl missing from a source checkout")
             self.skipTest("util/bin/heimdall-ctl not present (published tree)")
+        self.assertTrue(os.access(launcher, os.X_OK), "launcher must be executable")
         env = dict(os.environ)
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
         proc = subprocess.run([launcher, "--help"], stdout=subprocess.PIPE,

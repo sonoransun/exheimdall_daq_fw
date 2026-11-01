@@ -114,8 +114,7 @@ Use any of these forms:
 
 ```bash
 pip install .                                  # from the repo root: installs the heimdall-ctl console script
-util/bin/heimdall-ctl status                   # in a source tree
-PYTHONPATH=util python3 -m heimdall_ctl status # in any tree
+PYTHONPATH=util python3 -m heimdall_ctl status # from the repo root, without installing
 ```
 
 Run it inside an instance's `Firmware/` directory and it reads that `daq_chain_config.ini`
@@ -139,9 +138,6 @@ router stats           7001  cluster service
 ```
 
 ### Receiver serials {#receiver-serials}
-
-{% include verify_note.html wp="WP-14" block=true %}
-
 
 `rtl_daq` opens channel i as the receiver whose EEPROM serial is `serial_base + i`. With the
 key absent, `serial_base` behaves as `1000`, so a factory KrakenSDR (serials 1000-1004) works
@@ -224,9 +220,6 @@ ERROR:root:serial 1000 (channel 0) is present on 2 devices (/sys/bus/usb/devices
 ```
 
 ### Enable the status server for health checks {#enable-the-status-server-for-health-checks}
-
-{% include verify_note.html wp="WP-06" block=true %}
-
 
 The health checklists read `:5002` STATUS. It is off in the shipped INI. Turn it on in every
 recipe:
@@ -346,9 +339,6 @@ python3 ini_checker.py no_hw
 
 ### Start and stop {#start-and-stop}
 
-{% include verify_note.html wp="WP-12" block=true %}
-
-
 ```bash
 cd /opt/heimdall/Firmware
 sudo ./daq_start_sm.sh            # or: sudo env "PATH=$PATH" ./daq_start_sm.sh
@@ -365,7 +355,6 @@ host it is equivalent.
 | 1 | config or FIR-designer failure, or ports still busy after 10 attempts |
 | 3 | guard refusal (only with `[host] instance_guard = refuse` or `allow_core_sharing = refuse`) |
 | 4 | strict pre-flight failure (only with `[host] preflight = strict`) |
-
 
 Logs: `_logs/rtl_daq.log`, `rebuffer.log`, `decimator.log`, `delay_sync.log`, `hwc.log`,
 `iq_server.log` (eth only). PID files: `_logs/inst0/pids/*.pid`.
@@ -506,9 +495,6 @@ See [capacity_planning.md](capacity_planning.html) for the full worksheet and
 
 ### 1. Program the serials
 
-{% include verify_note.html wp="WP-14" block=true %}
-
-
 Unit 0 keeps the factory serials 1000-1004. Unit 1 becomes 1100-1104. Plug in unit 1 alone:
 
 ```bash
@@ -517,9 +503,6 @@ sudo /opt/heimdall/util/set_unit_serials.sh --unit 1 --yes
 ```
 
 ### 2. Provision the instances
-
-{% include verify_note.html wp="WP-14" block=true %}
-
 
 `util/provision_instance.py` creates the instance directory and writes the instance INI.
 It is a dry run unless you pass `--write`. **On a multi-instance host, provision instance 0
@@ -574,16 +557,13 @@ on the target host with the units plugged in to run the serial checks as well.
 | 1 | validation failed |
 | 2 | usage (for example `--instance 0` without `--in-place`) |
 | 3 | destination exists (without `--force` / `--refresh`) |
-| 4 | instance is running |
+| 4 | instance is live (`--refresh --write` without `--force`) |
 
 The instance-aware files need the C build of this release: instance 1's `decimate.out`
 reads `_data_control/inst1_fir_coeffs.txt`, which `fir_filter_designer.py` writes for
 instance 1. Run `make` in `Firmware/_daq_core` after every update.
 
 ### 3. Validate
-
-{% include verify_note.html wp="WP-13" block=true %}
-
 
 ```bash
 cd /opt/heimdall/Firmware             && python3 ini_checker.py no_hw attached
@@ -592,18 +572,14 @@ python3 daq_preflight.py --config /opt/heimdall/Firmware/daq_chain_config.ini \
                                   /opt/heimdall/instances/1/Firmware/daq_chain_config.ini
 ```
 
-Pass one `--config` followed by every INI. A second `--config` flag replaces the first, and
-then only one instance is checked. `heimdall-ctl capacity --config A B` builds the same
-command.
+Pass every INI after one `--config`, or repeat `--config`; the lists are combined.
+`heimdall-ctl capacity --config A B` builds the same command.
 
 The pre-flight tool prints `need / have / verdict` per resource (cores, core overlap, memory,
 `/dev/shm`, memlock, USB bus load, NIC egress, ports, frame period). Exit 0 ok, 1 warnings,
-2 failures. The core-count rule fails when `4 x hardware instances > nproc`.
+2 failures, 3 usage error. The core-count rule fails when `4 x hardware instances > nproc`.
 
 ### 4. Start and stop
-
-{% include verify_note.html wp="WP-12" block=true %}
-
 
 Start each instance from its own directory:
 
@@ -625,7 +601,7 @@ With `instance_guard = refuse` (written by the provisioning tool):
 
 - a second start of the same instance from the same directory stops and restarts it;
 - a start of the same instance id from a different directory exits 3
-  (`instance 1 is already running from <dir> (use --takeover to stop it)`);
+  (`ERROR: instance 1 is already running from <dir> (use --takeover to stop it)`);
 - a busy-port round at start runs the scoped `./daq_stop.sh 1`, never the host-wide stop.
 
 Whatever the guard setting, `daq_stop.sh` refuses `--clean` and `--reset-fence` (exit 3)
@@ -633,9 +609,6 @@ while a process of that instance is still alive. `daq_stop.sh 1 --clean` keeps
 `iq_track_lock`, the FIR coefficients and `fence_term`.
 
 ### 5. Supervise (optional)
-
-{% include verify_note.html wp="WP-14,WP-16" block=true %}
-
 
 Supervision needs instances provisioned with `--systemd`. That flag writes
 `/etc/default/heimdall-daq` (instance 0) or `/etc/default/heimdall-daq@<N>` and sets
@@ -665,9 +638,6 @@ sudo systemctl enable --now heimdall-host-tuning heimdall-daq-supervised heimdal
 ```
 
 ### Health checklist (Recipe C) {#health-checklist-recipe-c}
-
-{% include verify_note.html wp="WP-12,WP-13" block=true %}
-
 
 1. Both instances are registered and alive:
    ```bash
@@ -737,9 +707,6 @@ clocks must be synchronised.
 
 ### 1. Generate the configs
 
-{% include verify_note.html wp="WP-14" block=true %}
-
-
 `util/cluster_cfg_gen.py` writes every instance INI, the `federation.ini` files, a port
 table and a provisioning script, and validates all of them. Run it on one host (here hosta).
 `/opt/heimdall` and `/root` are root-owned, so every write uses `sudo`.
@@ -772,8 +739,9 @@ Output (the tool prints `written: <path>` per file, then `ok: 3 instance(s) on 2
 | `cluster/ports.md` | per-instance port table (1130/5000-5003/6000/7000/7001) |
 | `cluster/provision.sh` | a script with one `case` branch per host; run `sudo sh provision.sh [HOST]` (default: the short host name). `HEIMDALL_ROOT` (default `/opt/heimdall`) and `PYTHON` (default `python3`) override the paths |
 
-Every generated file carries `auth_token` in plain text and is written with mode 0644.
-`/root/cluster` itself is readable only by root.
+Every generated INI (instance and `federation.ini`) carries `auth_token` in plain text. The
+files are written with mode 0644 (`provision.sh` 0755); `/root/cluster` itself is readable
+only by root.
 
 Each instance INI gets: `[federation] instance_id`, `port_stride`, `en_federation = 1`,
 `cluster_members` (every instance, real host names), `coordinator_candidates`, `node_id`,
@@ -783,8 +751,9 @@ with units numbered across the cluster (hosta inst 0 = 1000, hosta inst 1 = 1100
 inst 0 = 1200) and `unit_id = auto`; `[daq] ctl_max_connections = 4`; `[host]
 instance_registry = 1`, `instance_guard = refuse`, `cpu_cores` (4 per instance; exit 1 when a
 host's plan exceeds `--cores-per-host`); `[monitoring] en_monitoring = 1`,
-`en_status_server = 1`, `status_extended = 1`, `status_update_interval = 10`. It never writes
-`peer_list`, so each instance's health peers are `cluster_members` minus itself.
+`en_status_server = 1`, `status_extended = 1`, `status_update_interval = 10`. It leaves
+`peer_list` empty (a template value is cleared), so each instance's health peers are
+`cluster_members` minus itself.
 
 It also sets `[daq] ctr_channel_serial_no` to the same channel index within each unit's
 serials (1000 in the template gives 1100 and 1200). Any validation error exits 1 and names
@@ -834,9 +803,6 @@ instance_guard = refuse
 
 ### 2. Provision each site host
 
-{% include verify_note.html wp="WP-14" block=true %}
-
-
 Run the [Build and install](#build-and-install) and [Install root layout](#install-root-layout)
 steps on every host. Do not copy binaries between hosts: hostb (aarch64) and hosta (x86_64)
 need different builds, and the default `MARCH` tunes for the build host's CPU, so a binary
@@ -885,8 +851,8 @@ chronyc tracking        # "System time" offset; keep it far below router_max_ske
 chronyc sources -v
 ```
 
-The router reports each source's `clock_offset_ms` and sets `skew_warning` when the offset
-deviates by more than `--max-skew-ms`. Details: [networking_and_time_sync.md](networking_and_time_sync.html).
+The router reports each source's `clock_offset_ms` and sets `skew_warning` when that offset
+deviates from the median of all sources' offsets by more than `--max-skew-ms`. Details: [networking_and_time_sync.md](networking_and_time_sync.html).
 
 ### 4. Firewall
 
@@ -924,9 +890,6 @@ Across sites, carry the cluster network over WireGuard. Examples:
 [networking_and_time_sync.md](networking_and_time_sync.html).
 
 ### 5. Coordinator and routers
-
-{% include verify_note.html wp="WP-12,WP-08,WP-09" block=true %}
-
 
 Every host that runs a coordinator or a router reads `/etc/heimdall/federation.ini`.
 Install the generated files from step 1; do not write them by hand.
@@ -1038,7 +1001,8 @@ Router flags win over the file. Useful ones:
 | `--upstream-stats` | none | the site routers' `:7001`, so the central router names chained sources by node key |
 
 The coordinator picks its own candidate entry from `coordinator_candidates` (the one whose
-port equals its listen port and whose host is local); `--self host:port` overrides that.
+port equals its listen port and whose host is local); `[federation] coordinator_self` or
+`--self host:port` overrides that.
 Router exit codes: 0 normal stop, 2 output or stats port bind failure, 3 bad arguments or
 config.
 
@@ -1053,9 +1017,6 @@ Egress budget: each source instance at `R = 1` sends 96 MB/s into its site route
 central router receives the sum. Over a WAN link, use decimation (Recipe B) to cut it by `R`.
 
 ### Health checklist (Recipe D) {#health-checklist-recipe-d}
-
-{% include verify_note.html wp="WP-08,WP-06" block=true %}
-
 
 1. Each host passes [Recipe C's checklist](#health-checklist-recipe-c) (or Recipe A's for a
    single-instance host).
@@ -1137,9 +1098,6 @@ image default (for example `raspberrypi`) gets a node-key collision warning. `ci
 
 ### 2. Synthetic chain (Linux, root)
 
-{% include verify_note.html wp="WP-12" block=true %}
-
-
 `daq_synthetic_start.sh` replaces `rtl_daq.out` with `_testing/test_data_synthesizer.py`.
 The synthesizer answers the ZMQ control port (`1130 + offset`, bind address
 `[daq] zmq_listen_address` or `*`), so `hw_controller.py` gets replies, `tune`/`gain`
@@ -1196,7 +1154,7 @@ ss -ltnp | grep ':1130 '
 
 ### 3. Record and replay for field debugging
 
-{% include verify_note.html wp="WP-20" block=true %}
+{% include verify_note.html wp="WP-20/17b" block=true %}
 
 
 Record a problem on site, replay it at your desk. The `.hcap` container is a sequence of
@@ -1237,9 +1195,6 @@ is absent. `daq_replay_start.sh` refuses a capture that is not `raw_u8` with exi
 
 ## Recipe F: systemd supervised deployment {#recipe-f-systemd-supervised-deployment}
 
-{% include verify_note.html wp="WP-16" block=true %}
-
-
 Two supervision choices exist per instance. They conflict, so enable only one per instance.
 
 | Unit | Type | What it does |
@@ -1250,11 +1205,7 @@ Two supervision choices exist per instance. They conflict, so enable only one pe
 | `heimdall-daq-watchdog.service` + `.timer` | oneshot every 30 s | restarts a supervised unit after 3 failed STATUS checks (optional) |
 | `heimdall-coordinator.service`, `heimdall-iq-router.service` | simple | federation services, run as user `heimdall` |
 
-
 ### Install {#install}
-
-{% include verify_note.html wp="WP-16" block=true %}
-
 
 ```bash
 cd /opt/heimdall
@@ -1278,9 +1229,6 @@ Provisioning with `--systemd` writes `/etc/default/heimdall-daq@<N>` and sets
 
 ### Enable {#enable}
 
-{% include verify_note.html wp="WP-16" block=true %}
-
-
 ```bash
 # single-instance host
 sudo systemctl enable --now heimdall-host-tuning heimdall-daq-supervised
@@ -1296,9 +1244,6 @@ sudo systemctl enable --now heimdall-daq-watchdog.timer
 ```
 
 ### How the supervisor behaves {#how-the-supervisor-behaves}
-
-{% include verify_note.html wp="WP-12" block=true %}
-
 
 `daq_supervise.sh` always exports `HEIMDALL_SCOPED_STOP=1`, so a busy-port round of the start
 script stops only its own instance. It supervises the PID files in `_logs/inst<N>/pids/`.
@@ -1336,9 +1281,6 @@ fencing survives restarts.
 ---
 
 ## Host sizing matrix {#host-sizing-matrix}
-
-{% include verify_note.html wp="WP-13" block=true %}
-
 
 Per-instance figures at the defaults (5 channels, 2.4 MS/s, `daq_buffer_size` 2^18,
 `cpi_size` 2^20, `decimation_ratio` 1). Formulas and the full worksheet are in
@@ -1388,9 +1330,6 @@ to check when a row fails.
 ---
 
 ## Upgrade and rollback {#upgrade-and-rollback}
-
-{% include verify_note.html wp="WP-14,WP-12" block=true %}
-
 
 Follow [upgrade_and_rollback.md](upgrade_and_rollback.html), section 6 (6.1 for instance 0,
 6.2 for instance directories). The outline below adds the steps that the

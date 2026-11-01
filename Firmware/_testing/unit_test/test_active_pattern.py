@@ -14,6 +14,7 @@ import unittest
 from os.path import dirname, join, realpath
 
 import numpy as np
+from scipy.signal import windows
 
 current_path = dirname(realpath(__file__))
 root_path = dirname(dirname(current_path))
@@ -98,6 +99,22 @@ class TestConventions(unittest.TestCase):
             r = np.exp(-2j * np.pi * F * tau) / np.conj(P.steering_ff(pos, u0, F))
             self.assertLess(np.abs(np.angle(r / r[0])).max(), 1e-9)      # common phase only
 
+    def test_ttd_near_field_limit_and_sign(self):
+        g = G.preset_ura(3, 2, 0.4 * LAM, 0.45 * LAM)
+        pos = g.positions()
+        u0 = G.direction_vector(25, 10)
+        np.testing.assert_allclose(P.ttd_delays_nf_s(pos, 1e7 * u0), P.ttd_delays_s(pos, u0), atol=1e-15)
+        near = P.ttd_delays_nf_s(pos, 1.5 * u0)
+        rn = np.linalg.norm(1.5 * u0 - pos, axis=1)
+        np.testing.assert_allclose(near, (rn.max() - rn) / C0, atol=1e-20)
+        self.assertGreaterEqual(float(near.min()), 0.0)
+        # carrier part of the near-field TTD = phase of the spherical steering vector
+        a = P.steering_nf(pos, 1.5 * u0, F)
+        r = a * np.exp(-2j * np.pi * F * near)
+        np.testing.assert_allclose(np.angle(r / r[0]), 0.0, atol=1e-9)
+        with self.assertRaises(ValueError):
+            P.ttd_delays_nf_s(pos, pos[1])
+
     def test_ttd_aligns_wideband_lfm(self):
         fs = 1e9                                                  # 3.5-sample aperture fill time
         g = G.preset_ula(8, LAM / 2)
@@ -162,15 +179,72 @@ class TestSteeringAndPatterns(unittest.TestCase):
         cut = G.ElementPattern("table", table=((0, 0, 5.0, 0.0), (30, 0, 4.1, 2.0)))
         g = P.element_gain(cut, G.direction_vector([0, 15, 30, 195], [0, 0, 0, 0]))
         np.testing.assert_allclose(20 * np.log10(np.abs(g[:3])), [5.0, 4.55, 4.1], atol=1e-9)
-        np.testing.assert_allclose(np.degrees(np.angle(g[:3])), [0.0, 1.0, 2.0], atol=1e-9)
-        self.assertAlmostEqual(20 * math.log10(abs(g[3])), 4.55, places=9)   # periodic wrap 30 -> 360
+        np.testing.assert_allclose(np.degrees(np.angle(g[:3])), [0.0, 1.0, 2.0], atol=1e-6)
+        # constant extension (explicit opt-in): periodic across the gap, same cut at every elevation
+        const = G.ElementPattern("table", table=cut.table, table_extend="constant")
+        self.assertAlmostEqual(20 * math.log10(abs(P.element_gain(const, G.direction_vector(195, 0)))), 4.55)
+        self.assertAlmostEqual(20 * math.log10(abs(P.element_gain(const, G.direction_vector(0, 60)))), 5.0)
         grid = G.ElementPattern("table", table=tuple((a, e, a / 10.0 + e / 5.0, 0.0)
                                                     for a in (0, 90, 180, 270) for e in (-30, 0, 30)))
         v = P.element_gain(grid, G.direction_vector(45, 15))
         self.assertAlmostEqual(20 * math.log10(abs(v)), 4.5 + 3.0, places=9)
-        self.assertAlmostEqual(20 * math.log10(abs(P.element_gain(grid, G.direction_vector(45, 80)))), 4.5 + 6.0)
+        cgrid = G.ElementPattern("table", table=grid.table, table_extend="constant")
+        self.assertAlmostEqual(20 * math.log10(abs(P.element_gain(cgrid, G.direction_vector(45, 80)))), 4.5 + 6.0)
         shifted = G.ElementPattern("table", gain_dbi=2.0, table=((0, 0, 5.0, 0.0), (30, 0, 4.1, 2.0)))
         self.assertAlmostEqual(20 * math.log10(abs(P.element_gain(shifted, [0, 1, 0]))), 2.0)
+
+    def test_table_phase_wraps_through_180(self):
+        t = G.ElementPattern("table", table=((0, 0, 0, 179), (10, 0, 0, -179), (180, 0, 0, 0)))
+        ph = np.degrees(np.angle(P.element_gain(t, G.direction_vector(5, 0))))
+        self.assertAlmostEqual(abs(ph), 180.0, places=6)
+        self.assertAlmostEqual(np.degrees(np.angle(P.element_gain(t, G.direction_vector(2.5, 0)))), 179.5, places=3)
+        self.assertAlmostEqual(abs(P.element_gain(t, G.direction_vector(5, 0))), 1.0, places=12)  # gain in dB
+        grid = G.ElementPattern("table", table=((0, -10, 0, 179), (10, -10, 0, -179), (0, 10, 0, 179),
+                                                (10, 10, 0, -179)), table_extend="constant")
+        self.assertAlmostEqual(abs(np.degrees(np.angle(P.element_gain(grid, G.direction_vector(5, 0))))), 180.0,
+                               places=6)
+        # through the manifold: the element phase reaches the steering vector unchanged
+        els = [G.Element(i, (0.1 * i, 0, 0), rx=ChannelRef("s", i), pattern=t) for i in range(2)]
+        A = P.array_manifold(G.ArrayGeometry(els), G.direction_vector(5, 0), F)
+        A0 = P.array_manifold(G.ArrayGeometry(els), G.direction_vector(5, 0), F, include_pattern=False)
+        self.assertAlmostEqual(abs(np.degrees(np.angle(A[0] / A0[0]))), 180.0, places=6)
+
+    def test_table_coverage_extension(self):
+        # spec 6.1 example: a front-sector cut (az 0..30 at el 0)
+        cut = G.ElementPattern("table", table=((0, 0, 5.0, 0.0), (30, 0, 4.1, 2.0)))
+        floor = 4.1 - P.TABLE_FLOOR_REL_DB
+
+        def db(p, az, el):
+            return 20 * math.log10(abs(P.element_gain(p, G.direction_vector(az, el))))
+
+        self.assertAlmostEqual(db(cut, 180, 0), floor)                     # no invented back lobe
+        self.assertAlmostEqual(db(cut, 40, 0), floor)                      # 10 deg edge taper
+        self.assertAlmostEqual(db(cut, 35, 0), 0.5 * (4.1 + floor))
+        self.assertAlmostEqual(db(cut, 350, 0), floor)
+        self.assertAlmostEqual(db(cut, 0, 90), floor)                      # single cut tapers to the poles
+        self.assertAlmostEqual(db(cut, 0, 60), 5.0 + (floor - 5.0) * 60 / 90)
+        self.assertAlmostEqual(db(cut, 0, -45), 5.0 + (floor - 5.0) * 0.5)
+        own = G.ElementPattern("table", table=cut.table, table_floor_db=-10.0)
+        self.assertAlmostEqual(db(own, 180, 0), -10.0)
+        self.assertEqual(own.effective_gain_dbi(), 5.0)                    # peak gain unchanged
+        # a full-circle azimuth table (gaps <= 90 deg) stays periodic
+        full = G.ElementPattern("table", table=tuple((a, 0, 1.0 + (a == 0), 0.0) for a in (0, 90, 180, 270)))
+        self.assertAlmostEqual(db(full, 315, 0), 1.5)
+        # an elevation cut tapers to the floor at the back
+        ecut = G.ElementPattern("table", table=((0, -30, 2.0, 0), (0, 0, 6.0, 0), (0, 30, 2.0, 0)))
+        self.assertAlmostEqual(db(ecut, 0, 0), 6.0)
+        self.assertAlmostEqual(db(ecut, 180, 0), 2.0 - P.TABLE_FLOOR_REL_DB)
+        self.assertAlmostEqual(db(ecut, 90, 0), 0.5 * (6.0 + 2.0 - P.TABLE_FLOOR_REL_DB))
+        # a grid with partial elevation coverage tapers 10 deg past its edge
+        grid = G.ElementPattern("table", table=tuple((a, e, 3.0, 0.0) for a in (0, 90, 180, 270) for e in (0, 30)))
+        self.assertAlmostEqual(db(grid, 45, 35), 0.5 * (3.0 + 3.0 - P.TABLE_FLOOR_REL_DB))
+        self.assertAlmostEqual(db(grid, 45, -20), 3.0 - P.TABLE_FLOOR_REL_DB)
+        with self.assertRaises(G.GeometryError):
+            G.ElementPattern("table", table=cut.table, table_extend="mirror")
+        with self.assertRaises(G.GeometryError):
+            G.ElementPattern("table", table=cut.table, table_floor_db=float("nan"))
+        d = own.to_dict()
+        self.assertEqual((d["table_floor_db"], d["table_extend"]), (-10.0, "taper"))
 
     def test_manifold_uses_body_frame_patterns(self):
         els = [G.Element(i, (0.15 * i, 0, 0), rx=ChannelRef("s", i), pattern=G.ElementPattern("cos_q", q=2))
@@ -224,12 +298,39 @@ class TestMetrics(unittest.TestCase):
             self.assertLess(m.pointing_error_deg, 0.01)
             self.assertAlmostEqual(m.hpbw_az_deg, 12.8 / math.cos(math.radians(az)), delta=0.6)
 
+    def test_large_aperture_psll_matches_exact_1d(self):
+        """N = 256 lambda/2 ULA, Taylor 30 dB: the sphere grid is capped (~0.22 deg) above the
+        near-in sidelobe spacing, so the local HPBW/10 re-grid must recover the true PSLL."""
+        n = 256
+        g = G.preset_ula(n, LAM / 2)
+        u0 = G.direction_vector(30, 10)
+        x = g.positions()[:, 0]
+        w = windows.taylor(n, nbar=4, sll=30, norm=False) * P.steering_ff(g.positions(), u0, F)
+        m = P.beam_metrics(g, w, F, u0)
+        self.assertTrue(m.local_refine)
+        self.assertGreater(m.grid_step_deg, m.hpbw_az_deg / 4)
+        # exact reference in direction-cosine space v = u.x (isotropic ULA)
+        v = np.linspace(-1, 1, 200001)
+        af = np.abs(np.exp(2j * np.pi / LAM * np.outer(v, x)) @ np.conj(w)) ** 2
+        af /= af.max()
+        i0 = int(np.argmax(af))
+        hi = i0
+        while af[hi + 1] < af[hi]:
+            hi += 1
+        lo = i0
+        while af[lo - 1] < af[lo]:
+            lo -= 1
+        exact = 10 * math.log10(max(af[:lo].max(), af[hi + 1:].max()))
+        self.assertAlmostEqual(m.psll_db, exact, delta=0.1)
+        self.assertLess(m.pointing_error_deg, 0.01)
+
     def test_planar_mirror_and_nulls(self):
         g = G.preset_ura(4, 4, LAM / 2, LAM / 2)                                # vertical panel facing North
         u0 = G.direction_vector(20, 10)
         a = P.steering_ff(g.positions(), u0, F)
         m = P.beam_metrics(g, a / 16, F, u0, nulls=((60, 0),))
         self.assertLess(m.pointing_error_deg, 0.01)
+        self.assertTrue(all(lb.intrinsic for lb in m.lobes if lb.kind == "ambiguity"))     # the mirror image
         self.assertTrue(any(lb.kind == "ambiguity" and lb.level_db > -0.1 and 150 < lb.az_deg < 190
                             for lb in m.lobes))                                  # back-side mirror image
         self.assertGreater(m.psll_db, -14.0)
@@ -333,6 +434,63 @@ class TestGratingAndAmbiguity(unittest.TestCase):
         self.assertTrue(any("edge of visible space" in i.message for i in edge.issues if i.level == "warning"))
         tx = P.geometry_report(G.preset_ula(4, 0.1, map_tx=False), F, F, 60.0, which="tx")
         self.assertEqual((tx.n, tx.issues), (0, []))
+
+    def test_tx_edge_lobes_are_errors(self):
+        """For the TX set the endfire / horizon skirt >= -3 dB is an error (solve_beam refuses it)."""
+        ura = G.preset_ura(4, 4, LAM / 2, LAM / 2)
+        rep = P.geometry_report(ura, F, F, 60.0, which="tx")
+        errs = [i for i in rep.issues if i.level == "error"]
+        self.assertTrue(errs and all(i.code == "AMBIGUITY" for i in errs))
+        self.assertTrue(any("TX set" in i.message and "edge of visible space" in i.message for i in errs))
+        self.assertLessEqual(len(errs), 5)                                   # capped, plus a summary line
+        self.assertTrue(any(lb.edge and lb.kind == "grating" for lb in rep.lobes))
+        self.assertEqual(codes(P.geometry_report(ura, F, F, 45.0, which="tx").issues, "error"), [])
+        # directional elements: re-measured with the patterns -> warnings only
+        els = [G.Element(e.id, e.pos_body_m, rx=e.rx, tx=e.tx, pattern=G.ElementPattern("cos_q", q=2))
+               for e in ura.elements]
+        rp = P.geometry_report(G.ArrayGeometry(els), F, F, 60.0, which="tx")
+        self.assertEqual(codes(rp.issues, "error"), [])
+        self.assertTrue(any("edge of visible space" in i.message for i in rp.issues if i.level == "warning"))
+
+
+class TestBeamMetricsLobes(unittest.TestCase):
+    def test_edge_flag_and_metrics_round_trip(self):
+        g = G.preset_ula(4, LAM / 2)
+        u0 = G.direction_vector(60, 0)
+        m = P.beam_metrics(g, P.steering_ff(g.positions(), u0, F) / 4, F, u0)
+        edge = [lb for lb in m.lobes if lb.edge]
+        self.assertEqual(len(edge), 1)
+        self.assertEqual((round(edge[0].az_deg), round(edge[0].el_deg), edge[0].kind), (270, 0, "grating"))
+        self.assertAlmostEqual(edge[0].level_db, -1.0, delta=0.1)
+        self.assertAlmostEqual(m.look_level_db, 0.0, places=6)
+        self.assertEqual(P.BeamMetrics.from_dict(json.loads(json.dumps(m.to_dict()))), m)
+        old = m.to_dict()                                                    # documents from before edge/look
+        for k in ("near_field_m", "look_level_db"):
+            old.pop(k)
+        for lb in old["lobes"]:
+            lb.pop("edge")
+        self.assertEqual(P.BeamMetrics.from_dict(old).look_level_db, 0.0)
+
+    def test_near_field_metrics(self):
+        g = G.preset_ula(8, LAM / 2)
+        u0 = G.direction_vector(20, 0)
+        p = 1.5 * u0
+        w = P.steering_nf(g.positions(), p, F) / 8
+        nf = P.beam_metrics(g, w, F, u0, focus_range_m=1.5)
+        ff = P.beam_metrics(g, w, F, u0)                                     # the defocused far field
+        self.assertEqual(nf.near_field_m, 1.5)
+        self.assertEqual(ff.near_field_m, 0.0)
+        self.assertLess(nf.pointing_error_deg, 0.5)
+        self.assertLess(nf.psll_db, -9.0)
+        self.assertFalse([lb for lb in nf.lobes if not lb.intrinsic])
+        self.assertGreater(ff.psll_db, nf.psll_db)
+        with self.assertRaises(ValueError):
+            P.beam_metrics(g, w, F, u0, focus_range_m=-1.0)
+        # the planar mirror image is reported as intrinsic in the near field too
+        ura = G.preset_ura(4, 4, LAM / 2, LAM / 2)
+        u1 = G.direction_vector(20, 10)
+        m = P.beam_metrics(ura, P.steering_nf(ura.positions(), 2.0 * u1, F) / 16, F, u1, focus_range_m=2.0)
+        self.assertTrue(any(lb.intrinsic and lb.level_db > -0.5 and 150 < lb.az_deg < 190 for lb in m.lobes))
 
 
 if __name__ == "__main__":

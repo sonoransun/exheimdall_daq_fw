@@ -36,30 +36,35 @@ Notation used throughout:
 
 Everything here is opt-in. With every new key absent and no new flag passed, the chain behaves as before: same process names, FIFO names, shm names, ports and wire bytes. The exceptions are listed in the disabled-state ledger in [upgrade_and_rollback.md](upgrade_and_rollback.md).
 
-The scaling program is delivered in work packages. Some parts are in this tree and some are still planned. Each section says which. Planned parts are described as specified and carry the label **Planned**.
+Every feature in this guide is in this tree:
 
-| Area | Status | Where |
-|---|---|---|
-| Serial mapping (`[hw] serial_base`, `device_serials`), duplicate-serial defence, `unit_id = auto`, ZMQ bind address, USB ring depth | Available | `rtl_daq.c`, `device_map.c` |
-| Lazy track-lock file, extended acks (`XACK`), fencing, control snapshot (`HWSQ`), `RECL` | Available | `hw_controller.py` |
-| Prefixed FIR coefficients for N > 0, `size_t` sizing, config-sized segments, multi-client `iq_server` | In tree, report pending | `fir_filter_designer.py`, `fir_decimate.c`, `iq_server.c` |
-| Extended STATUS, staleness, `cluster_members` mesh peers, registrar wiring, slot 108 stamping | In tree, report pending | `delay_sync.py`, `daq_status_server.py` |
-| Coordinator protocol v2, election, fencing, health state machine, scheduler | In tree, report pending | `federation_coordinator.py`, `federation_election.py`, `federation_health.py`, `federation_scheduler.py` |
-| IQ router CLI, bounded queues, tagging, alignment, stats port | In tree, report pending | `federation_iq_router.py` |
-| Per-instance DB directory and sidecar (`instance_subdir`, `write_instance_meta`) | Available | `daq_db.py` |
-| Config limits and port-window checks, `--federation` validation | Available | `ini_checker.py` |
-| `heimdall-ctl` `fleet`, `router`, `ports`, `instances`, `peers` | Available | `util/heimdall_ctl/` |
-| `[host]` keys honoured by the start scripts, registry, instance lock, scoped stop, supervisor, federation launchers | **Planned** (WP-12) | `daq_common.sh`, `daq_supervise.sh`, `federation_start.sh` |
-| Capacity model and pre-flight tool | **Planned** (WP-13) | `capacity_model.py`, `daq_preflight.py` |
-| `provision_instance.py`, `cluster_cfg_gen.py`, serial programming tool | **Planned** (WP-14) | `util/` |
-| Supervised, coordinator, router, host-tuning and watchdog units | **Planned** (WP-16) | `packaging/systemd/` |
-
-`ini_checker.py` already validates the `[host]` keys. The current start scripts do not read them yet. Until WP-12 lands, `cpu_cores`, `instance_registry`, `instance_guard`, `allow_core_sharing`, `host_tuning` and `preflight` have no effect, so CPU pinning, the registry, the guard and host tuning are unchanged. Two keys work today because `delay_sync.py` reads them itself:
-
-| Key | Effect today |
+| Area | Where |
 |---|---|
-| `[host] delay_sync_cores` | Its core count sizes `[offload] fft_workers` and `xcorr_workers` when they are `auto`. It does not set the affinity mask yet |
-| `[host] health_thread_sched_other` | Moves the federation health poller thread off SCHED_FIFO |
+| Serial mapping (`[hw] serial_base`, `device_serials`), duplicate-serial defence, `unit_id = auto`, ZMQ bind address, USB ring depth | `rtl_daq.c`, `device_map.c` |
+| Lazy track-lock file, extended acks (`XACK`), fencing, control snapshot (`HWSQ`), `RECL` | `hw_controller.py` |
+| Prefixed FIR coefficients for N > 0, `size_t` sizing, config-sized segments, multi-client `iq_server` | `fir_filter_designer.py`, `fir_decimate.c`, `iq_server.c` |
+| Extended STATUS, staleness, `cluster_members` mesh peers, registrar wiring, slot 108 stamping | `delay_sync.py`, `daq_status_server.py` |
+| Coordinator protocol v2, election, fencing, health state machine, scheduler | `federation_coordinator.py`, `federation_election.py`, `federation_health.py`, `federation_scheduler.py` |
+| IQ router CLI, bounded queues, tagging, alignment, stats port | `federation_iq_router.py` |
+| Per-instance DB directory and sidecar (`instance_subdir`, `write_instance_meta`) | `daq_db.py` |
+| Config limits and port-window checks, `--federation` validation | `ini_checker.py` |
+| `heimdall-ctl` `fleet`, `router`, `ports`, `instances`, `peers` | `util/heimdall_ctl/` |
+| `[host]` keys in the start scripts, registry, instance lock, startup mutex, scoped stop, supervisor, federation launchers | `daq_common.sh`, `daq_start_sm.sh`, `daq_synthetic_start.sh`, `daq_stop.sh`, `daq_supervise.sh`, `federation_start.sh`, `federation_stop.sh` |
+| Capacity model and pre-flight tool | `_daq_core/capacity_model.py`, `daq_preflight.py` |
+| `provision_instance.py`, `cluster_cfg_gen.py`, serial programming tool `set_unit_serials.sh` | `util/` |
+| Supervised, coordinator, router, host-tuning and watchdog units | `packaging/systemd/` |
+
+The start scripts (`daq_start_sm.sh`, `daq_synthetic_start.sh`) read the `[host]` keys through `daq_common.sh`. With every `[host]` key absent they behave as before: the core formula of section 2, the original RT priorities, host tuning on every start, no registry, no lock and the global stop in the busy-port loop.
+
+| Key | Effect |
+|---|---|
+| `[host] cpu_cores` | Four distinct core ids for the tiers: rtl_daq; rebuffer + decimate; delay_sync + iq_server; hw_controller. Replaces the core formula |
+| `[host] delay_sync_cores` | The start scripts run delay_sync with this `taskset` list instead of the tier-2 core. Its core count also sizes `[offload] fft_workers` and `xcorr_workers` when they are `auto` |
+| `[host] rt_priority_offset` | Subtracted from every RT priority (default 0; a value above 81 is ignored) |
+| `[host] instance_registry`, `instance_guard`, `allow_core_sharing` | Registry, instance lock, startup mutex and guards (section 4.5) |
+| `[host] host_tuning` | `always` (default): sysctl, `irq_tuning.sh`, usbfs and `drop_caches` on every `daq_start_sm.sh` start. `auto`: run `util/host_tuning.sh --apply` unless `heimdall-host-tuning.service` is active or another registered instance runs. `1`: always run `host_tuning.sh --apply`. `0`: skip (also `--no-host-tuning`) |
+| `[host] preflight` | `off` (default), `warn` or `strict`: run `daq_preflight.py --plus-live` at start; with `strict` a failure stops the start with exit 4 |
+| `[host] health_thread_sched_other` | Moves the federation health poller thread off SCHED_FIFO (read by `delay_sync.py`) |
 
 ## 2. The scaling unit: one instance is one coherent island
 
@@ -115,7 +120,7 @@ The last three errors come from the shipped 5-entry `[amplification]` lists. Cha
 | `decimation_ratio` (R) | Output rate and frame rate drop by R. Egress per `:5000` client is `M * fs * 8 / R` bytes/s. `T_fp` grows by R | `decimate.out` still filters at the full input rate |
 | `cpi_size` (Ncpi) | Longer integration per frame, fewer frames per second | Larger shm segments; delay_sync copies `Ncpi * M * 8` bytes in and out per frame; slower reaction of control and health |
 | `corr_size` (Nc) | Better delay estimate during calibration | FFT cost in delay_sync during calibration; segments are sized for `max(Ncpi, Nc)` |
-| `[offload] fft_workers`, `xcorr_workers` (default 4) | FFT parallelism in delay_sync | With `auto`, the worker count already follows the core count of `[host] delay_sync_cores`. Pinning delay_sync to those cores (the affinity mask) is planned (WP-12) |
+| `[offload] fft_workers`, `xcorr_workers` (default 4) | FFT parallelism in delay_sync | With `auto`, the worker count follows the core count of `[host] delay_sync_cores`, and the start scripts pin delay_sync to that core list |
 | `[pre_processing] size_segments_from_config = 1` | `decimator_out` and `iq_server`'s map are sized from the config instead of the 2^23 worst case | None; off by default |
 | `[data_interface] iq_server_max_clients` (default 1) | More than one `:5000` client per instance | Egress multiplies by the client count |
 | `[daq] usb_ring_buffers` / `usb_async_transfers` (8 / 12) | Deeper USB ring against overruns | Locked memory `M * usb_ring_buffers * 2 * daq_buffer_size` bytes |
@@ -131,24 +136,21 @@ The last three errors come from the shipped 5-entry `[amplification]` lists. Cha
 | `delay_sync_iq` object (A+B) | `2 * (1024 + max(Ncpi, Nc) * M * 8)` | 80 MiB |
 | cf32 egress per `:5000` client | `M * fs * 8 / R` B/s | 96 MB/s (768 Mbit/s) |
 
-[capacity_planning.md](capacity_planning.md) has the full worksheet. The pre-flight tool that checks these numbers against a host is **Planned** (WP-13).
-
-<!-- verify-after: WP-04 -->
-<!-- verify-after: WP-13 -->
+[capacity_planning.md](capacity_planning.md) has the full worksheet. `python3 daq_preflight.py --config daq_chain_config.ini` (in `Firmware/`) checks these numbers against the host it runs on; `--add-instances N` adds planned copies and `--plus-live` counts the live registered instances. Exit codes: 0 ok, 1 warnings, 2 failures, 3 usage error. `[host] preflight = warn|strict` runs it at every start.
 
 ## 4. Several instances on one host
 
-### 4.1 What works today and what does not
+### 4.1 Default behaviour and the opt-in fixes
 
-| Item | Today |
-|---|---|
-| Serial numbers | Without serial keys, channel i opens serial `1000 + i` in every instance, so a second instance fails to open its dongles. Set `[hw] serial_base` (channel i uses `serial_base + i`) or `[hw] device_serials` (explicit comma list, one per channel) |
-| Working copy | Every stage reads the cwd-relative `daq_chain_config.ini` and `_data_control/`. Each instance needs its own working directory (section 4.4) |
-| Track-lock file | No longer required at start. hw_controller opens `_data_control/<P>iq_track_lock` only when `require_track_lock_intervention = 1`; a missing file then means "not approved" |
-| CPU cores | `CORE_k = (N*4 + k) % nproc`. When `(N+1)*4 > nproc` the start script only prints a `WARN:` line and the instances share cores |
-| Stopping | The port-busy loop of `daq_start_sm.sh` runs the no-argument `./daq_stop.sh`, which kills every DAQ process on the host by name. A busy port on one instance's start therefore stops all instances |
-| Port check | `lsof -i:P` also matches outbound client sockets, so a client connected to another service can be read as "busy" |
-| Host tuning | Every start runs the host-global `sysctl`, `irq_tuning.sh`, `usbfs_memory_mb = 0` and `drop_caches` steps again |
+| Item | Default (no `[host]` keys) | Opt-in |
+|---|---|---|
+| Serial numbers | Without serial keys, channel i opens serial `1000 + i` in every instance, so a second instance fails to open its dongles | `[hw] serial_base` (channel i uses `serial_base + i`) or `[hw] device_serials` (explicit comma list, one per channel) |
+| Working copy | Every stage reads the cwd-relative `daq_chain_config.ini` and `_data_control/`. Each instance needs its own working directory (section 4.4) | `util/provision_instance.py` creates it |
+| Track-lock file | Not required at start. hw_controller opens `_data_control/<P>iq_track_lock` only when `require_track_lock_intervention = 1`; a missing file then means "not approved" | - |
+| CPU cores | `CORE_k = (N*4 + k) % nproc`. When `(N+1)*4 > nproc` the start script only prints a `WARN:` line and the instances share cores | `[host] cpu_cores`; with `instance_registry = 1`, `allow_core_sharing = refuse` exits 3 on overlap with a live instance |
+| Stopping | The busy-port loop of the start script runs the no-argument `./daq_stop.sh`, which kills every DAQ process on the host by name. A busy port on one instance's start therefore stops all instances | `instance_guard = refuse` (needs `instance_registry = 1`) or `HEIMDALL_SCOPED_STOP=1` (exported by the supervisor): the loop runs `./daq_stop.sh N` |
+| Port check | Only listening sockets count (`ss -ltnH`, else `lsof -sTCP:LISTEN`); outbound client sockets on the same port number are ignored | - |
+| Host tuning | Every start runs the host-global `sysctl`, `irq_tuning.sh`, `usbfs_memory_mb = 0` and `drop_caches` steps again | `[host] host_tuning = auto` or `0`, plus `heimdall-host-tuning.service` |
 
 The core-sharing rule matters most on 4-core boards. On a Raspberry Pi 4 the formula maps instance 1 to cores 0-3, which are instance 0's cores. The start script warns and continues. Plan one hardware instance per 4 cores.
 
@@ -160,15 +162,15 @@ The core-sharing rule matters most on 4-core boards. On a Raspberry Pi 4 the for
 | FIFOs `_data_control/<P>fw_*`, `<P>bw_*` | cwd-relative | prefix, and the working copy |
 | Control files `<P>orientation_state`, `<P>bias_tee_state`, `<P>iq_track_lock`, `<P>fence_term`, `<P>hwc_state`, `<P>recal_request` | cwd-relative | prefix, and the working copy |
 | `_data_control/<P>fir_coeffs.txt` | cwd-relative | prefixed for N > 0 by `fir_filter_designer.py`, read by `decimate.out` |
-| `_data_control/hw_caps.json` | cwd-relative | **not** prefixed by today's start script; private only in a separate working copy (prefixing is planned, WP-12) |
+| `_data_control/<P>hw_caps.json` | cwd-relative | prefixed for N > 0 by the start scripts, and the working copy |
 | `daq_chain_config.ini` | cwd-relative | the working copy only |
 | `[database] db_dir` (default `_db`) | cwd-relative | the working copy, or `[database] instance_subdir = 1` (N > 0 uses `<db_dir>/inst<N>`) |
 | Logs and PID files | cwd-relative | `_logs/inst<N>/` |
 | Ports | Host-global | `<off>` |
 | USB dongles | Host-global | `serial_base` / `device_serials` |
-| CPU cores, RT priorities | Host-global | core formula (or `[host] cpu_cores`, planned WP-12) |
+| CPU cores, RT priorities | Host-global | core formula, or `[host] cpu_cores` / `delay_sync_cores` / `rt_priority_offset` |
 | pigpio antenna-switch GPIO | Host-global | `[hw] antenna_switch_gpio` (`none` or `A,B`; absent = GPIO 23/24 as before) |
-| Host tuning (sysctl, IRQ, usbfs, caches) | Host-global | run by every start (`[host] host_tuning`, planned WP-12) |
+| Host tuning (sysctl, IRQ, usbfs, caches) | Host-global | run by every start by default; once per boot with `[host] host_tuning = auto` or `0` and `heimdall-host-tuning.service` |
 
 `heimdall-ctl ports` prints an instance's port window from the config. Real output for instance 1 with the shipped config:
 
@@ -229,9 +231,9 @@ Use one built install root per host and one symlinked working copy per instance 
     util          -> <root>/util
     config_files  -> <root>/config_files
     Firmware/
-        _daq_core  _testing  _calibration  _fpga_gateware     -> symlinks into <root>/Firmware
-        ini_checker.py  fir_filter_designer.py                -> symlinks
-        daq_start_sm.sh  daq_synthetic_start.sh  daq_stop.sh  -> symlinks
+        every other entry of <root>/Firmware                  -> symlinks
+            (_daq_core, _testing, daq_common.sh, daq_start_sm.sh, daq_stop.sh,
+             daq_supervise.sh, daq_preflight.py, ini_checker.py, ...)
         daq_chain_config.ini     (real file, instance_id = N)
         _data_control/  _logs/  _db/   (real, private directories)
 ```
@@ -242,7 +244,7 @@ The private `daq_chain_config.ini`, `_data_control/`, `_logs/` and `_db/` isolat
 
 **Rebuild on every update.** Run `make` in `Firmware/_daq_core` after every update. An old `decimate.out` reads the unprefixed `fir_coeffs.txt`, so an instance N > 0 with stale binaries fails at start instead of filtering with stale taps.
 
-Create an instance directory by hand today (run as the user that owns `/opt/heimdall`):
+`util/provision_instance.py` (below) creates this layout. To create an instance directory by hand instead (run as the user that owns `/opt/heimdall`), link every `Firmware` entry except the private ones. The start scripts need `daq_common.sh` next to them and stop with `daq_common.sh not found` without it:
 
 ```sh
 R=/opt/heimdall; N=1
@@ -250,9 +252,11 @@ mkdir -p $R/instances/$N/Firmware && cd $R/instances/$N
 ln -s $R/util util
 ln -s $R/config_files config_files
 cd Firmware
-for f in _daq_core _testing _calibration _fpga_gateware ini_checker.py \
-         fir_filter_designer.py daq_start_sm.sh daq_synthetic_start.sh daq_stop.sh; do
-    ln -s $R/Firmware/$f $f
+for f in $R/Firmware/*; do
+    case "${f##*/}" in
+        _data_control|_logs|_db|__pycache__|daq_chain_config.ini*) ;;
+        *) ln -s "$f" "${f##*/}" ;;
+    esac
 done
 mkdir _data_control _logs _db
 cp $R/Firmware/daq_chain_config.ini .
@@ -267,7 +271,7 @@ python3 ini_checker.py daq_chain_config.ini no_hw
 ERROR:root:[daq] ctr_channel_serial_no 1000 is not one of the configured serials 1100, 1101, 1102, 1103, 1104 (...)
 ```
 
-**Planned (WP-14): `util/provision_instance.py`.** It creates the same layout and writes the instance INI. The default run is a dry run; `--write` executes.
+**`util/provision_instance.py`** creates the same layout and writes the instance INI. The default run is a dry run that prints the directory plan, the INI diff and the port table; `--write` executes.
 
 ```
 sudo python3 util/provision_instance.py --instance N [--root /opt/heimdall] [--dest DIR]
@@ -278,16 +282,14 @@ sudo python3 util/provision_instance.py --instance N [--root /opt/heimdall] [--d
     [--cluster-members LIST] [--node-id NAME] [--cluster-id ID] [--coordinator H:P[,H:P]]
     [--advertise-host H] [--register] [--profile minimal|balanced|maximum] [--systemd]
     [--env-file PATH] [--python-bin DIR] [--check-attached]
-    [--in-place] [--refresh] [--force] [--write]
+    [--in-place] [--refresh] [--from-root OLD] [--force] [--write]
 ```
 
-With `--template`, it writes these defaults for instance N: `serial_base = 1000 + 100*N`, `unit_id = auto`, `cpu_cores = 4N,4N+1,4N+2,4N+3`, `[daq] ctl_max_connections = 4`, `[host] instance_registry = 1`, `instance_guard = refuse`, `allow_core_sharing = refuse`, `preflight = warn`, `health_thread_sched_other = 1`, and `[monitoring] en_monitoring = 1`, `en_status_server = 1`, `status_extended = 1`, `status_update_interval = 10`, `event_tag_identity = 1`. Instance 0 needs `--in-place`. On a multi-instance host, provision instance 0 with `--in-place` too, so it carries the registry and guard keys. Exit codes: 0 ok, 1 validation failed, 2 usage, 3 destination exists, 4 instance live.
-
-<!-- verify-after: WP-14 -->
+With `--template` (the default template is `<root>/Firmware/daq_chain_config.ini`), it writes these defaults for instance N: `serial_base = 1000 + 100*N`, `unit_id = auto`, `cpu_cores = 4N,4N+1,4N+2,4N+3`, `[daq] ctl_max_connections = 4`, `[host] instance_registry = 1`, `instance_guard = refuse`, `allow_core_sharing = refuse`, `host_tuning = auto` (`0` with `--systemd`), `preflight = warn`, `health_thread_sched_other = 1`, and `[monitoring] en_monitoring = 1`, `en_status_server = 1`, `status_extended = 1`, `status_update_interval = 10`, `event_tag_identity = 1`. `--from-config` uses an INI verbatim. Instance 0 needs `--in-place`. On a multi-instance host, provision instance 0 with `--in-place` too, so it carries the registry and guard keys. Exit codes: 0 ok, 1 validation failed, 2 usage, 3 destination exists, 4 instance live.
 
 ### 4.5 Start and stop order
 
-Today:
+With the default `[host]` keys:
 
 1. Build once in `<root>/Firmware/_daq_core` (`make`).
 2. Start instance 0 from `<root>/Firmware`: `sudo ./daq_start_sm.sh`.
@@ -299,24 +301,26 @@ Today:
 4. Stop one instance with its id: `sudo ./daq_stop.sh N` (PID files of this copy only).
 5. Never run the no-argument `./daq_stop.sh` on a multi-instance host unless you mean to stop everything. It is the documented host-wide kill.
 
-Start instances one after the other. Today's start scripts have no startup mutex, and a start that finds its ports busy runs the global stop.
+Start instances one after the other. With the default keys the start scripts have no startup mutex, and a start that finds its ports busy runs the global stop.
 
-**Planned (WP-12): registry, lock, guard and scoped stop.** These activate only with `[host] instance_registry = 1`:
+**Registry, lock, guard and scoped stop.** The first five rows activate only with `[host] instance_registry = 1`; the environment variable and the stop forms work in every configuration:
 
 | Feature | Behaviour |
 |---|---|
 | Registry | `$HEIMDALL_RUN_DIR` (default `/run/heimdall`, fallback `/tmp/heimdall-run-<uid>`) holds `inst<N>.json` and `inst<N>.env` per live instance. `heimdall-ctl instances` lists them. It is host-wide only when every instance sets the key and all starts run as the same uid |
 | Instance lock | `inst<N>.lock`, held through fd 9 by the stages. A second start of the same N finds it held |
 | Startup mutex | `inst<N>.start`, fd 8, held by the start script only. Serialises concurrent starts of the same N |
-| `[host] instance_guard` | `legacy` (default): conflicts print `WARN:` and today's global stop resolves them. `refuse`: a duplicate start from another copy exits 3; busy-port rounds use the scoped `./daq_stop.sh N`. `--takeover` stops the other copy first |
+| `[host] instance_guard` | `legacy` (default): conflicts print `WARN:` and the global stop of the busy-port loop resolves them. `refuse` (requires `instance_registry = 1`): a duplicate start from another copy exits 3, a restart from the same copy stops it with `./daq_stop.sh N` first, and busy-port rounds use the scoped `./daq_stop.sh N`. `--takeover` stops the other copy first |
 | `[host] allow_core_sharing` | `warn` (default), `refuse` (exit 3 when cores overlap a live instance), `allow` |
 | `HEIMDALL_SCOPED_STOP=1` | Exported by the supervisor. The busy-port loop then runs `./daq_stop.sh N` instead of the global stop |
-| `daq_stop.sh N --clean` | Also removes this instance's FIFOs, shm objects and relay files. Keeps `iq_track_lock`, `fir_coeffs` and `fence_term`. Refused (exit 3) while a stage is alive |
+| `daq_stop.sh N --clean` | Stops instance N, then removes its FIFOs, shm objects and relay files (`orientation_state`, `bias_tee_state`, `hwc_state`, `recal_request`). Keeps `iq_track_lock`, `fir_coeffs` and `fence_term`. Refused (exit 3) when a stage is still alive after the stop |
+| `daq_stop.sh N --reset-fence` | Removes `<P>fence_term` of a stopped instance. Refused (exit 3, nothing stopped) while a stage of N runs |
 | `daq_stop.sh --this-copy` | Signals only processes whose cwd is this copy |
+| `daq_stop.sh --all` | Global stop, force-kill of the python stages and removal of every registry entry |
 
-Start-script exit codes stay 0 (started) and 1 (config/designer failure or ports still busy). New: 3 guard refusal, 4 strict pre-flight failure.
+Start-script exit codes: 0 started, 1 config/designer failure or ports still busy, 3 guard refusal, 4 strict pre-flight failure.
 
-`heimdall-ctl instances` exists today. Without registry files it prints:
+Without registry files `heimdall-ctl instances` prints:
 
 ```
 $ heimdall-ctl instances
@@ -325,16 +329,13 @@ no registry entries in /run/heimdall, /tmp/heimdall-run-<uid> (only instances st
 
 The tool searches `$HEIMDALL_RUN_DIR` (default `/run/heimdall`) and the per-uid fallback `/tmp/heimdall-run-<uid>`, so `<uid>` is `0` when run as root.
 
-<!-- verify-after: WP-12 -->
+**Supervisor.** `./daq_supervise.sh [--instance N] [--synthetic] [--interval 2] [--healthcheck auto|on|off] [--grace 60] [--stall-sec auto|SECONDS] [--allow-legacy-guard] [-- START_SCRIPT_ARGS...]` starts this copy's chain with `HEIMDALL_SCOPED_STOP=1`, watches every stage's PID file (and, with the health check, the status server), and on the first failure stops the instance with `./daq_stop.sh N`. It refuses (exit 2) to start an instance that runs with `instance_guard = legacy` while another instance is live, unless `--allow-legacy-guard` is given.
 
 ### 4.6 systemd units
 
-Today `packaging/systemd/heimdall-daq@.service` starts `/opt/heimdall/instances/%i/Firmware/daq_start_sm.sh` and stops with `daq_stop.sh %i`. `%i` must equal the `instance_id` in that copy's INI. The instance-0 unit `heimdall-daq.service` stops with the no-argument `daq_stop.sh`, which on a multi-instance host stops every instance. Do not use it beside templated instances until the WP-16 change lands.
+`packaging/systemd/heimdall-daq@.service` starts `/opt/heimdall/instances/%i/Firmware/daq_start_sm.sh` and stops with `daq_stop.sh %i`. `%i` must equal the `instance_id` in that copy's INI. The instance-0 unit `heimdall-daq.service` starts `/opt/heimdall/Firmware/daq_start_sm.sh` and stops with `daq_stop.sh 0`, so it stops only instance 0.
 
-**Planned (WP-16).** `heimdall-daq.service` stops with `daq_stop.sh 0`. New `heimdall-daq-supervised@.service` (and `heimdall-daq-supervised.service` for instance 0) runs `daq_supervise.sh --instance %i --healthcheck auto`, restarts on failure and runs `daq_stop.sh %i --clean` after stop. The oneshot and supervised units of one instance conflict; pick one per instance. The supervisor exits 10-15 when a stage dies (10 rtl_daq or synthesizer, 11 rebuffer, 12 decimate, 13 delay_sync, 14 hw_controller, 15 iq_server) and 16 on a failed health check. Exit codes 1-4 are not restarted. Further units: `heimdall-coordinator.service`, `heimdall-iq-router.service` (both unprivileged, user `heimdall`), `heimdall-host-tuning.service`, and an optional `heimdall-daq-watchdog.timer`. See [packaging/systemd/README.md](../packaging/systemd/README.md).
-
-<!-- verify-after: WP-12 -->
-<!-- verify-after: WP-16 -->
+`heimdall-daq-supervised@.service` (and `heimdall-daq-supervised.service` for instance 0) runs `daq_supervise.sh --instance %i --healthcheck auto`, restarts on failure and runs `daq_stop.sh %i --clean` after stop. The oneshot and supervised units of one instance conflict; pick one per instance. The supervisor exits 10-15 when a stage dies (10 rtl_daq or synthesizer, 11 rebuffer, 12 decimate, 13 delay_sync, 14 hw_controller, 15 iq_server) and 16 on a failed health check. Exit codes 1-4 are not restarted. Further units: `heimdall-coordinator.service`, `heimdall-iq-router.service` (both unprivileged, user `heimdall`), `heimdall-host-tuning.service`, and an optional `heimdall-daq-watchdog.timer`. See [packaging/systemd/README.md](../packaging/systemd/README.md).
 
 ## 5. Multi-host federation
 
@@ -380,8 +381,8 @@ Mesh peers of an instance: `peer_list` when non-empty, else `cluster_members` mi
 | Process | Count | Placement | Started by |
 |---|---|---|---|
 | DAQ instance | one per receiver set | the host with the dongles | `daq_start_sm.sh` (root) |
-| Coordinator | one static, or 3 or more election candidates | any host that can reach every member's `:5001` and `:5002` | by hand today; `federation_start.sh coordinator` or `heimdall-coordinator.service` (**Planned**, WP-12/WP-16) |
-| IQ router | one per host, plus optionally one central router | per-host: next to its instances; central: next to the consumers | by hand today; `federation_start.sh router` or `heimdall-iq-router.service` (**Planned**) |
+| Coordinator | one static, or 3 or more election candidates | any host that can reach every member's `:5001` and `:5002` | by hand, `federation_start.sh coordinator` or `heimdall-coordinator.service` |
+| IQ router | one per host, plus optionally one central router | per-host: next to its instances; central: next to the consumers | by hand, `federation_start.sh router` or `heimdall-iq-router.service` |
 
 The coordinator and router need no root and no RT priority.
 
@@ -401,7 +402,7 @@ Add `instance_id * port_stride` to the 5000-5002 ports for members with instance
 
 The coordinator drives the instances, not the other way round. It polls each member's `:5002` and sends commands to each member's `:5001`. An instance contacts a coordinator only when `register_with_coordinator = 1` (section 5.4). `[federation] coordinator_host`/`coordinator_port` are read by `heimdall-ctl fleet` and by that registrar; the pipeline does not use them otherwise.
 
-Run the coordinator by hand today:
+Run the coordinator by hand:
 
 ```
 $ cd /opt/heimdall/Firmware
@@ -432,7 +433,7 @@ $ echo $?
 0
 ```
 
-**Planned (WP-12): federation launchers.**
+**Federation launchers** (in `Firmware/`, no root, no RT priority, no CPU pinning):
 
 ```
 ./federation_start.sh coordinator|router|all [--config PATH] [--foreground]
@@ -440,9 +441,9 @@ $ echo $?
 ./federation_stop.sh  coordinator|router|all [--pid-dir DIR]
 ```
 
-Defaults: config `/etc/heimdall/federation.ini` if present, else `./daq_chain_config.ini`; logs in `_logs/federation/`; PID files in `_logs/federation/pids/`. Exit 3 when the service is already running, 2 on usage errors, 1 when the service exits immediately.
+Defaults: config `/etc/heimdall/federation.ini` if present, else `./daq_chain_config.ini`; logs in `_logs/federation/` (`$HEIMDALL_FED_LOG_DIR`); PID files in `_logs/federation/pids/` (`$HEIMDALL_FED_PID_DIR`); `--state-dir` (coordinator only) from `$HEIMDALL_FED_STATE_DIR`, not passed when empty. `--foreground` execs one service in place (used by the systemd units). Start exit codes: 0 started, 1 the service exited immediately, 2 usage error, 3 already running. `federation_stop.sh` sends SIGTERM, waits 5 s, then SIGKILL; exit 0 done, 2 usage error.
 
-**Planned (WP-14): `util/cluster_cfg_gen.py`.**
+**`util/cluster_cfg_gen.py`** generates a whole cluster's configuration:
 
 ```
 python3 util/cluster_cfg_gen.py --template PATH --hosts hosta:2 hostb:1 [--stride 100]
@@ -451,11 +452,7 @@ python3 util/cluster_cfg_gen.py --template PATH --hosts hosta:2 hostb:1 [--strid
     [--register] [--health-mode mesh|hub] [--auth-token-file PATH] --out DIR
 ```
 
-It writes one INI per instance (`DIR/<host>/inst<N>/daq_chain_config.ini`) with `cluster_members`, never `peer_list`, plus `DIR/federation.ini`, `DIR/ports.md` and `DIR/provision.sh`. It validates every file and exits 1 on a port collision or a core plan that exceeds a host.
-
-<!-- verify-after: WP-08 -->
-<!-- verify-after: WP-12 -->
-<!-- verify-after: WP-14 -->
+It writes one INI per instance (`DIR/<host>/inst<N>/daq_chain_config.ini`, ids 0..k-1 per host) with `cluster_members`, never `peer_list`, plus `DIR/federation.ini`, `DIR/ports.md` and `DIR/provision.sh` (`provision_instance.py --from-config` lines per host). With `--router`, every host other than the router host also gets `DIR/<host>/federation.ini` for a per-host router chained into the central one. It validates every file and exits 1 (files kept for inspection) on a validation error, a port collision or a core plan that exceeds a host; 2 on usage errors.
 
 ### 5.4 Dynamic registration
 
@@ -470,9 +467,6 @@ With `[federation] register_with_coordinator = 1` (requires `en_federation = 1`)
 | holder expired (no REGISTER for 3 × its interval) | accepted; replaces the holder |
 
 Expired members show `state: "expired"` and are removed after `register_retain_sec` (600 s).
-
-<!-- verify-after: WP-06 -->
-<!-- verify-after: WP-08 -->
 
 ## 6. Coordination features
 
@@ -500,8 +494,6 @@ $ printf 'VERSION\n' | nc 127.0.0.1 6000
 $ printf 'REBALANCE\n' | nc 127.0.0.1 6000
 {"error": "no master schedule"}
 ```
-
-<!-- verify-after: WP-08 -->
 
 ### 6.2 The fleet CLI
 
@@ -572,8 +564,6 @@ The schedule document uses the `signal_scheduler` JSON format:
 
 Without a `state_dir`, a static coordinator forgets the master schedule on restart. `REBALANCE` then replies `no master schedule`.
 
-<!-- verify-after: WP-08 -->
-
 ### 6.4 Coordinator election and fencing
 
 Election runs only when `[federation] coordinator_candidates` lists the coordinator processes (`host:port,...`). Otherwise the coordinator is `static` with term 0.
@@ -593,11 +583,9 @@ The leader holds leases granted by the other candidates. Followers answer every 
 
 **Quorum needs at least 3 candidates.** With 2 candidates and `require_quorum = 1`, losing either host blocks all mutations. With `require_quorum = 0`, two leaders can exist during a network partition. This is not consensus. Members fence stale leaders instead.
 
-**Fencing at members.** The coordinator sends its term in `XACK`. Each hw_controller keeps the highest term it has seen in `_data_control/<P>fence_term` and refuses mutating requests with a lower non-zero term (`reason: "stale_term"`). The file survives restarts. Connections with term 0 (heimdall-ctl, DoA clients, static coordinators) are never fenced. A term more than `fence_max_term_jump` (default 1000) above the stored one is refused with `term_jump`. Only an XACK whose `cluster_id` equals the member's own can raise the stored term. The planned `daq_stop.sh N --reset-fence` (WP-12) removes the file.
+**Fencing at members.** The coordinator sends its term in `XACK`. Each hw_controller keeps the highest term it has seen in `_data_control/<P>fence_term` and refuses mutating requests with a lower non-zero term (`reason: "stale_term"`). The file survives restarts. Connections with term 0 (heimdall-ctl, DoA clients, static coordinators) are never fenced. A term more than `fence_max_term_jump` (default 1000) above the stored one is refused with `term_jump`. Only an XACK whose `cluster_id` equals the member's own can raise the stored term. `./daq_stop.sh N --reset-fence` removes the file of a stopped instance (section 4.5).
 
 Replicated state (master schedule, runtime members, assignments) is pushed from the leader to followers after every change. With `require_quorum = 1`, a change stored on a minority replies `not_replicated`. With `require_quorum = 0`, the reply carries `"durable": false` when not every follower stored it.
-
-<!-- verify-after: WP-08 -->
 
 ### 6.5 Timeouts
 
@@ -612,8 +600,6 @@ Every coordinator request has a deadline fixed at receipt. `VERSION` advertises 
 | Circuit breaker | 3 failures, 10 s hold | `breaker_failures`, `breaker_open_sec` |
 
 A target whose `T_cmd` exceeds the remaining budget is skipped before the command is sent (`rto_exceeds_deadline`).
-
-<!-- verify-after: WP-08 -->
 
 ## 7. Data aggregation: the IQ router
 
@@ -673,8 +659,6 @@ Calibration bursts are per island. Each instance runs its own noise-source burst
 
 See [consumer_guide.md](consumer_guide.md) for the header slots and [networking_and_time_sync.md](networking_and_time_sync.md) for clock discipline.
 
-<!-- verify-after: WP-09 -->
-
 ## 8. Failure modes and recovery
 
 | Failure | What you see | Recovery |
@@ -685,17 +669,13 @@ See [consumer_guide.md](consumer_guide.md) for the header slots and [networking_
 | Elected leader dies | Followers reply `not_leader` until one takes over (about 10 s for rank 1) | Automatic. heimdall-ctl follows the redirect |
 | Network partition, `require_quorum = 1` | Minority side replies `no_quorum` to mutations | Heal the network |
 | Network partition, `require_quorum = 0` | Two leaders possible | Members refuse the lower term (`stale_term`) |
-| Instance crash | Peers report it down; coordinator STATUS `error`; router source goes to `backoff` | Restart the instance. The planned supervised units restart it automatically (WP-16) |
+| Instance crash | Peers report it down; coordinator STATUS `error`; router source goes to `backoff` | Restart the instance. The supervised units restart it automatically (section 4.6) |
 | Stalled pipeline (processes alive, no frames) | With `[monitoring] status_extended = 1`: STATUS `pipeline_health: "stale"` after `stale_after_sec` (auto `3 × k × T_fp + 1` s, k = `status_update_interval` when > 0, else `heartbeat_interval`; 132 s at defaults). The coordinator also flags a member whose `frame_count` stops advancing (`member_stall_after_sec`, auto) | Inspect the logs; restart the instance |
 | Duplicate node key | REGISTER rejected with `duplicate_node_key`; `MEMBERS` lists `key_collisions` | Set a unique `advertise_host` or `node_id` |
 | Foreign cluster | `cluster_mismatch` | Align `cluster_id` |
 | Router consumer lost | Router evicts the client; sources keep streaming to other clients | Client reconnects |
 | `iq_server` slot held by another client | Router source in `waiting_for_slot` | Free the slot, or set `[data_interface] iq_server_max_clients > 1` |
-| Busy ports at start (today) | Start script runs the global `./daq_stop.sh`; every instance stops | Start instances one at a time; use the planned scoped stop (WP-12) |
-
-<!-- verify-after: WP-06 -->
-<!-- verify-after: WP-08 -->
-<!-- verify-after: WP-09 -->
+| Busy ports at start (default `instance_guard = legacy`) | Start script runs the global `./daq_stop.sh`; every instance stops | Start instances one at a time; set `instance_registry = 1` and `instance_guard = refuse`, or start under the supervisor, so the busy-port loop runs the scoped `./daq_stop.sh N` |
 
 ## 9. Worked examples
 
@@ -708,10 +688,10 @@ Hardware: 8 cores, two xHCI controllers, two 5-channel units on separate control
 | 0 | `/opt/heimdall/Firmware` | `serial_base = 1000` (default) | 0,1,2,3 | 1130, 5000-5003 |
 | 1 | `/opt/heimdall/instances/1/Firmware` | `serial_base = 1100` | 4,5,6,7 | 1230, 5100-5103 |
 
-Steps today:
+Steps by hand:
 
 1. Build: `cd /opt/heimdall/Firmware/_daq_core && make`.
-2. Program unit B's EEPROM serials to 1100-1104 with `rtl_eeprom` (a helper, `util/set_unit_serials.sh`, is planned in WP-14). See [hardware_setup.md](hardware_setup.md).
+2. Program unit B's EEPROM serials to 1100-1104. Plug in unit B alone and run `sudo util/set_unit_serials.sh --unit 1` (it prints the plan; add `--yes` to write and verify), or use `rtl_eeprom` directly. See [hardware_setup.md](hardware_setup.md).
 3. Create instance 1's directory as in section 4.4. Set in its INI:
 
    ```ini
@@ -738,17 +718,16 @@ Steps today:
 7. Check: `heimdall-ctl status` and `heimdall-ctl --instance 1 status`. These read the status servers (`:5002` and `:5102`) enabled in steps 3 and 4.
 8. Stop one: `sudo ./daq_stop.sh 1` in instance 1's directory.
 
-With the planned tools (WP-12/14/16), steps 3-6 become:
+With the provisioning tool and the supervised units, steps 3-6 become (run from `/opt/heimdall`; drop `--write` first to see the dry-run plan):
 
 ```sh
-sudo python3 util/provision_instance.py --instance 0 --in-place --write
-sudo python3 util/provision_instance.py --instance 1 --write --systemd
+sudo python3 util/provision_instance.py --instance 0 --in-place --systemd --write
+sudo python3 util/provision_instance.py --instance 1 --systemd --write
+sudo systemctl enable --now heimdall-host-tuning
 sudo systemctl enable --now heimdall-daq-supervised heimdall-daq-supervised@1
 ```
 
-<!-- verify-after: WP-12 -->
-<!-- verify-after: WP-14 -->
-<!-- verify-after: WP-16 -->
+`--systemd` sets `[host] host_tuning = 0`, so `heimdall-host-tuning.service` does the host tuning once per boot. The provisioned INIs also enable the status servers, so step 7 works unchanged.
 
 ### 9.2 Three hosts, one instance each, with coordinator and router
 
@@ -836,7 +815,9 @@ Start order:
        --pid-file _logs/federation/pids/router.pid >/dev/null 2>&1 &
    ```
 
-   Stop them with `kill $(cat _logs/federation/pids/coordinator.pid)` and `kill $(cat _logs/federation/pids/router.pid)`.
+   Stop them with `kill $(cat _logs/federation/pids/coordinator.pid)` and `kill $(cat _logs/federation/pids/router.pid)`, or with `./federation_stop.sh all`, which uses the same PID files.
+
+   Instead of steps 3 and 4 you can run `./federation_start.sh coordinator --state-dir /var/lib/heimdall/coordinator` and `./federation_start.sh router` (both read `/etc/heimdall/federation.ini` when it exists), or enable `heimdall-coordinator.service` and `heimdall-iq-router.service` (user `heimdall`). Neither passes `--self`, so set `[federation] coordinator_self` in each host's `federation.ini`, or rely on the host-name match described under Requirements.
 
 5. Check:
 
@@ -855,9 +836,6 @@ Requirements:
 * Firewall: the flows in the table in section 5.3. The candidates must reach each other on 6000; blocking it stops election and replication, and with `require_quorum = 1` mutations fail with `no_quorum`.
 
 See [networking_and_time_sync.md](networking_and_time_sync.md). The three islands are independent; downstream DSP must treat them as separate arrays.
-
-<!-- verify-after: WP-08 -->
-<!-- verify-after: WP-09 -->
 
 ### 9.3 Raspberry Pi 4: one hardware instance
 

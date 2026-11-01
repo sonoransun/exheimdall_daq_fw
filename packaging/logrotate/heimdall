@@ -1,17 +1,45 @@
 # Logrotate policy for the HeIMDALL DAQ firmware.
 #
-# The DAQ processes append to Firmware/_logs/*.log (instance 0) and
-# Firmware/_logs/instN/*.log (federation instances N>0) via stderr
-# redirection, so copytruncate is required - the processes keep their file
-# descriptors open for the lifetime of the chain.
+# The DAQ processes write Firmware/_logs/*.log (instance 0) and
+# Firmware/_logs/instN/*.log (federation instances N>0) through a stderr
+# redirection, and the federation coordinator/router keep their log files
+# open too, so copytruncate is required - every process keeps its file
+# descriptor open for its whole lifetime.
+#
+# Known limitation: the start scripts open the stage logs with "2>"
+# (truncate, no O_APPEND). After copytruncate a stage keeps writing at its
+# old offset, so its log becomes a sparse file that stays above the size
+# limit, is rotated again on every run, and its rotated copy contains the
+# leading zeros. The federation logs (/var/log/heimdall, opened in append
+# mode) are not affected.
+#
+# Covered:
+#   /opt/heimdall/Firmware/_logs/...              instance 0 (and any instance
+#                                                 run from the install root)
+#   /opt/heimdall/instances/<N>/Firmware/_logs/   provisioned instance dirs
+#                                                 (util/provision_instance.py)
+#   /opt/heimdall/Firmware/_logs/federation/      federation_start.sh default
+#   /var/log/heimdall/                            heimdall-coordinator.service and
+#                                                 heimdall-iq-router.service
+#
+# Separate from this policy: every start of daq_start_sm.sh /
+# daq_synthetic_start.sh moves the previous run's logs into
+# _logs[/instN]/archive/<timestamp>/ and keeps the last 10 archives of that
+# instance. logrotate only bounds the logs of the running chain; it does not
+# touch the archive directories.
 #
 # Install (assumes the firmware is deployed at /opt/heimdall, see
 # packaging/systemd/README.md):
 #   sudo cp packaging/logrotate/heimdall /etc/logrotate.d/heimdall
-# If the firmware lives elsewhere, adjust the paths below.
+# If the firmware lives elsewhere, adjust the paths below
+# (util/provision_instance.py prints a matching stanza for its --root).
 
 /opt/heimdall/Firmware/_logs/*.log
-/opt/heimdall/Firmware/_logs/inst*/*.log {
+/opt/heimdall/Firmware/_logs/inst*/*.log
+/opt/heimdall/instances/*/Firmware/_logs/*.log
+/opt/heimdall/instances/*/Firmware/_logs/inst*/*.log
+/opt/heimdall/Firmware/_logs/federation/*.log
+/var/log/heimdall/*.log {
     size 50M
     rotate 7
     copytruncate

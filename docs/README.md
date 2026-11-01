@@ -21,15 +21,14 @@ no npm, no build step. This README is excluded from the site.
 2. On GitHub, open **Settings → Pages**.
 3. Under **Build and deployment**, choose **Source: Deploy from a branch**, then the
    branch (for example `main`) and the folder **`/docs`**. Save.
-4. The base URL is detected on GitHub Pages: `_config.yml` leaves `baseurl` unset
-   (YAML null), so the Pages build uses `/<repo>` for a project site
-   (`https://<owner>.github.io/<repo>/`) and nothing for a user site or a custom domain.
-   Set `baseurl: "/<repo>"` only to override that. Never set it to `""`: an empty
-   string switches the detection off and breaks every link on a project site.
-5. Before publishing, set `repo_url: "https://github.com/<owner>/<repo>"` in
-   `_config.yml`. The footer and guide links that point outside `Documentation/`
-   (for example `../CHANGELOG.md`) then become links into the repository; while it
-   is empty they render as code text.
+4. The site is published at <https://sonoransun.github.io/exheimdall_daq_fw/>.
+   `_config.yml` sets `url: "https://sonoransun.github.io"` and
+   `baseurl: "/exheimdall_daq_fw"` explicitly, so local builds produce the same links.
+   For a fork, change both to your owner and repository name; for a custom domain
+   or a user site, set `baseurl: ""`.
+5. `repo_url` is set to `https://github.com/sonoransun/exheimdall_daq_fw`. The footer
+   and guide links that point outside `Documentation/` (for example `../CHANGELOG.md`)
+   become links into the repository; set it to `""` to render them as code text.
 6. Re-run `python3 docs/_tools/sync_docs.py` as the last step before publishing, so
    the guide matches `Documentation/`.
 
@@ -70,7 +69,7 @@ source "https://rubygems.org"
 gem "github-pages", group: :jekyll_plugins
 G
 BUNDLE_GEMFILE=/tmp/Gemfile bundle install
-BUNDLE_GEMFILE=/tmp/Gemfile bundle exec jekyll serve --source . --destination /tmp/heimdall-site --baseurl /exheimdall
+BUNDLE_GEMFILE=/tmp/Gemfile bundle exec jekyll serve --source . --destination /tmp/heimdall-site --baseurl /exheimdall_daq_fw
 ```
 
 Or with any Jekyll 3.9 or 4.x in a container:
@@ -83,7 +82,7 @@ docker run --rm -p 4000:4000 -v "$PWD":/srv/jekyll -w /srv/jekyll jekyll/jekyll:
 Then open <http://localhost:4000/>. After a build, check internal links and anchors:
 
 ```bash
-python3 docs/_tools/check_links.py /tmp/heimdall-site --baseurl /exheimdall
+python3 docs/_tools/check_links.py /tmp/heimdall-site --baseurl /exheimdall_daq_fw
 ```
 
 With `--baseurl`, a site-relative link that lacks the prefix (one that skipped the

@@ -1,0 +1,12 @@
+# Environment for the HeIMDALL DAQ units (heimdall-daq*.service and
+# heimdall-daq-watchdog.service). Install as /etc/default/heimdall-daq;
+# per-instance overrides go to /etc/default/heimdall-daq@<N>
+# (provision_instance.py --systemd writes them).
+#
+# systemd reads KEY=VALUE lines only; no inline comments, no shell syntax.
+#
+# PATH must reach the python3 that has numpy/scipy/numba/pyzmq (the conda/
+# miniforge "kraken" environment by default).
+PATH=/opt/miniforge3/envs/kraken/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Host instance registry directory ([host] instance_registry = 1)
+HEIMDALL_RUN_DIR=/run/heimdall

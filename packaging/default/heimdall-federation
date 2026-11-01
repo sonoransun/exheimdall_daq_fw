@@ -1,0 +1,12 @@
+# Environment for heimdall-coordinator.service and heimdall-iq-router.service.
+# Install as /etc/default/heimdall-federation.
+#
+# systemd reads KEY=VALUE lines only; no inline comments, no shell syntax.
+PATH=/opt/miniforge3/envs/kraken/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+#
+# federation_start.sh defaults, used when its --log-dir/--pid-dir/--state-dir
+# flags are absent. The shipped units pass all three flags (flags win), so
+# these only matter for a unit override that drops a flag.
+#HEIMDALL_FED_LOG_DIR=/var/log/heimdall
+#HEIMDALL_FED_PID_DIR=/run/heimdall-federation
+#HEIMDALL_FED_STATE_DIR=/var/lib/heimdall/coordinator

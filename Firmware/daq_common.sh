@@ -206,14 +206,18 @@ for k, v in out.items():
 # ---------------------------------------------------------------------------
 
 # hd_pid_role_alive PID ROLE: 0 when PID runs and its command line
-# (ps -o args=) contains ROLE - the stale-PID-file test of daq_stop.sh.
+# (ps -o args=) contains ROLE - the stale-PID-file test of daq_stop.sh. A
+# zombie (exited, not yet reaped by a parent such as a container's PID 1
+# that never waits) does not run.
 hd_pid_role_alive() {
-    local args
+    local info
     [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
     case "$1" in *[!0-9]*) return 1 ;; esac
     kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1 || return 1
-    args=$(ps -o args= -p "$1" 2>/dev/null) || return 1
-    case "$args" in
+    info=$(ps -o stat= -o args= -p "$1" 2>/dev/null) || return 1
+    info="${info#"${info%%[! ]*}"}"
+    case "$info" in
+        Z*) return 1 ;;
         *"$2"*) return 0 ;;
     esac
     return 1
@@ -273,9 +277,26 @@ hd_run_dir() {
     return 1
 }
 
+# hd_registry_dir_trusted DIR: 0 when DIR may be read as a registry
+# directory. $HD_RUN, $HEIMDALL_RUN_DIR and /run/heimdall only need to exist;
+# any other directory (the /tmp/heimdall-run-<uid> fallback, a run_dir hint)
+# must be a real directory owned by this uid, the test hd_run_dir applies,
+# so a directory another local user planted in /tmp is never read or pruned.
+hd_registry_dir_trusted() {
+    local owner
+    [ -d "$1" ] || return 1
+    case "$1" in
+        "${HD_RUN:-/run/heimdall}" | "${HEIMDALL_RUN_DIR:-/run/heimdall}" | /run/heimdall) return 0 ;;
+    esac
+    [ ! -L "$1" ] || return 1
+    owner=$(ls -ldn "$1" 2>/dev/null | awk '{print $3}')
+    [ "$owner" = "$(id -u)" ]
+}
+
 # hd_registry_dirs: existing registry directories, one per line: $HD_RUN,
 # $HEIMDALL_RUN_DIR (default /run/heimdall), /tmp/heimdall-run-<uid> and the
-# run_dir hints this copy's chains recorded. Creates nothing.
+# run_dir hints this copy's chains recorded (the last two only when
+# hd_registry_dir_trusted). Creates nothing.
 hd_registry_dirs() {
     local f
     {
@@ -285,7 +306,7 @@ hd_registry_dirs() {
             [ -f "$f" ] && head -n 1 "$f"
         done
     } | awk 'NF && !seen[$0]++' | while IFS= read -r f; do
-        [ -d "$f" ] && printf '%s\n' "$f"
+        hd_registry_dir_trusted "$f" && printf '%s\n' "$f"
     done
 }
 
@@ -517,19 +538,42 @@ HD_EOF
     return 0
 }
 
+# hd_ss_listen [-p] PORT: the listener lines `ss -ltn[p] "sport = :PORT"`
+# reports, without its header (no -H/--no-header, which iproute2 < 4.13 lacks).
+# Non-zero when ss is missing or fails.
+hd_ss_listen() {
+    local fl out
+    fl=-ltn
+    if [ "$1" = -p ]; then
+        fl=-ltnp
+        shift
+    fi
+    command -v ss >/dev/null 2>&1 || return 1
+    out=$(ss "$fl" "sport = :$1" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | awk 'NF && $1 != "State"'
+}
+
+# hd_lsof_listen PORT: lsof's listener lines of PORT without the header.
+# Non-zero when lsof is missing; lsof's own status is not trusted (it is 1
+# both for "nothing found" and for errors), so an empty answer means free.
+hd_lsof_listen() {
+    command -v lsof >/dev/null 2>&1 || return 1
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | tail -n +2
+    return 0
+}
+
 # hd_port_in_use PORT: 0 = a TCP listener holds PORT, 1 = free, 2 = unknown
-# (neither ss nor lsof). Only listening sockets count (L5).
+# (neither ss nor lsof gave an answer). Only listening sockets count (L5).
 hd_port_in_use() {
     local rc out
     rc=2
-    if command -v ss >/dev/null 2>&1; then
+    if out=$(hd_ss_listen "$1"); then
         rc=1
-        out=$(ss -ltnH "sport = :$1" 2>/dev/null)
         [ -n "$out" ] && return 0
     fi
-    if command -v lsof >/dev/null 2>&1; then
+    if out=$(hd_lsof_listen "$1"); then
         rc=1
-        lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+        [ -n "$out" ] && return 0
     fi
     return "$rc"
 }
@@ -537,22 +581,20 @@ hd_port_in_use() {
 # hd_port_holder PORT: "name",pid=... of the listener (best effort).
 hd_port_holder() {
     local h
-    h=""
-    if command -v ss >/dev/null 2>&1; then
-        h=$(ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*users:((\(.*\))).*/\1/p' | head -n 1)
-    fi
-    if [ -z "$h" ] && command -v lsof >/dev/null 2>&1; then
-        h=$(lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 {print $1 " (pid " $2 ")"}')
+    h=$(hd_ss_listen -p "$1" | sed -n 's/.*users:((\(.*\))).*/\1/p' | head -n 1)
+    if [ -z "$h" ]; then
+        h=$(hd_lsof_listen "$1" | awk 'NR == 1 {print $1 " (pid " $2 ")"}')
     fi
     printf '%s\n' "${h:-unknown}"
 }
 
 # hd_port_listeners PORT: the listener lines of PORT for the final error.
 hd_port_listeners() {
-    if command -v ss >/dev/null 2>&1; then
-        ss -ltnpH "sport = :$1" 2>/dev/null
-    elif command -v lsof >/dev/null 2>&1; then
-        lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | tail -n +2
+    local out
+    if out=$(hd_ss_listen -p "$1") && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    else
+        hd_lsof_listen "$1"
     fi
 }
 
@@ -571,7 +613,9 @@ hd_port_check() {
     if [ "$HD_EN_MONITORING" = 1 ] && [ "$HD_EN_ZMQ_PUB" = 1 ]; then
         adv="$adv $((HD_ZMQ_PUB_PORT + off))"
     fi
-    if ! command -v ss >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+    p=0
+    hd_port_in_use "$iq" || p=$?
+    if [ "$p" = 2 ]; then
         echo "WARN: Neither lsof nor ss available - skipping port availability check"
         return 0
     fi

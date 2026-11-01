@@ -1,0 +1,30 @@
+# HeIMDALL DAQ watchdog - one check of every systemd-supervised chain.
+# Started by heimdall-daq-watchdog.timer; optional, not enabled by install.
+#
+#   sudo systemctl enable --now heimdall-daq-watchdog.timer
+#
+# Restarts a heimdall-daq-supervised[@N] unit after 3 consecutive failed
+# STATUS checks (unreachable, pipeline_health error/stale, or frame_count
+# frozen beyond the stall threshold). Chains started by hand, by the oneshot
+# units or with the status server disabled are reported and never
+# restarted. Needs [host] instance_registry = 1 and the status server in the
+# instance INI (provision_instance.py writes both). Counters:
+# /run/heimdall/watchdog.json. Log: journalctl -u heimdall-daq-watchdog
+#
+# Only running chains are checked: a supervised unit that hit its start
+# limit has no running chain and needs "systemctl reset-failed <unit>" and
+# "systemctl start <unit>" by hand.
+#
+# No Condition*= here on purpose: a skipped run never activates this
+# oneshot, so OnUnitActiveSec= in the timer would lose its base and the
+# timer would stop. A missing script fails visibly (status 203/EXEC) and
+# the timer keeps firing.
+
+[Unit]
+Description=HeIMDALL DAQ watchdog (restart unhealthy supervised chains)
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/heimdall-daq
+ExecStart=/opt/heimdall/util/heimdall_watchdog.py --run-dir /run/heimdall --fails 3

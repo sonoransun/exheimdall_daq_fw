@@ -1,22 +1,37 @@
-# HeIMDALL DAQ chain - single-instance (instance 0) systemd unit.
+# HeIMDALL DAQ chain - single-instance (instance 0) systemd unit, oneshot.
 #
 # Install notes: see packaging/systemd/README.md
 #
 # The start script itself applies the tiered SCHED_FIFO priorities and CPU
 # affinity (chrt/taskset in daq_start_sm.sh) - the unit only has to permit
 # them (LimitRTPRIO/LimitMEMLOCK) and must not tamper with CPUAffinity.
+#
+# This unit starts the chain and leaves it alone: a stage that dies stays
+# dead until the next restart. heimdall-daq-supervised.service watches the
+# chain and lets systemd restart it instead; the two units conflict, enable
+# only one of them.
+#
+# ExecStop stops only instance 0 (daq_stop.sh 0, through its PID files), so
+# stopping this unit never takes other instances of the host down with it.
 
 [Unit]
 Description=HeIMDALL DAQ coherent acquisition chain
 After=network.target
 Documentation=https://github.com/krakenrf/heimdall_daq_fw
+Conflicts=heimdall-daq-supervised.service
+# Refuse to start (instead of failing mid-start) when the C core is not built
+ConditionPathExists=/opt/heimdall/Firmware/_daq_core/rtl_daq.out
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/heimdall/Firmware
+# PATH (conda/miniforge python) and HEIMDALL_RUN_DIR; optional
+EnvironmentFile=-/etc/default/heimdall-daq
+# Recorded as "launcher" in the instance registry ([host] instance_registry = 1)
+Environment=HEIMDALL_LAUNCHER=systemd-oneshot
 ExecStart=/opt/heimdall/Firmware/daq_start_sm.sh
-ExecStop=/opt/heimdall/Firmware/daq_stop.sh
+ExecStop=/opt/heimdall/Firmware/daq_stop.sh 0
 # The start/stop scripts use sudo internally; run the unit as root.
 User=root
 # Allow SCHED_FIFO up to the tiers daq_start_sm.sh requests (99 max)

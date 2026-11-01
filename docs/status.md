@@ -12,7 +12,7 @@ description: What the verification review checked, which estimates it corrected,
 
 Every figure on the overview pages (home, architecture, scaling, status, active arrays) was checked against the current tree, the pristine pre-program baseline, the design specification and, for the active track, primary vendor sources. The synced guides in the library are reproduced as written and were not all checked; where a guide disagrees with a figure here, this page has the verified value. Nothing here is committed or tagged yet: "done" means implemented and reviewed in the working tree.
 
-**The foundations hold.** The baseline still passes its 15 hardware-free modules and builds cleanly in all three lanes. In the current tree, the default 1024-byte header and the seed-0 synthetic stream are byte-identical to the baseline. The arithmetic behind the [default configuration]({{ '/scaling.html#defaults' | relative_url }}) is solid. Most corrections only tighten a figure. Two need action: one finished package has a test that now fails, and the default multi-client deadline cannot be met over Gigabit Ethernet.
+**The foundations hold.** The baseline still passes its 15 hardware-free modules and builds cleanly in all three lanes. In the current tree, the default 1024-byte header and the seed-0 synthetic stream are byte-identical to the baseline. The arithmetic behind the [default configuration]({{ '/scaling.html#defaults' | relative_url }}) is solid. Most corrections only tighten a figure. One still needs action: the default multi-client deadline cannot be met over Gigabit Ethernet. The test defect the review found in WP-10 is fixed.
 
 ## Claims checked
 
@@ -36,7 +36,7 @@ Every figure on the overview pages (home, architecture, scaling, status, active 
 | Active-arrays research | 39 | 32 | 5 | 0 | 0 | 2 |
 | **Total** | **184** | **131** | **29** | **2** | **16** | **6** |
 
-Of the audit's top 20 gaps, one is fixed, two are partly fixed, nine are being fixed by packages in flight and eight are still open.
+At review time, of the audit's top 20 gaps, one was fixed, two were partly fixed, nine were being fixed by packages then in flight and eight were still open.
 
 ## Corrected estimates
 
@@ -55,7 +55,7 @@ Of the audit's top 20 gaps, one is fixed, two are partly fixed, nine are being f
 | Triangular-lattice element saving | 15&nbsp;% | 13.4&nbsp;% |
 | Velocity-factor phase error, 2&nbsp;m at 2.4&nbsp;GHz | ±97° | ±87° at a velocity factor of 0.66 |
 | Per Vices `ref_locked` sensor | commented out | live, alongside `pps_detected` |
-| Hardware-free suite (review snapshot) | 21 of 21, 14 pending | 25 of 27 present pass; 35 registered |
+| Hardware-free suite | 21 of 21, 14 pending | 35 registered, all present; 35 of 35 pass in a fresh run on 2026-11-01 |
 
 Six claims could not be settled. Three need hardware: the USB bus budget per hub, the share of a Raspberry Pi 4 core that `delay_sync` needs, and the latency of a deferred command (bounded at 0.437&nbsp;s in steady state). The 40&nbsp;MiB memlock example has no derivation, and two active-track facts, the amateur and ITU spurious-emission rule text and the `python3-uhdpv` import name, were not fetched from their sources. One further figure, the exact number of blocks in a calibration burst, can also only be measured on hardware.
 
@@ -74,15 +74,12 @@ Six claims could not be settled. Three need hardware: the USB bus budget per hub
 
 {% include status_legend.html %}
 
-WP-12, WP-13 and WP-14 have files on disk but have not been reviewed. WP-10's synthesizer is correct, but its new loop-model test binds module functions as methods; a two-line `staticmethod()` change fixes it. The specification's documentation packages are not in the package list.
+WP-17b and WP-20 are still being implemented. The WP-10 loop-model test that bound module functions as methods now wraps them in `staticmethod()`, and all 15 of its tests pass. The specification's documentation packages are not in the package list.
 
 ## Open risks
 
-- **A test defect keeps the CI lane red.** Until the WP-10 fix lands, the hardware-free suite cannot go green.
-- **The multi-client deadline is not met over GbE.** At the defaults every Gigabit client becomes a straggler; the factor or its basis needs revisiting before WP-04 closes.
-- **WP-05 behaviour on Linux is unsettled.** Its tests pass on macOS; one Linux run errored and another hung. It needs a clean re-run once the file settles.
-- **A federation fan-out regression.** WP-08's fan-out test returns `reset` instead of a success reply; it is in flight and needs a clean re-run.
-- **Opt-in defaults stay conservative.** A default install still shows most of the top-20 gaps after the packages land, for example a single control connection and a ZMQ port bound to every interface. Two gaps stay open until the launch scripts (WP-12) and packaging (WP-16) are done.
+- **The multi-client deadline is not met over GbE.** At the defaults every Gigabit client becomes a straggler. WP-04 closed with the auto deadline still at 0.8 × the frame period, so over GbE set `iq_server_frame_deadline_ms` explicitly; the factor or its basis still needs revisiting.
+- **Opt-in defaults stay conservative.** A default install still shows most of the top-20 gaps after the packages land, for example a single control connection and a ZMQ port bound to every interface.
 - **Documentation has no owner.** The specification's documentation packages (WP-18 and WP-19) are not in the package list, so five audit gaps have no owner, and the glossary's "today" wording has already drifted from the current defaults.
 - **A latent partial write in `GAIN`, also in the baseline.** A value outside the valid gain table mid-list leaves earlier channels written, to be applied on the next change.
 - **Some figures need hardware.** The four above, with no hardware lane yet to measure them.

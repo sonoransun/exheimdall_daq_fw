@@ -2,7 +2,7 @@
 
 This release is a drop-in upgrade for an existing station. Every new feature is opt-in. With every new key absent and no new flag passed, the chain behaves as before. The only exceptions are the sixteen default-path differences listed in [section 4](#4-default-path-changes-in-this-release-ledger-l1-l16). This document explains how to identify versions, what to keep, how to upgrade a station or a fleet, and how to roll back.
 
-Two packages of this release are still being implemented: the systemd unit changes (WP-16, ledger row L8) and the `.hcap` capture sidecar (WP-20). The rows that describe them follow the design specification and carry a `verify-after` marker in the source of this page. Everything else on this page describes the code in this tree.
+One package of this release is still being implemented: the `.hcap` capture sidecar (WP-20). The row that describes it follows the design specification and carries a `verify-after` marker in the source of this page. Everything else on this page describes the code in this tree.
 
 ## Key facts
 
@@ -160,7 +160,7 @@ Set `unit_id` back to an integer before you start an older tree. The rollback pr
 
 "Default path" means an existing INI with every new key absent, and scripts invoked with no new flag. These rows are the complete list of differences on that path. Each row is a fix of an audited defect, a cleanup that is a no-op unless an opt-in feature created files, or (L16) log text only. Everything else is byte-identical: process names, FIFO and shm names and sizes, ports, the 128-byte `:5001` and `:1130` frames, the `FNSD` replies of existing verbs, the `:5002` JSON of existing verbs, the `:5003` frames and the 1024-byte IQ header.
 
-"Implemented" means the change is in the code of this tree. "Specified" means its package (WP-16) is still in progress. The row describes the specification.
+"Implemented" means the change is in the code of this tree.
 
 | Row | Difference on the default path | Status |
 |---|---|---|
@@ -171,7 +171,7 @@ Set `unit_id` back to an integer before you start an older tree. The rollback pr
 | L5 | The start script's port-busy test matches listening sockets only (`ss -ltnH`, then `lsof -sTCP:LISTEN`), so a connected DoA client no longer triggers a kill. The status port probed is `[monitoring] status_server_port` + offset (fallback 5002). Ports `1130` + offset and the event PUB port get an advisory `WARN:` line only. The retry loop, its `./daq_stop.sh` call, the 10 attempts and exit 1 are unchanged | Implemented |
 | L6 | `ini_checker` errors on `num_ch > 31`, `cpi_size > 2^23` and `corr_size > 2^23`. Port-window checks are errors only in new-key mode ([section 3.2](#32-new-validation-ledger-rows-l6-and-l7)) | Implemented |
 | L7 | `ini_checker` prints warnings to stderr with the prefix `WARNING: `. The exit code is unchanged. Every shipped preset prints no warning in `no_hw` mode. `daq_start_sm.sh` now runs the `no_hw attached` form. Without serial keys its serial checks only warn, for example when two attached receivers share a serial | Implemented |
-| L8 | `heimdall-daq.service` uses `ExecStop=daq_stop.sh 0`, an optional `EnvironmentFile=-`, `ConditionPathExists` and `Conflicts=` with the supervised unit. `KillMode=control-group` is unchanged | Specified (WP-16) <!-- verify-after: WP-16 --> |
+| L8 | `heimdall-daq.service` uses `ExecStop=daq_stop.sh 0`, an optional `EnvironmentFile=-`, `ConditionPathExists` and `Conflicts=` with the supervised unit. `KillMode=control-group` is unchanged | Implemented |
 | L9 | Synthetic mode. The synthesizer answers ZMQ control commands on `1130` + offset, so the simulated chain can calibrate. It still stamps header `unit_id = 0` unless `[hw] unit_id = auto` or `--unit-id-from-config` is given. It stays unpaced, unseeded and 10 000 blocks long by default | Implemented (synthesizer) |
 | L9 (scripts) | `daq_synthetic_start.sh` exits 1 when the FIR designer fails (it returned 0 before), runs an advisory port probe, uses `sudo env "PATH=$PATH"` for hw_controller and creates `iq_track_lock` (L2) | Implemented |
 | L10 | `auto_config.py` rewrites the INI atomically (temporary file and `os.replace`, mode and owner kept). It writes nothing when no value is `auto`, which is the case for every shipped INI | Implemented |
@@ -332,7 +332,25 @@ Install the new release next to the old one, then switch a symlink. The old tree
     sudo systemctl daemon-reload
     ```
 
-    The unit changes of ledger row L8 take effect only through this step. <!-- verify-after: WP-16 -->
+    The unit changes of ledger row L8 take effect only through this step. The new `heimdall-daq.service` has `ConditionPathExists=/opt/heimdall/Firmware/_daq_core/rtl_daq.out`, so systemd skips the start when step 4 did not build the C core.
+
+    This release also ships new units and environment templates. Install only the ones you use. [packaging/systemd/README.md](../packaging/systemd/README.md) describes each of them:
+
+    ```
+    # supervised chain (enable it instead of heimdall-daq, the two units conflict)
+    sudo cp $NEW/packaging/systemd/heimdall-daq-supervised.service /etc/systemd/system/
+    sudo cp $NEW/packaging/systemd/heimdall-daq-supervised@.service /etc/systemd/system/   # instance N > 0
+    sudo cp $NEW/packaging/systemd/heimdall-daq-watchdog.service $NEW/packaging/systemd/heimdall-daq-watchdog.timer /etc/systemd/system/
+    sudo cp $NEW/packaging/systemd/heimdall-host-tuning.service /etc/systemd/system/
+    # federation services
+    sudo cp $NEW/packaging/systemd/heimdall-coordinator.service $NEW/packaging/systemd/heimdall-iq-router.service /etc/systemd/system/
+    # environment templates; -n keeps a file you already edited
+    sudo cp -n $NEW/packaging/default/heimdall-daq /etc/default/heimdall-daq
+    sudo cp -n $NEW/packaging/default/heimdall-federation /etc/default/heimdall-federation   # federation services
+    sudo systemctl daemon-reload
+    ```
+
+    Every unit reads its `/etc/default` file with `EnvironmentFile=-`, so a missing file is not an error.
 
 12. Start:
 
@@ -359,7 +377,7 @@ If a check fails, roll back ([section 8](#8-rollback)). The old tree is unchange
 
 ### 6.2 Several instances on one host
 
-Stop every instance before the switch, and stop each systemd unit by name. The units are `Type=oneshot` with `RemainAfterExit=yes`. `systemctl stop heimdall-daq` runs the host-wide `daq_stop.sh`, which kills the processes of every instance. The `heimdall-daq@N` units then stay `active (exited)`, so a later `systemctl start heimdall-daq@N` does nothing and instance N stays down without an error. Stop and start each unit explicitly, or use `systemctl restart`.
+Stop every instance before the switch, and stop each systemd unit by name. The units are `Type=oneshot` with `RemainAfterExit=yes`. With the previous release's unit, `systemctl stop heimdall-daq` runs the host-wide `daq_stop.sh`, which kills the processes of every instance. This release's unit runs `daq_stop.sh 0` and stops only instance 0 (ledger row L8), but the units installed at upgrade time are still the old ones. After a host-wide stop the `heimdall-daq@N` units stay `active (exited)`, so a later `systemctl start heimdall-daq@N` does nothing and instance N stays down without an error. Stop and start each unit explicitly, or use `systemctl restart`.
 
 Both multi-instance layouts keep the instance directories under `/opt/heimdall/instances/<N>`, which is inside the versioned tree. The switch must carry them into `$NEW`.
 
@@ -527,6 +545,7 @@ Rollback is the upgrade in reverse. It needs no rebuild when the old tree still 
 
 ```
 sudo systemctl disable --now heimdall-daq@1 heimdall-daq@2
+sudo systemctl disable --now heimdall-daq-supervised@1 heimdall-daq-supervised@2   # supervised instances
 ```
 
 Leave `$NEW/instances` where it is. The previous release does not use it, and a later roll forward to the same `$NEW` finds it in place. To run an instance N > 0 on the old tree anyway (for example a synthetic one), move the directory back with `sudo mv $NEW/instances $OLD/` after step 1. Then run the refresh after step 3 with the new tree's script, because the previous release has no `provision_instance.py`:
@@ -554,6 +573,18 @@ The old root must still contain `Firmware/_daq_core`, `ini_checker.py`, `daq_sta
    sudo cp -a /root/heimdall-units-<old>/heimdall-daq*.service /etc/systemd/system/
    sudo systemctl daemon-reload
    ```
+
+   If 6.1 step 11 installed units that are new in this release, disable them before the start. The old tree has no `daq_supervise.sh` and no watchdog. Leave a unit out of the list when you did not install it:
+
+   ```
+   sudo systemctl disable --now heimdall-daq-watchdog.timer heimdall-daq-supervised heimdall-host-tuning
+   sudo rm /etc/systemd/system/heimdall-daq-supervised.service /etc/systemd/system/heimdall-daq-supervised@.service \
+           /etc/systemd/system/heimdall-daq-watchdog.service /etc/systemd/system/heimdall-daq-watchdog.timer \
+           /etc/systemd/system/heimdall-host-tuning.service
+   sudo systemctl daemon-reload
+   ```
+
+   Then enable the oneshot unit again if you had switched to the supervised one: `sudo systemctl enable heimdall-daq`. A previous release ignores `/etc/default/heimdall-daq`.
 
 5. Validate with the old tree's checker: `cd /opt/heimdall/Firmware && python3 ini_checker.py no_hw; echo "exit=$?"`.
 6. Start, then check as in 6.1 step 13. `heimdall-ctl status` again needs the `:5002` status server.

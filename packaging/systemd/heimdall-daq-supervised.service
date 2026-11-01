@@ -1,0 +1,56 @@
+# HeIMDALL DAQ chain - supervised, instance 0 (/opt/heimdall/Firmware).
+#
+#   systemctl enable --now heimdall-daq-supervised
+#
+# daq_supervise.sh starts the chain, watches every stage (and, with the
+# status server enabled, STATUS) and exits with a stage-specific code when
+# one fails: 10 rtl_daq/synthesizer, 11 rebuffer, 12 decimate,
+# 13 delay_sync, 14 hw_controller, 15 iq_server, 16 healthcheck. systemd
+# then restarts the unit (at most 5 starts in 300 s). Codes 1-4 (config
+# error, usage, guard refusal, strict preflight) are not transient and are
+# not restarted. After the start limit the unit stays failed with nothing
+# running (the watchdog does not see it); recover it by hand:
+#   systemctl reset-failed heimdall-daq-supervised
+#   systemctl start heimdall-daq-supervised
+#
+# Every stop here is "daq_stop.sh 0", never the host-wide stop. ExecStopPost
+# "--clean" removes instance 0's FIFOs, shared memory and relay files after
+# every stop (fence_term is kept).
+#
+# On a multi-instance host provision instance 0 first:
+#   sudo python3 /opt/heimdall/util/provision_instance.py --instance 0 --in-place --systemd --write
+# otherwise the supervisor refuses to start it (legacy instance guard,
+# exit 2, not restarted).
+# Conflicts with heimdall-daq.service (the oneshot alternative).
+
+[Unit]
+Description=HeIMDALL DAQ chain, supervised (instance 0)
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+After=network-online.target heimdall-host-tuning.service
+Wants=network-online.target
+Conflicts=heimdall-daq.service
+ConditionPathExists=/opt/heimdall/Firmware/daq_chain_config.ini
+ConditionPathExists=/opt/heimdall/Firmware/_daq_core/rtl_daq.out
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/heimdall/Firmware
+EnvironmentFile=-/etc/default/heimdall-daq
+# Recorded as "unit" in the instance registry (used by the watchdog)
+Environment=UNIT_NAME=%n
+ExecStart=/opt/heimdall/Firmware/daq_supervise.sh --instance 0 --healthcheck auto
+ExecStopPost=/opt/heimdall/Firmware/daq_stop.sh 0 --clean
+Restart=on-failure
+RestartSec=5
+# 1 config error, 2 usage/misconfiguration, 3 guard refusal, 4 strict preflight: not transient
+RestartPreventExitStatus=1 2 3 4
+User=root
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -52,6 +52,12 @@ HIGH_SPEED_MBPS = 480
 MEM_HEADROOM_BYTES = 512 * MIB         # OS / Python interpreters / page cache headroom
 FRAME_PERIOD_WARN_SEC = 8.0            # control timeouts (D.6.1)
 EGRESS_WARN_FRACTION = 0.70            # warn from 70 % of a NIC's line rate
+#: TCP/IPv4 goodput share of Ethernet line rate at a 1500-byte MTU with
+#: timestamps: 1448 payload bytes per 1538 bytes on the wire (preamble, SFD,
+#: header, FCS, IFG). Egress above it cannot be carried, so it is the fail bound.
+TCP_GOODPUT_FRACTION = 1448.0 / 1538.0  # ~0.941
+SEND_FRAME_DEADLINE_S = 10             # iq_server.c single-client per-frame send bound
+IQ_MULTI_MIN_AUTO_DEADLINE_MS = 100    # iq_server.c floor of the automatic frame deadline
 MEMORY_WARN_FRACTION = 0.80            # warn from 80 % of MemAvailable
 
 DEFAULT_STATUS_PORT, DEFAULT_ZMQ_PUB_PORT = 5002, 5003
@@ -124,6 +130,24 @@ def rebuffer_ring_bytes(M, Ncpi, R, Nc, B):
 def frame_period_sec(Ncpi, R, fs):
     """T_fp = Ncpi * R / fs (rebuffer.c)."""
     return Ncpi * R / float(fs)
+
+
+def iq_frame_deadline_sec(inst):
+    """Time iq_server.out allows one frame to reach every client (iq_server.c).
+
+    Single-client (iq_server_max_clients = 1): SEND_FRAME_DEADLINE_S. Multi-
+    client: the explicit iq_server_frame_deadline_ms, else 1.0 x the frame
+    period truncated to whole ms and floored at IQ_MULTI_MIN_AUTO_DEADLINE_MS
+    (multi_frame_deadline_ms). The multi-client sessions send in parallel, so
+    all of them must finish within it over the shared link.
+    """
+    if inst.get("iq_server_max_clients", 1) <= 1:
+        return float(SEND_FRAME_DEADLINE_S)
+    explicit = inst.get("iq_server_frame_deadline_ms", 0) or 0
+    if explicit > 0:
+        return explicit / 1000.0
+    ms = int(inst["cpi_size"] * inst["decimation_ratio"] * 1000.0 / inst["sample_rate"])
+    return max(ms, IQ_MULTI_MIN_AUTO_DEADLINE_MS) / 1000.0
 
 
 def rt_priorities(offset=0):
@@ -327,6 +351,8 @@ def instance_from_params(params, config=None, mode="hw", nproc=None, is_local=No
         "serials": resolve_serials(params, M) if mode == "hw" else [],
         "out_data_iface_type": iface,
         "iq_server_max_clients": _int(params, "data_interface", "iq_server_max_clients", 1, minimum=1),
+        "iq_server_frame_deadline_ms": _int(params, "data_interface", "iq_server_frame_deadline_ms",
+                                            0, minimum=0),
         "num_ch": M, "sample_rate": sample_rate, "daq_buffer_size": B, "cpi_size": Ncpi,
         "decimation_ratio": R, "corr_size": Nc,
         "usb_ring_buffers": _int(params, "daq", "usb_ring_buffers", 8, minimum=1),
@@ -358,7 +384,8 @@ def instance_from_registry(entry, params=None, nproc=None, is_local=None):
                 "cores": default_cores(iid, nproc), "explicit_cores": False,
                 "delay_sync_cores": [], "allow_core_sharing": "warn",
                 "rt_priority_offset": 0, "serials": serials, "out_data_iface_type": "eth",
-                "iq_server_max_clients": 1, "size_segments_from_config": False,
+                "iq_server_max_clients": 1, "iq_server_frame_deadline_ms": 0,
+                "size_segments_from_config": False,
                 "params_known": False}
         inst.update(d)
     inst["source"] = "live"
@@ -477,6 +504,8 @@ def instance_model(inst):
         "egress_per_client_Bps": M * fs * CF32_SAMPLE_BYTES / float(R),
         "egress_clients": clients,
         "egress_Bps": M * fs * CF32_SAMPLE_BYTES / float(R) * clients,
+        "egress_deadline_Bps": (clients * (IQ_HEADER_BYTES + M * Ncpi * CF32_SAMPLE_BYTES)
+                                / iq_frame_deadline_sec(inst)) if eth else 0,
         "cores": list(inst["cores"]),
         "rt_priorities": rt_priorities(inst["rt_priority_offset"]),
     }
@@ -651,6 +680,11 @@ def _check_egress(insts, host):
         return {"egress": _skip("MB/s", "NICs not probed")}
     need = round(sum(i["model"]["egress_Bps"] for i in eth) / 1e6, 3)
     clients = sum(i["model"]["egress_clients"] for i in eth)
+    # Every frame must reach all clients of a multi-client server within its
+    # frame deadline; a deadline shorter than the frame period needs a burst
+    # rate above the stream rate (sessions missing it are closed every frame).
+    burst = round(sum(max(i["model"]["egress_Bps"], i["model"].get("egress_deadline_Bps", 0))
+                      for i in eth) / 1e6, 3)
     links = [n for n in nics if n.get("speed_mbps") and n["speed_mbps"] > 0 and n.get("name") != "lo"]
     if not links:
         return {"egress": _skip("MB/s", "no NIC with a known link speed")}
@@ -663,9 +697,14 @@ def _check_egress(insts, host):
     for n in links:
         have = round(n["speed_mbps"] / 8.0, 3)
         frac = need / have
-        verdict = "fail" if frac > 1.0 else ("warn" if frac >= EGRESS_WARN_FRACTION else "ok")
-        note = "{0:.0f} % of link ({1} client{2} at cf32)".format(100.0 * frac, clients,
-                                                                 "" if clients == 1 else "s")
+        verdict = "fail" if frac > TCP_GOODPUT_FRACTION else (
+            "warn" if frac >= EGRESS_WARN_FRACTION else "ok")
+        note = "{0:.0f} % of link ({1} client{2} at cf32; TCP goodput {3:.1f} % of link)".format(
+            100.0 * frac, clients, "" if clients == 1 else "s", 100.0 * TCP_GOODPUT_FRACTION)
+        if burst > need and burst / have > TCP_GOODPUT_FRACTION:
+            verdict = "fail"
+            note += "; frame deadline needs {0:.1f} MB/s ({1:.0f} % of link)".format(
+                burst, 100.0 * burst / have)
         if n["speed_mbps"] < fastest and verdict != "ok":
             verdict = "skip"
             note += "; not judged: {0} is faster".format(", ".join(best))

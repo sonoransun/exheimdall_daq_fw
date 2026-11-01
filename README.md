@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/sonoransun/exheimdall_daq_fw/actions/workflows/ci.yml/badge.svg)](https://github.com/sonoransun/exheimdall_daq_fw/actions/workflows/ci.yml)
 
+**Documentation site: <https://sonoransun.github.io/exheimdall_daq_fw/>** (overview, architecture, scaling and clustering, active arrays, and the full guide library, built from `docs/`).
+
 Coherent data acquisition and signal processing chain for KrakenSDR multichannel
 RTL-SDR receivers. Designed for Raspberry Pi 4 (ARM64) and x86_64 Linux systems.
 
@@ -464,8 +466,8 @@ Limits: a 4-core host such as a Raspberry Pi 4 fits one hardware instance
 (each instance pins 4 cores). Two units on one USB 2.0 bus do not fit the
 capacity model's 35 MB/s budget. Every member of a federation needs
 `[monitoring] en_monitoring = 1` and `en_status_server = 1`; the router needs
-`[data_interface] out_data_iface_type = eth`. The systemd units for the
-supervisor, coordinator, router and host tuning are not shipped yet; see
+`[data_interface] out_data_iface_type = eth`. For systemd units covering the
+supervisor, coordinator, router and host tuning, see
 [Deployment](#deployment).
 
 ### Quick start: two instances on one host
@@ -613,26 +615,46 @@ integrators, cluster operators and developers.
 
 ## Deployment
 
-`packaging/` contains:
+`packaging/` contains the following. The table in
+[packaging/systemd/README.md](packaging/systemd/README.md) is the reference,
+and that file also gives the install procedure.
 
-- `systemd/heimdall-daq.service`: single-instance unit wrapping
-  `daq_start_sm.sh`/`daq_stop.sh` with the required `LimitRTPRIO`/
-  `LimitMEMLOCK` grants. Its `ExecStop` runs the no-argument `daq_stop.sh`,
-  which stops every instance on the host, so do not use it beside templated
-  instances.
-- `systemd/heimdall-daq@.service`: per-instance template for
-  `/opt/heimdall/instances/%i/Firmware`, stopped with `daq_stop.sh %i`
-- `logrotate/heimdall`: rotation for `/opt/heimdall/Firmware/_logs/*.log` and
-  `/opt/heimdall/Firmware/_logs/inst*/*.log`, the instance-0 tree only. A
-  provisioned instance N logs to
-  `/opt/heimdall/instances/<N>/Firmware/_logs/inst<N>/*.log`, and the
-  federation services log to `_logs/federation/*.log`. Add your own entries
-  for those paths.
+- `systemd/heimdall-daq.service`: instance 0, oneshot. It wraps
+  `daq_start_sm.sh` with the required `LimitRTPRIO`/`LimitMEMLOCK` grants and
+  stops with `daq_stop.sh 0`, so it stops only instance 0 and is safe beside
+  templated instances.
+- `systemd/heimdall-daq@.service`: instance N > 0, oneshot template for
+  `/opt/heimdall/instances/%i/Firmware`, stopped with `daq_stop.sh %i`.
+- `systemd/heimdall-daq-supervised.service` and
+  `systemd/heimdall-daq-supervised@.service`: the supervised alternatives for
+  instance 0 and instance N. `daq_supervise.sh` watches the chain, and systemd
+  restarts it when a stage dies or the status-server health check fails.
+  `ExecStopPost` runs `daq_stop.sh <N> --clean`. Each supervised unit
+  conflicts with the oneshot unit of the same instance.
+- `systemd/heimdall-host-tuning.service`: host-wide tuning, run once per boot
+  (`util/host_tuning.sh --apply`).
+- `systemd/heimdall-coordinator.service`: the federation coordinator
+  (port 6000), run unprivileged.
+- `systemd/heimdall-iq-router.service`: the federation IQ router
+  (ports 7000/7001), run unprivileged.
+- `systemd/heimdall-daq-watchdog.service` and `.timer`: optional. They restart
+  a supervised chain whose status server keeps reporting a failure.
+- `default/heimdall-daq` and `default/heimdall-federation`: environment
+  templates for `/etc/default/heimdall-daq` and
+  `/etc/default/heimdall-federation`. Use them to put the `kraken` Python
+  environment on the units' `PATH`.
+- `udev/99-heimdall-rtlsdr.rules`: optional. It gives the `plugdev` group
+  access to RTL2832U devices.
+- `logrotate/heimdall`: rotation for the instance-0 tree
+  (`/opt/heimdall/Firmware/_logs/*.log` and `_logs/inst*/*.log`), the
+  provisioned instance directories (`/opt/heimdall/instances/*/Firmware/_logs/`),
+  the federation launcher logs (`_logs/federation/*.log`) and the
+  coordinator/router unit logs (`/var/log/heimdall/*.log`).
 
-See `packaging/systemd/README.md` for the install procedure. Units for the
-supervisor, the coordinator, the router, host tuning and a watchdog are
-specified but not in this tree yet. Until they land, run `daq_supervise.sh`
-and `federation_start.sh --foreground` from your own units.
+None of these files changes how the scripts behave when you run them by hand.
+If the firmware is not in `/opt/heimdall`, edit the paths in the units and the
+logrotate policy. `util/provision_instance.py` prints a logrotate stanza that
+matches its `--root`.
 
 ## Project Structure
 
@@ -712,7 +734,7 @@ exheimdall_daq_fw/
 │   └── performance_monitor.py        # Per-process performance tracking
 ├── ci/build.sh                       # Reproducible lanes (generic/kfr/asan/deploy-lint)
 ├── .github/workflows/ci.yml          # CI: C matrix, asan, Python, pipeline, deploy-lint
-├── packaging/                        # systemd units + logrotate policy
+├── packaging/                        # systemd units, /etc/default templates, udev rule, logrotate
 ├── Documentation/                    # In-depth documentation (start at README.md)
 ├── pyproject.toml                    # heimdall-ctl packaging + pytest config
 ├── CONTRIBUTING.md                   # Contributor guide

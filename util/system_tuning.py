@@ -143,9 +143,15 @@ def apply_sysctl_config():
         target = Path('/etc/sysctl.d/99-heimdall-rt.conf')
         target.write_text(config_file.read_text())
 
-        # Apply immediately
-        subprocess.run(['sysctl', '-p', str(target)], check=True)
-        print("  Applied kernel tuning parameters")
+        # Apply immediately. -e: keys this kernel does not have are skipped
+        # instead of aborting; sysctl still applies every other key when one
+        # value is rejected, so a non-zero exit is reported, not fatal.
+        result = subprocess.run(['sysctl', '-e', '-p', str(target)], check=False)
+        if result.returncode == 0:
+            print("  Applied kernel tuning parameters")
+        else:
+            print(f"  Warning: sysctl rejected some settings of {target} "
+                  f"(exit {result.returncode}); the others were applied")
     except Exception as e:
         print(f"  Warning: Sysctl configuration failed: {e}")
 

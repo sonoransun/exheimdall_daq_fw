@@ -1388,6 +1388,153 @@ class TestReviewRegressions(CoordinatorCase):
         self.assertEqual(a.gen, rec["gen"])
 
 
+class _TrickleServer(object):
+    """Accepts connections and sends one byte every *period* seconds, forever."""
+
+    def __init__(self, period=0.05):
+        self.period = period
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self._trickle, args=(c,), daemon=True).start()
+
+    def _trickle(self, c):
+        try:
+            while not self.stop.is_set():
+                c.sendall(b" ")
+                time.sleep(self.period)
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+
+
+class TestHardening(CoordinatorCase):
+    """Bounded reads, atomic sync apply, REGISTER limits, priority probe."""
+
+    def test_apply_sync_doc_is_atomic(self):
+        c = self.coord([], start=False)
+        for bad in ({"term": 5, "version": 7, "issued_gens": ["x"]},
+                    {"term": 6, "version": 9, "assignments": [1]},
+                    {"term": 6, "version": 9, "assignments": {"k": 1}},
+                    {"term": 6, "version": 9, "members_runtime": [1]},
+                    {"term": 6, "version": 9, "schedule": {"entries": "x"}}):
+            with self.assertRaises(ValueError):
+                c._apply_sync_doc(bad)
+            self.assertEqual((c._sync_term, c._version), (0, 0), bad)
+            self.assertEqual(c._assignments, {})
+        c._apply_sync_doc({"term": 2, "version": 3, "schedule": SCHED,
+                           "issued_gens": [1, 2], "members_runtime": {"added": ["hostq:2"]}})
+        self.assertEqual((c._sync_term, c._version), (2, 3))
+        self.assertEqual([m.node_key for m in c._members()], ["hostq:2"])
+
+    def test_load_state_discards_corrupt_assignments(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "master_schedule.json"), "w") as f:
+                json.dump({"term": 3, "version": 4, "schedule": None}, f)
+            with open(os.path.join(d, "assignments.json"), "w") as f:
+                json.dump({"assignments": [1]}, f)
+            with self.assertLogs("federation_coordinator", level="ERROR"):
+                c = self.coord([], settings=fast_settings(state_dir=d), start=False)
+            self.assertEqual((c._sync_term, c._version), (0, 0))
+
+    def test_status_poll_bounded_against_trickling_member(self):
+        tr = _TrickleServer()
+        self._cleanup.append(tr.close)
+        insts = [{"host": "127.0.0.1", "instance_id": 0, "node_key": "slow:0",
+                  "ports": {"ctl": _free_port(), "status": tr.port}}]
+        c = self.coord(insts, settings=fast_settings(status_timeout_sec=0.3), start=False)
+        t0 = time.monotonic()
+        out = c._line_worker("STATUS")(c._members()[0], _Ctx(5.0))
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertIn("error", out)
+
+    def test_health_fetch_bounded_against_trickling_peer(self):
+        from federation_health import FederationHealth
+        tr = _TrickleServer()
+        self._cleanup.append(tr.close)
+        fh = FederationHealth(0, [], peer_timeout=0.3)
+        t0 = time.monotonic()
+        with self.assertRaises(socket.timeout):
+            fh._fetch_status("127.0.0.1", tr.port)
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_register_rate_limited_per_source(self):
+        import federation_coordinator as fcm
+        from federation_common import Request
+        c = self.coord([], start=False)
+
+        def reg(i, src):
+            body = {"node_key": "h{}:1".format(i), "instance_id": 1, "nonce": "n{}".format(i),
+                    "advertise_host": "10.1.0.{}".format(i % 250 + 1)}
+            req = Request("REGISTER", "", json.dumps(body).encode(), False, "REGISTER")
+            return c._verb_register(req, (src, 40000))
+        for i in range(fcm.REGISTER_NEW_PER_SOURCE):
+            self.assertTrue(reg(i, "10.0.0.1")["ok"])
+        r = reg(999, "10.0.0.1")
+        self.assertEqual((r["ok"], r["error"]), (False, "busy"))
+        self.assertTrue(reg(0, "10.0.0.1")["ok"])          # a re-registration still works
+        self.assertTrue(reg(1000, "10.0.0.2")["ok"])       # another source is not affected
+        old = fcm.REGISTER_MAX_MEMBERS
+        fcm.REGISTER_MAX_MEMBERS = len(c._registered)
+        try:
+            r = reg(1001, "10.0.0.3")
+            self.assertEqual((r["ok"], r["error"]), (False, "busy"))
+        finally:
+            fcm.REGISTER_MAX_MEMBERS = old
+
+    def test_collision_events_pruned(self):
+        import federation_coordinator as fcm
+        c = self.coord([], start=False)
+        mono = time.monotonic()
+        for i in range(300):
+            c._collision_events[("k{}".format(i), "a", "b")] = mono - fcm.COLLISION_EVENT_SEC - 1
+        from federation_common import Request
+
+        def reg(src, nonce):
+            body = {"node_key": "dup:1", "instance_id": 1, "nonce": nonce}
+            req = Request("REGISTER", "", json.dumps(body).encode(), False, "REGISTER")
+            return c._verb_register(req, (src, 40000))
+        self.assertTrue(reg("10.0.0.1", "a")["ok"])
+        self.assertEqual(reg("10.0.0.2", "b")["error"], "duplicate_node_key")
+        self.assertLessEqual(len(c._collision_events), 256)
+        self.assertIn(("dup:1", "10.0.0.1", "10.0.0.2"), c._collision_events)
+
+    def test_idle_overflow_does_not_starve_priority_probe(self):
+        c = self.coord([], settings=fast_settings(max_handlers=2, reserved_handlers=2))
+        holders = [socket.create_connection(("127.0.0.1", c.port)) for _ in range(2 + 40)]
+        self._cleanup.extend(h.close for h in holders)
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        leader = rj(c.port, "LEADER", timeout=5.0)
+        self.assertTrue(leader["ok"])
+        self.assertLess(time.monotonic() - t0, 1.5)
+
+
+class _Ctx(object):
+    def __init__(self, sec):
+        self.deadline = time.monotonic() + sec
+        self.phase = None
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+
 def _raw(line):
     from federation_common import Request
     parts = line.split(None, 1)

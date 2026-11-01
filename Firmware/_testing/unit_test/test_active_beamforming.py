@@ -327,6 +327,7 @@ class TestTx(unittest.TestCase):
         g = ula8()
         t = BF.tx_weights(g, BF.BeamSpec(20, 0, taper="chebyshev"), F)
         s = D.ramp_window(D.bandlimited_noise(4096, 10e6, 5e6, rng_stream(5, "s")), 32)
+        s = np.concatenate([s, np.zeros(8)])                              # guard zeros >= the 2-sample delay
         cal = (np.exp(1j * np.linspace(0, 2, 8)) * np.linspace(0.8, 1.3, 8), np.linspace(0, 2e-7, 8))
         out = BF.synthesize_tx(s, t, 10e6, tx_cal=cal, backoff_db=6.0, peak_target=0.5)
         self.assertAlmostEqual(float(np.abs(out).max()), 0.5 * 10 ** (-6 / 20), places=15)
@@ -339,6 +340,255 @@ class TestTx(unittest.TestCase):
         bad[5] = np.nan
         with self.assertRaises(ValueError):
             BF.synthesize_tx(bad, t, 10e6)
+
+
+class TestTxRefusals(unittest.TestCase):
+    """TX is safety critical: requests the weights cannot honour are refused, not warned."""
+
+    def test_das_with_tx_nulls_is_refused(self):
+        g = ula8()
+        spec = BF.BeamSpec(0, 0, nulls=((22, 0),))
+        with self.assertRaises(GeometryError) as cm:
+            BF.tx_weights(g, spec, F)
+        self.assertEqual(cm.exception.code, "NULLS")
+        self.assertIn("projection", str(cm.exception))
+        with self.assertRaises(GeometryError):
+            BF.solve_beam(g, spec, F, direction="tx")
+        sol = BF.solve_beam(g, BF.BeamSpec(0, 0, method="projection", nulls=((22, 0),)), F, direction="tx")
+        self.assertLess(sol.metrics.null_depths_db[0], -100.0)
+        cfg = C.default_config(beam={"tx_nulls": "40:0"})               # tx_method defaults to das
+        with self.assertRaises(GeometryError):
+            BF.tx_weights(g, BF.spec_from_config(cfg, "tx"), F)
+
+    def test_tx_look_outside_scan_cone_is_refused(self):
+        g = G.preset_ula(8, 0.6 * LAM)
+        self.assertEqual([i for i in G.validate_geometry(g, F, F, 40, which="tx") if i.level != "info"], [])
+        for kw in (dict(scan_limit_deg=40), {}):
+            gg = g if kw else g.with_scan_limit(40)
+            with self.assertRaises(GeometryError) as cm:
+                BF.solve_beam(gg, BF.BeamSpec(70, 0), F, direction="tx", **kw)
+            self.assertEqual(cm.exception.code, "SCAN_LIMIT")
+            BF.tx_weights(gg, BF.BeamSpec(35, 0), F, **kw)               # inside the cone: fine
+        for az in (265.0, 180.0, 95.0):                                  # behind, default 90 deg (forward half)
+            with self.assertRaises(GeometryError) as cm:
+                BF.tx_weights(g, BF.BeamSpec(az, 0), F)
+            self.assertEqual(cm.exception.code, "SCAN_LIMIT")
+        with self.assertRaises(GeometryError):                           # endfire with a 40 deg cone
+            BF.tx_weights(g.with_scan_limit(40), BF.BeamSpec(270, 0), F)
+        with self.assertRaises(GeometryError):                           # focus point outside the cone too
+            BF.tx_weights(g.with_scan_limit(30), BF.BeamSpec(45, 0, focus_range_m=3.0), F)
+        cfg = C.default_config(geometry={"scan_limit_deg": 20, "spacing_m": 0.1},
+                               devices={"sim0": {"family": "sim", "rx_channels": "0..3", "tx_channels": "0..3"}})
+        gc = G.geometry_from_config(cfg)
+        self.assertEqual(gc.scan_limit_deg, 20.0)
+        with self.assertRaises(GeometryError):
+            BF.tx_weights(gc, BF.BeamSpec(25, 0), F)
+        # RX is not refused, only flagged
+        out = []
+        sol = BF.solve_beam(g.with_scan_limit(40), BF.BeamSpec(70, 0), F, issues=out)
+        self.assertIn("SCAN_LIMIT", [i.code for i in out])
+        self.assertEqual(sol.issues, out)
+
+    def test_tx_grating_lobe_is_refused(self):
+        g = G.preset_ula(8, 1.0 * LAM)                                   # grating lobes for any scan
+        with self.assertRaises(GeometryError) as cm:
+            BF.solve_beam(g, BF.BeamSpec(20, 0), F, direction="tx")
+        self.assertEqual(cm.exception.code, "GRATING_LOBE")
+        rx = BF.solve_beam(g, BF.BeamSpec(20, 0), F)                     # RX: reported in the metrics
+        self.assertTrue(any(lb.kind == "grating" and lb.level_db > -1.0 for lb in rx.metrics.lobes))
+        # the intrinsic mirror image of a planar panel is not a grating lobe
+        ura = G.preset_ura(4, 4, LAM / 2, LAM / 2)
+        tx = BF.solve_beam(ura, BF.BeamSpec(20, 10), F, direction="tx")
+        self.assertTrue(any(lb.intrinsic and lb.level_db > -1.0 for lb in tx.metrics.lobes))
+
+    def test_solve_beam_collects_issues(self):
+        out = []
+        sol = BF.solve_beam(ula8(), BF.BeamSpec(0, 0, nulls=((40, 0),)), F, issues=out)
+        self.assertEqual([i.code for i in out], ["NULLS"])
+        self.assertEqual(sol.issues, out)
+        back = BF.BeamSolution.from_json(sol.to_json())
+        self.assertEqual(back.issues, sol.issues)
+        uca = G.preset_uca(8, arc_spacing_m=0.45 * LAM)
+        out = []
+        tx = BF.solve_beam(uca, BF.BeamSpec(0, 0, taper="taylor"), F, direction="tx", issues=out)
+        self.assertIn("TAPER", [i.code for i in tx.issues])
+        self.assertEqual(out, tx.issues)
+        t_issues = []
+        BF.tx_weights(uca, BF.BeamSpec(0, 0, taper="hamming"), F, issues=t_issues)
+        self.assertEqual([i.code for i in t_issues], ["TAPER"])
+
+    def test_synthesize_tx_rejects_bad_scaling(self):
+        g = ula8()
+        t = BF.tx_weights(g, BF.BeamSpec(10, 0), F)
+        s = 0.5 * D.tone(1024, 10e6, 1e6)
+        for bad in (dict(backoff_db=-20.0), dict(backoff_db=float("nan")), dict(backoff_db=float("inf")),
+                    dict(backoff_db="x"), dict(peak_target=3.0), dict(peak_target=0.0),
+                    dict(peak_target=-0.5), dict(peak_target=float("nan"))):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                BF.synthesize_tx(s, t, 10e6, **bad)
+        self.assertAlmostEqual(float(np.abs(BF.synthesize_tx(s, t, 10e6, peak_target=1.0)).max()), 1.0)
+        corr = np.ones(8, dtype=complex)
+        corr[3] = 1000.0                                                 # a very weak chain
+        with self.assertLogs("heimdall.active.beamforming", "WARNING"):
+            out = BF.synthesize_tx(s, t, 10e6, tx_cal=(corr, np.zeros(8)))
+        self.assertTrue(np.isfinite(out).all())
+        out = BF.synthesize_tx(s, t, 10e6, tx_cal=(corr, np.zeros(8)), peak_target=0.8, backoff_db=1.0)
+        self.assertAlmostEqual(float(np.abs(out).max()), 0.8 * 10 ** (-1 / 20), places=12)
+
+
+def _patterned(body, pattern):
+    return G.ArrayGeometry([G.Element(i, tuple(b), rx=ChannelRef("s", i), tx=ChannelRef("s", i), pattern=pattern)
+                            for i, b in enumerate(body)])
+
+
+class TestTxBeamGates(unittest.TestCase):
+    """The radiated TX beam (not only the commanded look) must stay inside the validated cone."""
+
+    F9 = 915e6
+    L9 = C0 / 915e6
+
+    def _code(self, g, spec, **kw):
+        try:
+            BF.solve_beam(g, spec, self.F9, direction="tx", **kw)
+            return "OK"
+        except GeometryError as e:
+            return e.code
+
+    def test_mirror_image_stronger_than_the_beam_is_refused(self):
+        body = G._ura_body(8, 2, self.L9 / 2, self.L9 / 2, "vertical")          # panel facing North
+        for bs, az in ((110.0, 40.0), (120.0, 45.0)):                               # elements look behind
+            g = _patterned(body, G.ElementPattern("cos_q", q=1, boresight_az_deg=bs)).with_scan_limit(60)
+            with self.assertRaises(GeometryError) as cm:
+                BF.solve_beam(g, BF.BeamSpec(az, 0, taper="chebyshev"), self.F9, direction="tx")
+            self.assertEqual(cm.exception.code, "POINTING")
+            self.assertIn("mirror", str(cm.exception))
+            rx = BF.solve_beam(g, BF.BeamSpec(az, 0, taper="chebyshev"), self.F9)            # RX: reported
+            self.assertTrue(any(lb.intrinsic and lb.level_db > 3.0 for lb in rx.metrics.lobes))
+        ok = _patterned(body, G.ElementPattern("cos_q", q=2)).with_scan_limit(60)            # facing the look
+        self.assertEqual(self._code(ok, BF.BeamSpec(40, 0, taper="chebyshev")), "OK")
+
+    def test_peak_pulled_along_the_cone_is_refused(self):
+        body = G._ula_body(8, self.L9 / 2, 90.0)
+        up = _patterned(body, G.ElementPattern("cos_q", q=2, boresight_el_deg=70))
+        self.assertEqual(self._code(up.with_scan_limit(60), BF.BeamSpec(20, 0)), "SCAN_LIMIT")  # peak outside
+        self.assertEqual(self._code(up, BF.BeamSpec(20, 0), scan_limit_deg=90), "POINTING")    # look < -3 dB
+        rx = BF.solve_beam(up, BF.BeamSpec(20, 0), self.F9)
+        self.assertGreater(rx.metrics.pointing_error_deg, 30.0)
+        self.assertLess(rx.metrics.look_level_db, -3.0)
+        # a mild pull (look still inside the half-power beam) and isotropic elements are fine
+        fwd = _patterned(body, G.ElementPattern("cos_q", q=2)).with_scan_limit(60)
+        self.assertEqual(self._code(fwd, BF.BeamSpec(30, 20)), "OK")
+        self.assertEqual(self._code(fwd, BF.BeamSpec(50, 0)), "OK")
+        iso = G.preset_ula(8, self.L9 / 2).with_scan_limit(60)
+        sol = BF.solve_beam(iso, BF.BeamSpec(30, 0), self.F9, direction="tx")
+        self.assertLess(sol.metrics.pointing_error_deg, 0.01)
+        self.assertFalse(any(lb.intrinsic for lb in sol.metrics.lobes))         # a flat cone ridge is main lobe
+
+    def test_cone_ridge_rising_away_from_the_peak_is_exposed(self):
+        u_pk = G.direction_vector(20, 0)
+        axis = np.array([1.0, 0.0, 0.0])
+        rising = lambda U: 1.0 + 2.0 * np.clip(np.atleast_2d(U)[:, 2], 0, None)     # stronger toward zenith
+        lb = P._cone_ridge_lobe(rising, u_pk, 1.0, axis)
+        self.assertTrue(lb.intrinsic and lb.kind == "ambiguity")
+        self.assertGreater(lb.level_db, 4.0)
+        self.assertGreater(lb.el_deg, 60.0)
+        self.assertIsNone(P._cone_ridge_lobe(lambda U: np.ones(np.atleast_2d(U).shape[0]), u_pk, 1.0, axis))
+
+    def test_edge_lobe_refusal_matches_the_geometry_report(self):
+        """lambda/2 TX sets steered to the edge of their cone: check predicts the refusal."""
+        for g0 in (G.preset_ula(4, self.L9 / 2), G.preset_ura(4, 4, self.L9 / 2, self.L9 / 2)):
+            for lim, expect in ((60.0, "GRATING_LOBE"), (45.0, "OK")):
+                g = g0.with_scan_limit(lim)
+                rep = P.geometry_report(g, self.F9, self.F9, lim, which="tx")
+                errs = [i for i in rep.issues if i.level == "error"]
+                self.assertEqual(bool(errs), expect != "OK", (g0.name, lim, errs))
+                self.assertEqual(self._code(g, BF.BeamSpec(lim, 0)), expect, (g0.name, lim))
+                self.assertEqual([i for i in P.geometry_report(g, self.F9, self.F9, lim).issues
+                                  if i.level == "error"], [])                    # RX set: warnings only
+            with self.assertRaises(GeometryError) as cm:
+                BF.solve_beam(g0.with_scan_limit(60), BF.BeamSpec(60, 0), self.F9, direction="tx")
+            self.assertIn("edge of visible space", str(cm.exception))
+        # directional elements suppress the endfire skirt: report and solver both accept
+        gp = _patterned(G._ura_body(4, 4, self.L9 / 2, self.L9 / 2, "vertical"),
+                        G.ElementPattern("cos_q", q=2)).with_scan_limit(60)
+        self.assertEqual([i for i in P.geometry_report(gp, self.F9, self.F9, 60, which="tx").issues
+                          if i.level == "error"], [])
+        for az in (60, -60):
+            self.assertEqual(self._code(gp, BF.BeamSpec(az, 0)), "OK")
+
+
+class TestSynthesizeGuard(unittest.TestCase):
+    def test_delayed_chain_must_not_lose_its_ramp_down(self):
+        s = D.ramp_window(np.ones(1000), 32)
+        t = np.ones(4)
+        cal = (np.ones(4), np.array([0.0, 0.0, -4e-6, -6e-6]))              # chains 2, 3 delayed 40 / 60 samples
+        with self.assertRaises(ValueError) as cm:
+            BF.synthesize_tx(s, t, 10e6, tx_cal=cal)
+        self.assertIn("guard zeros", str(cm.exception))
+        with self.assertRaises(ValueError):                                  # TTD delays count too
+            BF.synthesize_tx(s, t, 10e6, ttd_delays=[0, 0, 0, 2e-6])
+        padded = np.concatenate([s, np.zeros(60)])
+        out = BF.synthesize_tx(padded, t, 10e6, tx_cal=cal)
+        self.assertEqual(out.shape, (4, padded.size))
+        np.testing.assert_allclose(np.abs(out[:, -1]), 0.0, atol=1e-12)     # every burst ramps down
+        np.testing.assert_allclose(np.sum(np.abs(out) ** 2, axis=1), np.sum(np.abs(s) ** 2), rtol=1e-9)
+        BF.synthesize_tx(s, t, 10e6)                                         # no relative delay: nothing cut
+
+
+class TestNearFieldTtd(unittest.TestCase):
+    def test_focused_lambda_half_ula_has_no_grating_lobes(self):
+        """Metrics of focused weights are measured on the focal sphere, not the defocused far field."""
+        for n, ranges in ((8, (1.0, 2.0)), (16, (1.0, 3.0))):
+            g = G.preset_ula(n, LAM / 2)
+            self.assertGreater(g.fraunhofer_m(F), 2.0 * max(ranges))         # well inside R_ff
+            for r in ranges:
+                spec = BF.BeamSpec(20, 0, focus_range_m=r)
+                for direction in ("rx", "tx"):
+                    sol = BF.solve_beam(g, spec, F, direction=direction)
+                    m = sol.metrics
+                    self.assertEqual(m.near_field_m, r)
+                    self.assertFalse([lb for lb in m.lobes if lb.kind == "grating"], (n, r, direction))
+                    self.assertLess(m.pointing_error_deg, 1.0)
+                    self.assertLess(m.psll_db, -3.0)
+                    self.assertGreater(m.look_level_db, -0.1)
+        # far focus converges to the far-field metrics
+        g = ula8()
+        u0 = G.direction_vector(25, 5)
+        w = BF.rx_weights(g, BF.BeamSpec(25, 5), F)
+        ff = P.beam_metrics(g, w, F, u0)
+        nf = P.beam_metrics(g, w, F, u0, focus_range_m=1e5)
+        self.assertAlmostEqual(nf.hpbw_az_deg, ff.hpbw_az_deg, delta=0.01)
+        self.assertAlmostEqual(nf.psll_db, ff.psll_db, delta=0.05)
+        self.assertAlmostEqual(nf.directivity_dbi, 10 * math.log10(8), places=6)   # coherent array gain
+
+    def test_focused_tx_on_a_grating_lattice_is_refused(self):
+        with self.assertRaises(GeometryError) as cm:
+            BF.solve_beam(G.preset_ula(8, LAM), BF.BeamSpec(20, 0, focus_range_m=2.0), F, direction="tx")
+        self.assertEqual(cm.exception.code, "GRATING_LOBE")
+        # every element must see the focus inside the cone
+        with self.assertRaises(GeometryError) as cm:
+            BF.tx_weights(G.preset_ula(16, LAM / 2).with_scan_limit(45), BF.BeamSpec(30, 0, focus_range_m=0.5), F)
+        self.assertEqual(cm.exception.code, "SCAN_LIMIT")
+        self.assertIn("sees the focus", str(cm.exception))
+
+
+    def test_focused_ttd_uses_spherical_delays(self):
+        g = ula8()
+        spec = BF.BeamSpec(40, 0, steering="ttd", focus_range_m=2.0)
+        p = 2.0 * G.direction_vector(40, 0)
+        for direction in ("rx", "tx"):
+            sol = BF.solve_beam(g, spec, F, direction=direction)
+            rn = np.linalg.norm(p[None, :] - g.positions(direction), axis=1)
+            np.testing.assert_allclose(sol.ttd_delays_s, (rn.max() - rn) / C0, atol=1e-18)
+            self.assertAlmostEqual(float(sol.ttd_delays_s.min()), 0.0)
+            # envelope delay matches the carrier phase of the focused weights at the focus point
+            w = sol.weights if direction == "rx" else np.conj(sol.weights)
+            ph = np.angle(w * np.exp(-2j * np.pi * F * sol.ttd_delays_s))   # residual after removing TTD
+            ph = np.angle(np.exp(1j * (ph - ph[0])))
+            np.testing.assert_allclose(ph, 0.0, atol=1e-6)
+        far = BF.solve_beam(g, BF.BeamSpec(40, 0, steering="ttd"), F)
+        np.testing.assert_allclose(far.ttd_delays_s, P.ttd_delays_s(g.positions(), G.direction_vector(40, 0)))
+        self.assertGreater(float(np.ptp(far.ttd_delays_s) - np.ptp(sol.ttd_delays_s)), 0.5e-9)
 
 
 class TestSolution(unittest.TestCase):

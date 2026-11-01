@@ -29,6 +29,7 @@ if [ ! -f ./daq_common.sh ]; then
     echo -e "\e[91mdaq_common.sh not found next to $0 - DAQ chain not started!\e[39m"
     exit 1
 fi
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=daq_common.sh
 . ./daq_common.sh
 

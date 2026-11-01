@@ -1,0 +1,8 @@
+# Optional: RTL2832U receivers (KrakenSDR / KerberosSDR units, 0bda:2838)
+# readable and writable by the plugdev group, so tools such as rtl_test and
+# rtl_eeprom can open them without root. The DAQ chain itself
+# runs as root and does not need this rule.
+#
+# Install: sudo util/install.sh --extras-only --udev
+#   (copies this file to /etc/udev/rules.d/ and reloads the rules)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0664"

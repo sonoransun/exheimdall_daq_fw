@@ -1,0 +1,17 @@
+# Runs heimdall-daq-watchdog.service 120 s after boot and every 30 s after
+# the previous run. Optional, not enabled by install:
+#   sudo systemctl enable --now heimdall-daq-watchdog.timer
+
+[Unit]
+Description=HeIMDALL DAQ watchdog timer
+Documentation=https://github.com/krakenrf/heimdall_daq_fw
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=30
+# The default accuracy (1 min) would stretch the 30 s cadence
+AccuracySec=5s
+Unit=heimdall-daq-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -115,7 +115,7 @@ of log text only.
 - **L8** `heimdall-daq.service` stops with `daq_stop.sh 0` instead of the
   host-wide no-argument form, and gains `EnvironmentFile=-`,
   `ConditionPathExists` and `Conflicts=` with the supervised unit. On a
-  single-instance host the same processes stop. <!-- verify-after: WP-16 -->
+  single-instance host the same processes stop.
 - **L9** Simulation lane. The synthesizer
   (`_testing/test_data_synthesizer.py`) answers ZMQ control commands on
   `1130 + instance_id * port_stride`, so `hw_controller` gets replies and the
@@ -474,13 +474,13 @@ and [Documentation/deployment_recipes.md](Documentation/deployment_recipes.md).
   `util/irq_tuning.sh` flags (`--usb-core`, `--controller`, `--eth-core`,
   `--no-governor`, `--keep-going`, `--any-arch`). The default control flow of
   `irq_tuning.sh` is unchanged. <!-- verify-after: WP-12 -->
-- **systemd units (in progress)** (`packaging/systemd/`): supervised units
+- **systemd units** (`packaging/systemd/`): supervised units
   `heimdall-daq-supervised.service` and `heimdall-daq-supervised@.service`,
   `heimdall-coordinator.service`, `heimdall-iq-router.service`,
   `heimdall-host-tuning.service`, and `heimdall-daq-watchdog.service` +
   `.timer` (`util/heimdall_watchdog.py`). Also env templates in
   `packaging/default/`, a udev rule `packaging/udev/99-heimdall-rtlsdr.rules`
-  and an updated logrotate policy. <!-- verify-after: WP-16 -->
+  and an updated logrotate policy.
 - **Recording and replay (in progress)**: `.hcap` capture container
   (`_testing/iq_capture_format.py`), `iq_recorder.py --hcap`,
   `_testing/iq_replay.py` (`--serve-port` emulates `iq_server`;
@@ -529,18 +529,19 @@ and [Documentation/deployment_recipes.md](Documentation/deployment_recipes.md).
   `test_sync_loop_model`, `test_heimdall_ctl_fleet`,
   `test_federation_protocol`, `test_federation_election`, `test_iq_router`,
   `test_status_extended`, `test_delay_sync_fsm`, `test_capacity_model`,
-  `test_frame_sizes`, `test_launch_scripts`, `test_provisioning` and
-  `test_set_unit_serials`, plus extended `test_iq_header_abi`,
+  `test_frame_sizes`, `test_launch_scripts`, `test_provisioning`,
+  `test_set_unit_serials` and `test_watchdog`, the sudo lane
+  `test_start_stop_legacy`, plus extended `test_iq_header_abi`,
   `test_iq_header_v8`, `test_control_iface`, `test_ini_checker`,
-  `test_daq_db` and `test_heimdall_ctl`. Registered but not in the tree yet
-  (in progress, reported as `PEND`): `test_watchdog`,
-  `test_iq_capture_format`, `test_iq_replay`, and the sudo integration lanes
-  `test_start_stop_legacy`, `test_multi_instance`, `test_synthetic_chain`,
-  `test_bit_identity` and `test_throughput_lane`.
+  `test_daq_db` and `test_heimdall_ctl`. Registered but still in progress
+  (reported as `PEND` while the module is absent): `test_iq_capture_format`,
+  `test_iq_replay`, and the sudo integration lanes `test_multi_instance`,
+  `test_synthetic_chain`, `test_bit_identity` and `test_throughput_lane`.
+  <!-- verify-after: WP-20/17b -->
 - **Performance tooling**: `util/performance_monitor.py` measures latency
   through a real `IQDownload` client. The throughput lane (in progress)
   will write `Firmware/_testing/test_logs/throughput.json`.
-  <!-- verify-after: WP-13 -->
+  <!-- verify-after: WP-20/17b -->
 
 ### Added: documentation
 
@@ -580,7 +581,6 @@ Fixes on the default path are the ledger rows above. In short:
   `hw_controller`'s ZMQ commands; `daq_synthetic_start.sh` returned 0 after
   a FIR-designer failure (L9).
 - `heimdall-daq.service` stopped every instance on a multi-instance host (L8).
-  <!-- verify-after: WP-16 -->
 - `rebuffer.out 1` (drop mode, not used by the start scripts) re-sent an
   undelivered CPI after a frame drop. <!-- verify-after: WP-04 -->
 - Coordinator: silent socket close on `INSTANCE` with a bad id, false success

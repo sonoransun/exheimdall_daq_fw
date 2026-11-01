@@ -6,7 +6,7 @@ All commands run from the `Firmware/` directory of the copy you operate, unless 
 
 Some features below are **opt-in**. They are off in the shipped `daq_chain_config.ini` and change nothing until you enable them. Each opt-in item names the key or flag that enables it.
 
-A few items describe tooling that this release is still building: the new systemd units and the watchdog timer (WP-16). Those items say so in their first line and carry a `verify-after` marker for the reconciliation pass. The launch-script library (`daq_common.sh`), the supervisor, the federation launchers, the capacity pre-flight (`daq_preflight.py`) and the provisioning tools are in this tree.
+The launch-script library (`daq_common.sh`), the supervisor, the federation launchers, the capacity pre-flight (`daq_preflight.py`), the provisioning tools, the systemd units and the watchdog timer are all in this tree.
 
 Related documents:
 
@@ -63,7 +63,7 @@ Related documents:
 | Approve the track lock | `heimdall-ctl track-lock approve` ([section 12.2](#122-track-lock-approval)) |
 | Attached receivers as JSON | `python3 _daq_core/hw_discover.py --sdr` |
 
-`heimdall-ctl` runs from an installed package (`pip install .` at the repository root) or from the in-tree launcher `util/bin/heimdall-ctl`. It reads ports from `--config`, `--instance N` and `--port-stride`. Its exit codes are:
+`heimdall-ctl` runs from an installed package (`pip install .` at the repository root). Without an install, run it from the repository root as `PYTHONPATH=util python3 -m heimdall_ctl ...`. It reads ports from `--config`, `--instance N` and `--port-stride`. Its exit codes are:
 
 | Code | Meaning |
 |---|---|
@@ -325,41 +325,25 @@ Under `instance_guard = refuse`, delay_sync checks that it inherited the instanc
 
 ### 2.6 systemd
 
-`packaging/systemd/` ships two `Type=oneshot` units. See `packaging/systemd/README.md` for installation.
+`packaging/systemd/` ships the units below. See `packaging/systemd/README.md` for installation, the oneshot-or-supervised choice and the exit-code table.
 
-| Unit | Working directory | ExecStop |
-|---|---|---|
-| `heimdall-daq.service` | `/opt/heimdall/Firmware` | `daq_stop.sh` with **no argument** (global stop) |
-| `heimdall-daq@N.service` | `/opt/heimdall/instances/N/Firmware` | `daq_stop.sh N` |
+| Unit | Purpose |
+|---|---|
+| `heimdall-daq.service`, `heimdall-daq@N.service` | `Type=oneshot`: run `daq_start_sm.sh` in `/opt/heimdall/Firmware` (instance 0) or `/opt/heimdall/instances/N/Firmware`. `ExecStop=daq_stop.sh 0` (or `N`), so a stop is scoped to its instance. `EnvironmentFile=-/etc/default/heimdall-daq` (and `-/etc/default/heimdall-daq@N`) sets `PATH` |
+| `heimdall-daq-supervised.service`, `heimdall-daq-supervised@N.service` | `Type=simple`, runs `daq_supervise.sh --instance N --healthcheck auto`, `ExecStopPost=daq_stop.sh N --clean`, `Restart=on-failure`, `RestartPreventExitStatus=1 2 3 4`. Conflicts with the oneshot unit of the same instance |
+| `heimdall-coordinator.service`, `heimdall-iq-router.service` | run as user `heimdall`; logs in `/var/log/heimdall/`; coordinator state in `/var/lib/heimdall/coordinator` |
+| `heimdall-host-tuning.service` | oneshot `util/host_tuning.sh --apply` before the DAQ units |
+| `heimdall-daq-watchdog.timer` | every 30 s runs `util/heimdall_watchdog.py`; restarts a `systemd-supervised` registry entry after 3 failed STATUS checks; optional, not enabled by install |
 
-Known issues of the current units:
+Install `packaging/default/heimdall-daq` as `/etc/default/heimdall-daq` and set its `PATH` to the environment that has numpy/scipy/pyzmq. Without it the stages run the system `python3`, and `delay_sync.log` and `hwc.log` show `ModuleNotFoundError`. `packaging/logrotate/heimdall` covers instance 0, the instance directories `/opt/heimdall/instances/*/Firmware/_logs/` and the federation logs.
 
-| Issue | Effect | Workaround |
-|---|---|---|
-| `heimdall-daq.service` stops with the no-argument `daq_stop.sh` | `systemctl stop heimdall-daq` also kills every `heimdall-daq@N` instance | Do not run it beside the template units, or replace its `ExecStop` with the drop-in below |
-| The units set no `PATH` | `python3` resolves to the system interpreter. If numpy/scipy/pyzmq live only in the conda env `kraken`, `delay_sync.log` and `hwc.log` show `ModuleNotFoundError` | `systemctl edit heimdall-daq` and add `Environment=PATH=<conda-root>/envs/kraken/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` under `[Service]` |
-| logrotate globs cover only `/opt/heimdall/Firmware/_logs/` | logs under `/opt/heimdall/instances/N/Firmware/_logs/instN/` are never rotated | Add `/opt/heimdall/instances/*/Firmware/_logs/inst*/*.log` to `/etc/logrotate.d/heimdall` |
-
-`ExecStop=` is a list setting. A drop-in that only adds a line appends it after the unit's global stop. Reset the list with an empty assignment first. Run `sudo systemctl edit heimdall-daq` and enter:
+Units installed from an older tree stop `heimdall-daq.service` with the no-argument `daq_stop.sh`, which also kills every `heimdall-daq@N` instance. Install the current units, or reset the list with an empty assignment in a drop-in (`sudo systemctl edit heimdall-daq`):
 
 ```ini
 [Service]
 ExecStop=
 ExecStop=/opt/heimdall/Firmware/daq_stop.sh 0
 ```
-
-`systemctl edit` reloads the unit. If you write the file by hand under `/etc/systemd/system/heimdall-daq.service.d/`, run `sudo systemctl daemon-reload`.
-
-<!-- verify-after: WP-16 -->
-**Planned units (WP-16, not yet in this tree).**
-
-| Unit | Purpose |
-|---|---|
-| `heimdall-daq.service` | `ExecStop=daq_stop.sh 0`, `EnvironmentFile=-/etc/default/heimdall-daq` (holds `PATH`) |
-| `heimdall-daq-supervised.service`, `heimdall-daq-supervised@.service` | `Type=simple`, runs `daq_supervise.sh --instance N --healthcheck auto`, `ExecStopPost=daq_stop.sh N --clean`, `Restart=on-failure`, `RestartPreventExitStatus=1 2 3 4`. Conflicts with the oneshot unit of the same instance |
-| `heimdall-coordinator.service`, `heimdall-iq-router.service` | run as user `heimdall`; logs in `/var/log/heimdall/`; coordinator state in `/var/lib/heimdall/coordinator` |
-| `heimdall-host-tuning.service` | oneshot `util/host_tuning.sh --apply` before the DAQ units |
-| `heimdall-daq-watchdog.timer` | every 30 s runs `util/heimdall_watchdog.py`; restarts a `systemd-supervised` registry entry after 3 failed STATUS checks; optional, not enabled by install |
 
 ### 2.7 Supervisor (`daq_supervise.sh`)
 
@@ -476,14 +460,13 @@ HWSQ is answered by the server thread within milliseconds, even when frames stal
 
 A DUMMY frame carries `sync_state = 0`. Each tuner command makes the source emit 5 DUMMY frames. A STATUS refresh that lands on one reports `error` once. Judge health over several readings.
 
-<!-- verify-after: WP-06 -->
 With `status_extended = 1` STATUS also carries `status_protocol`, `snapshot_age_sec`, `stale_after_sec`, identity (`node_id`, `cluster_id`, `hostname`, `pid`, `fw_version`, `config_sha256`), the frame geometry (`num_channels`, `sampling_freq_hz`, `cpi_length`, `decimation_ratio`, `frame_period_sec`), `fsm_state`, `cal` (`quality_db`, `recal_generation`, ...) and extra counters: `buffer_overrun_cnt`, `cpi_gaps`, `daq_block_gaps`, `overrun_invalidated_frames`, and `decimator_drops` when `stamp_decimator_drops = 1`. The automatic staleness threshold is `3 × max(1, k) × frame_period + 1` seconds, where `k` is the effective refresh interval in frames.
 
 ---
 
 ## 4. Logs
 
-This section is the authoritative log legend. `Firmware/_logs/logs` holds a short copy for source trees.
+This section is the authoritative log legend.
 
 ### 4.1 Locations
 
@@ -513,7 +496,7 @@ PID files:
 | `hw_controller.pid` | the `sudo` wrapper of `hw_controller.py` |
 | `iq_server.pid` | `iq_server.out` (only with `out_data_iface_type = eth`) |
 
-`federation_start.sh` appends the service's stdout and stderr to its log file. <!-- verify-after: WP-16 --> Under the planned systemd units (WP-16) the federation logs go to `/var/log/heimdall/`.
+`federation_start.sh` appends the service's stdout and stderr to its log file. Under the systemd units (`heimdall-coordinator.service`, `heimdall-iq-router.service`) the federation logs go to `/var/log/heimdall/`.
 
 ### 4.2 Log files
 
@@ -689,7 +672,6 @@ The data plane runs in drop mode. A slow consumer loses frames. It never stalls 
 
 delay_sync does not log individual drops (`ignore_frame_drop_warning` is on). Use the counters and `frame_drop` events.
 
-<!-- verify-after: WP-04 -->
 Opt-in data-plane keys from this release: `[data_interface] iq_server_max_clients` (default 1) serves several `:5000` clients, each with its own queue. `iq_server_frame_deadline_ms` (default 0 = automatic: 0.8 × the frame period, at least 100 ms; multi-client mode only) closes a client that misses it (`IQ client <peer> missed the <n> ms frame deadline: closing session`). Without a sample rate the automatic deadline is the 10 s send bound. `[pre_processing] size_segments_from_config = 1` sizes the decimator and iq_server shared memory from the config.
 
 ---
@@ -766,7 +748,6 @@ Each instance with federation enabled polls its peers' status servers from delay
 
 ### 10.2 Coordinator errors
 
-<!-- verify-after: WP-08 -->
 `heimdall-ctl fleet ...` talks to the coordinator on `:6000`. Error replies print `Error: <error>` and exit 1, except `not_leader` (exit 4) and connection failures (exit 3).
 
 | Error | Cause | Fix |
@@ -790,7 +771,6 @@ A coordinator talking to an old member logs once per member: `member K is a lega
 
 ### 10.3 IQ router
 
-<!-- verify-after: WP-09 -->
 `heimdall-ctl router stats|sources|clients` queries the router stats port (default 7001, `--router H:P`). The stats port answers `PING`, `VERSION`, `STATS`, `SOURCES`, `CLIENTS`.
 
 | Symptom (router log) | Cause | Fix |

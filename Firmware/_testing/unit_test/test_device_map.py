@@ -10,7 +10,8 @@
         the probe target and the PIGPIO switch, via `make -n`) is checked too.
 
     Part 2 - rtl_daq.c against a fake librtlsdr (Linux + C compiler + libzmq
-        headers; skipped otherwise):
+        headers; skipped otherwise, except that on Linux under CI=true or
+        HEIMDALL_STRICT_MODULES=1 a missing compiler/libzmq is a failure):
         rtl_daq.c is compiled unchanged together with device_map.c, log.c,
         ini.c, iq_header.c and sh_mem_util.c against a stub rtl-sdr.h and an
         in-test fake librtlsdr whose attached devices are given by the
@@ -558,10 +559,41 @@ def make_ini(num_ch, port, hw_extra="", daq_extra="", unit_id="7",
     ) % (unit_id, num_ch, hw_extra, daq_extra, instance_id)
 
 
+def rtl_daq_ingress_strict():
+    """True when a Linux host must run TestRtlDaqIngress instead of skipping it.
+
+    On Linux the only reasons to skip are a missing C compiler or missing
+    libzmq development files, both of which a CI runner can install. A CI run
+    (CI=true, set by GitHub Actions) or HEIMDALL_STRICT_MODULES=1 turns those
+    skips into a failure so the module cannot report PASS with none of the
+    rtl_daq.c tests executed. HEIMDALL_STRICT_MODULES=0 set explicitly keeps
+    the lenient skip even under CI."""
+    if not sys.platform.startswith("linux"):
+        return False
+    flag = os.environ.get("HEIMDALL_STRICT_MODULES")
+    if flag is not None and flag.strip() != "":
+        return flag.strip() == "1"
+    return os.environ.get("CI", "").strip().lower() in ("1", "true", "yes")
+
+
 class TestRtlDaqIngress(unittest.TestCase):
     tmpdir = None
     exe = None
     skip_reason = None
+
+    @classmethod
+    def _linux_prereq_missing(cls, reason):
+        if rtl_daq_ingress_strict():
+            # tearDownClass does not run when setUpClass raises.
+            if cls.tmpdir:
+                shutil.rmtree(cls.tmpdir, ignore_errors=True)
+                cls.tmpdir = None
+            raise AssertionError(
+                "TestRtlDaqIngress cannot run: %s. Install a C compiler and "
+                "libzmq3-dev (CI=true / HEIMDALL_STRICT_MODULES=1 make this a "
+                "failure instead of a skip; set HEIMDALL_STRICT_MODULES=0 to "
+                "allow the skip)." % reason)
+        cls.skip_reason = reason
 
     @classmethod
     def setUpClass(cls):
@@ -570,7 +602,7 @@ class TestRtlDaqIngress(unittest.TestCase):
             return
         cc = find_compiler()
         if cc is None:
-            cls.skip_reason = "no C compiler (cc/gcc/clang) on PATH"
+            cls._linux_prereq_missing("no C compiler (cc/gcc/clang) on PATH")
             return
         cls.tmpdir = tempfile.mkdtemp(prefix="hd_rtldaq_")
         probe_c = os.path.join(cls.tmpdir, "zmq_probe.c")
@@ -580,7 +612,7 @@ class TestRtlDaqIngress(unittest.TestCase):
         res = subprocess.run([cc, probe_c, "-o", probe_c + ".out", "-lzmq"],
                              capture_output=True, timeout=120)
         if res.returncode != 0:
-            cls.skip_reason = "libzmq development files not installed"
+            cls._linux_prereq_missing("libzmq development files not installed")
             return
         src = os.path.join(cls.tmpdir, "src")
         os.mkdir(src)

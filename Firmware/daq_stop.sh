@@ -82,6 +82,7 @@ fi
 # daq_common.sh skips every registry action.
 HD_COMMON=false
 if [ -f ./daq_common.sh ]; then
+    # shellcheck source-path=SCRIPTDIR
     # shellcheck source=daq_common.sh
     . ./daq_common.sh
     HD_COMMON=true
@@ -296,6 +297,7 @@ remove_registry_entry() {
         fi
         printf '%s\n' "${HEIMDALL_RUN_DIR:-/run/heimdall}" "/tmp/heimdall-run-$(id -u)"
     } | awk 'NF && !seen[$0]++' | while IFS= read -r dir; do
+        hd_registry_dir_trusted "$dir" || continue
         [ -f "$dir/inst${INSTANCE_ID}.env" ] || continue
         entry_cwd=$(hd_env_get "$dir/inst${INSTANCE_ID}.env" CWD)
         if [ "$entry_cwd" = "$here" ]; then

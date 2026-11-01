@@ -20,7 +20,16 @@
     lies in the horizontal body x-y plane. JSON presets may choose
     ``"plane": "horizontal"`` for URA/triangular arrays.
 
-    Geometry files: canonical JSON (spec 6.1) and a convenience CSV (6.2).
+    Frames: in the ``body`` frame the platform attitude rotates the element
+    positions and directions; ``enu`` / ``lla`` positions are already ENU and the
+    attitude orients only the boresight and the element patterns.
+
+    Geometry files: canonical JSON (spec 6.1) and a convenience CSV (6.2; the
+    header line also records ``frame``). ``units = lambda`` needs the file's own
+    ``design_freq_hz``: physical positions never follow the configured operating
+    frequency. A geometry carries the TX/RX ``scan_limit_deg`` of its config and
+    any ``provenance_issues`` (e.g. a preset pitch derived from center_freq_hz),
+    which every ``validate_geometry`` reports.
 
     No hardware access; stdlib + numpy only.
 
@@ -47,6 +56,7 @@ logger = logging.getLogger("heimdall.active.geometry")
 
 GEOMETRY_SCHEMA = "heimdall-active-geometry/1"
 PATTERN_KINDS = ("isotropic", "cos_q", "dipole_v", "dipole_h", "table")
+TABLE_EXTEND = ("taper", "constant")
 PHASE_REFERENCES = ("element0", "centroid")
 FRAMES = ("body", "enu", "lla")
 UNITS = ("m", "mm", "lambda")
@@ -54,7 +64,8 @@ PRESET_TYPES = ("ula", "ura", "uca", "tri")
 PLANES = ("vertical", "horizontal")
 WHICH = ("rx", "tx", "all")
 LATTICE_KINDS = ("ula", "ura", "triangular", "uca", "irregular")
-AMBIGUITY_LABELS = ("cone", "mirror_elevation", "mirror_plane", "none", "degenerate")
+AMBIGUITY_LABELS = ("cone", "mirror_elevation", "none", "degenerate")
+PLANE_KINDS = ("horizontal", "vertical", "tilted")
 MIN_SEPARATION_M = 1e-4
 DIPOLE_GAIN_DBI = 2.15
 CSV_COLUMNS = ("id", "x_m", "y_m", "z_m", "rx_device", "rx_channel", "tx_device", "tx_channel",
@@ -98,6 +109,20 @@ class ElementPattern:
     table -> the table values as given (absolute dBi).
     A ``table`` is ``((az_deg, el_deg, gain_db, phase_deg), ...)`` in body-frame
     az/el; it must be a full az x el grid or a single cut (one el or one az).
+    Gain is interpolated bilinearly in dB and phase as a unit phasor (no error
+    across +-180 deg). Outside the tabulated coverage (``table_extend``):
+
+      - ``taper`` (default): an azimuth span with a gap > 90 deg falls linearly
+        (dB) to ``table_floor_db`` within 10 deg of its edges; elevations outside
+        a grid's span do the same toward the poles; a single elevation cut tapers
+        linearly to the floor at both poles and a single azimuth cut tapers to
+        the floor at the back (az0 + 180);
+      - ``constant``: a cut applies unchanged at every other angle, azimuth is
+        periodic across any gap and elevation is clamped (explicit opt-in for
+        elevation / azimuth independent elements).
+
+    ``table_floor_db`` (absolute, dBi before ``gain_dbi`` rescaling) defaults to
+    the lowest tabulated gain minus 30 dB. A one-row table is constant.
     """
     kind: str = "isotropic"
     q: float = 1.0
@@ -105,6 +130,8 @@ class ElementPattern:
     boresight_az_deg: float = 0.0
     boresight_el_deg: float = 0.0
     table: tuple = ()
+    table_floor_db: float = None
+    table_extend: str = "taper"
 
     def __post_init__(self):
         if self.kind not in PATTERN_KINDS:
@@ -113,6 +140,16 @@ class ElementPattern:
             raise _geom_error("GEOMETRY", "cos_q pattern needs q > 0, got %r" % (self.q,))
         if self.gain_dbi is not None and not math.isfinite(float(self.gain_dbi)):
             raise _geom_error("GEOMETRY", "pattern gain_dbi must be finite")
+        if self.table_extend not in TABLE_EXTEND:
+            raise _geom_error("GEOMETRY", "table_extend %r not in %s" % (self.table_extend, TABLE_EXTEND))
+        if self.table_floor_db is not None:
+            try:
+                fl = float(self.table_floor_db)
+            except (TypeError, ValueError):
+                raise _geom_error("GEOMETRY", "table_floor_db must be a number") from None
+            if not math.isfinite(fl):
+                raise _geom_error("GEOMETRY", "table_floor_db must be finite")
+            object.__setattr__(self, "table_floor_db", fl)
         if self.kind == "table":
             rows = tuple(tuple(float(c) for c in r) for r in self.table)
             if not rows:
@@ -152,6 +189,8 @@ class ElementPattern:
              "boresight_el_deg": float(self.boresight_el_deg)}
         if self.kind == "table":
             d["table"] = [list(r) for r in self.table]
+            d["table_floor_db"] = self.table_floor_db
+            d["table_extend"] = self.table_extend
         return d
 
 
@@ -485,7 +524,8 @@ class ArrayGeometry:
 
     def __init__(self, elements, orientation=Orientation(), phase_reference="element0", name="",
                  design_freq_hz=0.0, site_lla=None, element_size_m=0.0, survey_sigma_m=0.0,
-                 frame="body", rx_order=None, tx_order=None):
+                 frame="body", rx_order=None, tx_order=None, scan_limit_deg=None,
+                 provenance_issues=(), preset_spacing_m=None):
         els = tuple(elements)
         if not els:
             raise _geom_error("GEOMETRY", "no elements")
@@ -502,6 +542,13 @@ class ArrayGeometry:
             raise _geom_error("GEOMETRY", "frame must be body or enu internally, got %r" % (frame,))
         if not isinstance(orientation, Orientation):
             raise _geom_error("GEOMETRY", "orientation must be an Orientation")
+        if scan_limit_deg is not None:
+            scan_limit_deg = _finite(scan_limit_deg, "scan_limit_deg")
+            if not 0.0 <= scan_limit_deg <= 90.0:
+                raise _geom_error("GEOMETRY", "scan_limit_deg must be within [0, 90], got %g" % scan_limit_deg)
+        for it in provenance_issues:
+            if not isinstance(it, Issue):
+                raise _geom_error("GEOMETRY", "provenance_issues must be Issue instances")
         els = tuple(sorted(els, key=lambda e: e.id))
         for which in ("rx", "tx"):
             refs = [getattr(e, which) for e in els if getattr(e, which) is not None]
@@ -530,8 +577,14 @@ class ArrayGeometry:
         self.frame = frame
         self.rx_order = None if rx_order is None else list(rx_order)
         self.tx_order = None if tx_order is None else list(tx_order)
+        self.scan_limit_deg = scan_limit_deg
+        self.provenance_issues = tuple(provenance_issues)
+        self.preset_spacing_m = None if preset_spacing_m is None else float(preset_spacing_m)
+        # attitude (body -> ENU, for directions: boresight and element patterns)
         self._R = orientation.matrix()
-        self._enu = body @ self._R.T
+        # positions: rotated by the attitude in the body frame; already ENU otherwise
+        self._Rpos = self._R if frame == "body" else np.eye(3)
+        self._enu = body @ self._Rpos.T
         self._index = {e.id: k for k, e in enumerate(els)}
         en = np.array([e.enabled for e in els])
         if phase_reference == "centroid":
@@ -540,19 +593,35 @@ class ArrayGeometry:
             self._ref = self._enu[int(np.argmax(en))].copy()   # lowest-id enabled element
 
     # --- frames ----------------------------------------------------------------
+    # ``orientation`` is the platform attitude. In the body frame it rotates the
+    # element positions AND directions; in the enu frame (also lla files) the
+    # positions are stored in ENU already and the attitude only orients the
+    # body-frame directions: boresight and element patterns.
     def rotation(self) -> np.ndarray:
-        """3x3 body -> ENU rotation."""
+        """3x3 body -> ENU rotation of directions (platform attitude)."""
         return self._R.copy()
 
     def body_to_enu(self, v) -> np.ndarray:
+        """Body-frame direction(s) -> ENU."""
         return np.asarray(v, dtype=float) @ self._R.T
 
     def enu_to_body(self, v) -> np.ndarray:
+        """ENU direction(s) -> body frame (element patterns)."""
         return np.asarray(v, dtype=float) @ self._R
 
     def boresight_enu(self) -> np.ndarray:
-        """Platform boresight (body +y) in ENU."""
+        """Platform boresight (body +y) in ENU; for enu / lla geometries the platform
+        heading / pitch / roll still set it (positions are not rotated)."""
         return self._R[:, 1].copy()
+
+    def angle_from_boresight_deg(self, u) -> float:
+        """Angle (deg) between ENU direction ``u`` and the platform boresight."""
+        u = np.asarray(u, dtype=float).reshape(3)
+        nu = float(np.linalg.norm(u))
+        if not nu > 0:
+            raise ValueError("zero direction")
+        c = float(np.clip(self.boresight_enu() @ u / nu, -1.0, 1.0))
+        return math.degrees(math.acos(c))
 
     def reference_point_enu(self) -> np.ndarray:
         """Phase reference in the un-referenced ENU frame (rotated body coordinates)."""
@@ -626,17 +695,30 @@ class ArrayGeometry:
         return comp[:, 0].copy() if r == 2 else None
 
     def ambiguity(self, which="rx", rtol: float = 0.01) -> str:
-        """cone (linear), mirror_elevation (horizontal planar), mirror_plane (other planar:
-        mirror about the array plane), none (3-D) or degenerate."""
-        r, _, comp = position_subspace(self.positions(which), rtol)
+        """Frozen label (spec 4.4 / 10.6): cone (rank 1), mirror_elevation (rank 2: directions
+        mirrored about the array plane), none (3-D) or degenerate. ``plane_kind`` tells
+        which plane (horizontal: +el / -el; vertical: front / back)."""
+        r = position_subspace(self.positions(which), rtol)[0]
         if r == 1:
             return "cone"
         if r == 2:
-            return "mirror_elevation" if abs(float(comp[2, 0])) > math.cos(math.radians(5.0)) \
-                else "mirror_plane"
+            return "mirror_elevation"
         if r == 3:
             return "none"
         return "degenerate"
+
+    def plane_kind(self, which="rx", rtol: float = 0.01):
+        """For a planar (rank 2) set: horizontal (normal within 5 deg of Up), vertical
+        (normal within 5 deg of the horizon) or tilted; None otherwise."""
+        r, _, comp = position_subspace(self.positions(which), rtol)
+        if r != 2:
+            return None
+        nz = abs(float(comp[2, 0]))
+        if nz > math.cos(math.radians(5.0)):
+            return "horizontal"
+        if nz < math.sin(math.radians(5.0)):
+            return "vertical"
+        return "tilted"
 
     def fraunhofer_m(self, f_hz, which="rx") -> float:
         """Far-field distance 2 D^2 / lambda."""
@@ -657,12 +739,19 @@ class ArrayGeometry:
                     phase_reference=self.phase_reference, name=self.name,
                     design_freq_hz=self.design_freq_hz, site_lla=self.site_lla,
                     element_size_m=self.element_size_m, survey_sigma_m=self.survey_sigma_m,
-                    frame=self.frame, rx_order=self.rx_order, tx_order=self.tx_order)
+                    frame=self.frame, rx_order=self.rx_order, tx_order=self.tx_order,
+                    scan_limit_deg=self.scan_limit_deg, provenance_issues=self.provenance_issues,
+                    preset_spacing_m=self.preset_spacing_m)
         args.update(kw)
         return ArrayGeometry(**args)
 
     def with_orientation(self, o) -> "ArrayGeometry":
+        """New platform attitude. Body-frame geometries rotate their positions; enu
+        geometries keep their (already ENU) positions and change only the boresight."""
         return self._clone(orientation=o)
+
+    def with_scan_limit(self, scan_limit_deg) -> "ArrayGeometry":
+        return self._clone(scan_limit_deg=scan_limit_deg)
 
     def with_channel_order(self, rx_order=None, tx_order=None) -> "ArrayGeometry":
         return self._clone(rx_order=rx_order, tx_order=tx_order)
@@ -870,6 +959,8 @@ def validate_geometry(geom, f_min_hz, f_max_hz, scan_limit_deg, which="rx", look
         issues.append(Issue(level, code, msg, where))
 
     f_min, f_max = _freqs(f_min_hz, f_max_hz)
+    for it in geom.provenance_issues:          # how the geometry was built (e.g. derived pitch)
+        issues.append(it)
     lam_min = C0 / f_max                      # shortest wavelength (grating lobes)
     lam_max = C0 / f_min                      # longest wavelength (coupling)
     els = geom.elements_for(which)
@@ -895,17 +986,18 @@ def validate_geometry(geom, f_min_hz, f_max_hz, scan_limit_deg, which="rx", look
             % (dmin, geom.element_size_m))
     r, B, comp = position_subspace(P)
     amb = geom.ambiguity(which)
+    plane = geom.plane_kind(which)
     if r == 0:
         add("error", "GEOMETRY", "degenerate geometry (rank 0)")
         return issues
     if r == 1:
         add("info", "GEOMETRY", "linear array: cone-of-confusion ambiguity about the array axis")
     elif r == 2:
-        add("info", "GEOMETRY", "planar array (%s): directions mirrored about the array plane are "
-            "indistinguishable" % amb)
+        add("info", "GEOMETRY", "planar array (%s, %s plane): directions mirrored about the array plane "
+            "are indistinguishable" % (amb, plane))
     if look is not None:
         lel = float(look[1])
-        if r == 2 and amb == "mirror_elevation" and abs(lel) > 0:
+        if r == 2 and plane == "horizontal" and abs(lel) > 0:
             add("warning", "GEOMETRY", "look elevation %g deg on a horizontal coplanar array: "
                 "+el and -el are indistinguishable" % lel)
         if r == 1 and abs(lel) > 0:
@@ -975,7 +1067,8 @@ def _cfg_polarization(cfg, default="vertical"):
     return getattr(prof, "polarization", None) or default
 
 
-_PATTERN_KEYS = ("kind", "q", "gain_dbi", "boresight_az_deg", "boresight_el_deg", "table", "table_file")
+_PATTERN_KEYS = ("kind", "q", "gain_dbi", "boresight_az_deg", "boresight_el_deg", "table", "table_file",
+                 "table_floor_db", "table_extend")
 
 
 def _read_table_file(path):
@@ -1002,7 +1095,8 @@ def _pattern_from(d, base, base_dir, where) -> ElementPattern:
     bad = set(d) - set(_PATTERN_KEYS) - set(_FREE_TEXT_KEYS)
     if bad:
         raise _geom_error("GEOMETRY", "%s pattern: unknown key(s) %s" % (where, sorted(bad)))
-    kw = {k: d[k] for k in ("kind", "q", "gain_dbi", "boresight_az_deg", "boresight_el_deg") if k in d}
+    kw = {k: d[k] for k in ("kind", "q", "gain_dbi", "boresight_az_deg", "boresight_el_deg",
+                            "table_floor_db", "table_extend") if k in d}
     if "table_file" in d and d["table_file"]:
         p = d["table_file"]
         if not os.path.isabs(p):
@@ -1063,6 +1157,30 @@ def _orders(cfg):
     return list(cfg.rx_refs()), list(cfg.tx_refs())
 
 
+def _unit_scale(units, fd, what) -> float:
+    """Metres per file unit. ``lambda`` needs the file's own design frequency: the
+    physical element positions never follow the configured operating frequency."""
+    if units == "lambda":
+        if not fd > 0:
+            raise _geom_error("GEOMETRY", "%s: units = lambda requires design_freq_hz > 0 in the file "
+                              "(positions are not scaled by [active_geometry] / center_freq_hz)" % what)
+        return C0 / fd
+    return 1e-3 if units == "mm" else 1.0
+
+
+def _cfg_design_freq(cfg) -> float:
+    """``[active_geometry] design_freq_hz`` when explicitly > 0 (label only), else 0."""
+    v = float(_cfg_attr(cfg, "geometry.design_freq_hz", 0.0) or 0.0)
+    return v if v > 0 else 0.0
+
+
+def _cfg_scan_limit(cfg):
+    if cfg is None:
+        return None
+    v = _cfg_attr(cfg, "geometry.scan_limit_deg", None)
+    return None if v is None else float(v)
+
+
 _TOP_KEYS = ("schema", "name", "units", "design_freq_hz", "frame", "phase_reference", "platform",
              "survey", "element_size_m", "defaults", "elements", "preset")
 _ELEMENT_KEYS = ("id", "pos", "lla", "rx", "tx", "enabled", "label", "pattern", "polarization",
@@ -1088,14 +1206,9 @@ def geometry_from_dict(d: dict, base_dir: str = "", cfg=None) -> ArrayGeometry:
         raise _geom_error("GEOMETRY", "units must be one of %s, got %r" % (UNITS, units))
     fd = d.get("design_freq_hz")
     fd = _finite(fd, "design_freq_hz") if fd is not None else 0.0
-    if fd <= 0 and cfg is not None:
-        fd = float(_cfg_attr(cfg, "geometry.design_freq_hz", 0.0)) or float(_cfg_attr(cfg, "rf.center_freq_hz", 0.0))
-    if units == "lambda":
-        if fd <= 0:
-            raise _geom_error("GEOMETRY", "units = lambda requires design_freq_hz > 0")
-        scale = C0 / fd
-    else:
-        scale = 1e-3 if units == "mm" else 1.0
+    scale = _unit_scale(units, fd, "geometry file")
+    if fd <= 0:
+        fd = _cfg_design_freq(cfg)             # informative only: never scales positions
     frame = d.get("frame", "body")
     if frame not in FRAMES:
         raise _geom_error("GEOMETRY", "frame must be one of %s, got %r" % (FRAMES, frame))
@@ -1114,9 +1227,9 @@ def geometry_from_dict(d: dict, base_dir: str = "", cfg=None) -> ArrayGeometry:
 
     site = plat.get("site_lla")
     site = _vec3(site, "platform.site_lla") if site is not None else None
+    # body: the attitude rotates positions and directions; enu / lla: positions are
+    # already ENU and the attitude orients only the boresight and element patterns
     orientation = Orientation(_att("heading_deg"), _att("pitch_deg"), _att("roll_deg"))
-    if frame != "body":
-        orientation = Orientation()               # positions already ENU
     if frame == "lla" and site is None:
         raise _geom_error("GEOMETRY", "frame = lla requires platform.site_lla")
     phase_ref = d.get("phase_reference") or _cfg_attr(cfg, "geometry.phase_reference", "element0")
@@ -1144,7 +1257,7 @@ def geometry_from_dict(d: dict, base_dir: str = "", cfg=None) -> ArrayGeometry:
         geom = ArrayGeometry(elements, orientation=orientation, phase_reference=phase_ref, name=name,
                              design_freq_hz=fd, site_lla=site, element_size_m=esize,
                              survey_sigma_m=survey_sigma, frame="body" if frame == "body" else "enu",
-                             rx_order=rx_order, tx_order=tx_order)
+                             rx_order=rx_order, tx_order=tx_order, scan_limit_deg=_cfg_scan_limit(cfg))
     else:
         raw = d["elements"]
         if not isinstance(raw, list):
@@ -1195,7 +1308,7 @@ def geometry_from_dict(d: dict, base_dir: str = "", cfg=None) -> ArrayGeometry:
         geom = ArrayGeometry(elements, orientation=orientation, phase_reference=phase_ref, name=name,
                              design_freq_hz=fd, site_lla=site, element_size_m=esize,
                              survey_sigma_m=survey_sigma, frame="body" if frame == "body" else "enu",
-                             rx_order=rx_order, tx_order=tx_order)
+                             rx_order=rx_order, tx_order=tx_order, scan_limit_deg=_cfg_scan_limit(cfg))
     if cfg is not None:
         issues = geometry_map_issues(geom, cfg)
         errs = [i for i in issues if i.level == "error"]
@@ -1326,7 +1439,7 @@ def _load_csv(path, cfg):
     except (OSError, UnicodeDecodeError) as exc:
         raise _geom_error("GEOMETRY_FILE", "cannot read geometry %s: %s" % (path, exc)) from None
     lines = text.splitlines()
-    units, fd = "m", 0.0
+    units, fd, frame = "m", 0.0, "body"
     if lines and lines[0].lstrip().startswith("#"):
         for tok in lines[0].lstrip()[1:].split():
             if "=" not in tok:
@@ -1336,19 +1449,18 @@ def _load_csv(path, cfg):
                 units = v
             elif k == "design_freq_hz":
                 fd = _finite(v, "design_freq_hz")
+            elif k == "frame":
+                frame = v
             else:
                 raise _geom_error("GEOMETRY", "CSV header line: unknown key %r" % k)
         lines = lines[1:]
     if units not in UNITS:
         raise _geom_error("GEOMETRY", "CSV units must be one of %s, got %r" % (UNITS, units))
-    if fd <= 0 and cfg is not None:
-        fd = float(_cfg_attr(cfg, "geometry.design_freq_hz", 0.0)) or float(_cfg_attr(cfg, "rf.center_freq_hz", 0.0))
-    if units == "lambda":
-        if fd <= 0:
-            raise _geom_error("GEOMETRY", "units = lambda requires design_freq_hz > 0")
-        scale = C0 / fd
-    else:
-        scale = 1e-3 if units == "mm" else 1.0
+    if frame not in ("body", "enu"):
+        raise _geom_error("GEOMETRY", "CSV frame must be body or enu, got %r" % (frame,))
+    scale = _unit_scale(units, fd, "CSV geometry (header '# units=lambda design_freq_hz=...')")
+    if fd <= 0:
+        fd = _cfg_design_freq(cfg)
     reader = csv.DictReader(io.StringIO("\n".join(lines)))
     cols = [c.strip() for c in (reader.fieldnames or [])]
     missing = {"id", "x_m", "y_m", "z_m"} - set(cols)
@@ -1413,7 +1525,8 @@ def _load_csv(path, cfg):
                          phase_reference=_cfg_attr(cfg, "geometry.phase_reference", "element0"),
                          name=os.path.splitext(os.path.basename(path))[0], design_freq_hz=fd,
                          element_size_m=float(_cfg_attr(cfg, "geometry.element_size_m", 0.0)),
-                         rx_order=rx_order, tx_order=tx_order)
+                         frame=frame, rx_order=rx_order, tx_order=tx_order,
+                         scan_limit_deg=_cfg_scan_limit(cfg))
     if cfg is not None:
         issues = geometry_map_issues(geom, cfg)
         errs = [i for i in issues if i.level == "error"]
@@ -1444,7 +1557,8 @@ def csv_loss_warnings(geom: ArrayGeometry) -> list:
             out.append("element %d: a-priori corrections not representable in CSV" % e.id)
     o = geom.orientation
     if o.heading_deg or o.pitch_deg or o.roll_deg or geom.site_lla is not None:
-        out.append("platform orientation / site not stored in CSV (comes from [active_geometry])")
+        what = "orientation" if geom.frame == "body" else "attitude (boresight)"
+        out.append("platform %s / site not stored in CSV (comes from [active_geometry])" % what)
     if geom.phase_reference != "element0":
         out.append("phase_reference not stored in CSV (comes from [active_geometry])")
     if geom.survey_sigma_m or geom.element_size_m:
@@ -1463,7 +1577,7 @@ def save_geometry(geom: ArrayGeometry, path: str) -> None:
     for w in csv_loss_warnings(geom):
         logger.warning("geometry CSV export is lossy: %s", w)
     buf = io.StringIO()
-    buf.write("# units=m design_freq_hz=%r\n" % float(geom.design_freq_hz))
+    buf.write("# units=m design_freq_hz=%r frame=%s\n" % (float(geom.design_freq_hz), geom.frame))
     wr = csv.writer(buf, lineterminator="\n")
     wr.writerow(CSV_COLUMNS)
     for e in geom.elements:
@@ -1477,15 +1591,50 @@ def save_geometry(geom: ArrayGeometry, path: str) -> None:
     ac.atomic_write_text(path, buf.getvalue())
 
 
-def geometry_from_config(cfg) -> ArrayGeometry:
-    """Geometry from ``[active_geometry]``: the geometry file, else the preset keys.
+def geometry_config_issues(cfg) -> list:
+    """Provenance checks of the ``[active_geometry]`` preset keys (code GEOMETRY).
 
-    Presets map element i to global RX i and TX i (when those indices exist);
-    the channel map is validated (GeometryError GEOM_MAP).
+    With ``spacing_m = 0`` and ``design_freq_hz = 0`` the preset pitch is
+    ``spacing_lambda`` x lambda(center_freq_hz): the physical model then follows
+    the operating frequency and the grating check passes by construction. That
+    is a warning, an error with ``en_tx = 1``. A UCA whose size is fixed by
+    ``radius_m > 0`` is pinned (its pitch does not depend on the frequency).
     """
     g = cfg.geometry
     if g.geometry_file:
-        return load_geometry(cfg.resolve_path(g.geometry_file), cfg)
+        return []
+    if (g.spacing_m and g.spacing_m > 0) or (g.design_freq_hz and g.design_freq_hz > 0):
+        return []
+    if g.preset == "uca" and g.radius_m and g.radius_m > 0:
+        return []
+    tx_on = bool(_cfg_attr(cfg, "tx.en_tx", False))
+    try:
+        sp = "%.4g m" % (float(g.spacing_lambda) * ac.wavelength(float(cfg.rf.center_freq_hz)))
+    except ValueError:
+        sp = "undefined"
+    return [Issue("error" if tx_on else "warning", "GEOMETRY",
+                  "preset element pitch is derived from the operating frequency (spacing_lambda %g x "
+                  "lambda(center_freq_hz) = %s): set spacing_m or design_freq_hz to pin the physical "
+                  "geometry%s" % (float(g.spacing_lambda), sp, " (required with en_tx = 1)" if tx_on else ""),
+                  "[active_geometry] spacing_m / design_freq_hz")]
+
+
+def geometry_from_config(cfg, issues=None) -> ArrayGeometry:
+    """Geometry from ``[active_geometry]``: the geometry file, else the preset keys.
+
+    Presets map element i to global RX i and TX i (when those indices exist);
+    the channel map is validated (GeometryError GEOM_MAP). Provenance findings
+    (``geometry_config_issues``) are kept on ``geom.provenance_issues`` (reported
+    again by every ``validate_geometry``) and appended to ``issues`` when given;
+    the preset pitch actually used is ``geom.preset_spacing_m``.
+    """
+    g = cfg.geometry
+    if g.geometry_file:
+        geom = load_geometry(cfg.resolve_path(g.geometry_file), cfg)
+        if issues is not None:
+            issues.extend(geom.provenance_issues)
+        return geom
+    prov = geometry_config_issues(cfg)
     fd = float(g.design_freq_hz) if g.design_freq_hz and g.design_freq_hz > 0 else float(cfg.rf.center_freq_hz)
     spacing = float(g.spacing_m) if g.spacing_m and g.spacing_m > 0 else float(g.spacing_lambda) * ac.wavelength(fd)
     if g.preset == "ula":
@@ -1494,6 +1643,8 @@ def geometry_from_config(cfg) -> ArrayGeometry:
         body = _ura_body(g.nx, g.ny, spacing, spacing, "vertical")
     elif g.preset == "uca":
         body = _uca_body(g.num_elements, g.radius_m if g.radius_m > 0 else None, spacing, 0.0)
+        if g.radius_m > 0:                                     # pinned by the radius: the real arc pitch
+            spacing = 2.0 * float(g.radius_m) * math.sin(math.pi / len(body))
     elif g.preset == "tri":
         body = _tri_body(g.nx, g.ny, spacing, "vertical")
     else:
@@ -1507,7 +1658,10 @@ def geometry_from_config(cfg) -> ArrayGeometry:
     geom = ArrayGeometry(els, orientation=Orientation(g.heading_deg, g.pitch_deg, g.roll_deg),
                          phase_reference=g.phase_reference, name="preset-%s" % g.preset,
                          design_freq_hz=fd, element_size_m=g.element_size_m,
-                         rx_order=rx_order, tx_order=tx_order)
+                         rx_order=rx_order, tx_order=tx_order, scan_limit_deg=float(g.scan_limit_deg),
+                         provenance_issues=prov, preset_spacing_m=spacing)
+    if issues is not None:
+        issues.extend(prov)
     issues = geometry_map_issues(geom, cfg)
     errs = [i for i in issues if i.level == "error"]
     if errs:

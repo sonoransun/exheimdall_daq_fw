@@ -47,6 +47,12 @@ from federation_common import request_json
 TERM_MAX = 0xFFFFFFF0
 #: Largest term a message may carry (u32); a larger one is ignored, never adopted.
 TERM_U32_MAX = 0xFFFFFFFF
+#: Largest term increase accepted from an unsolicited message (an inbound
+#: LEASE, SCHEDULE SYNC or a member's XACK reply), like the members'
+#: ``fence_max_term_jump``. Replies to this candidate's own polls of the
+#: configured candidates are not bounded, so a candidate whose state was
+#: wiped still catches up with the cluster term.
+MAX_TERM_JUMP = 1000
 
 ROLE_FOLLOWER = "follower"
 ROLE_LEADER = "leader"
@@ -208,7 +214,7 @@ class Election(object):
                  settle_polls=5, clock_margin=0.05, failback_sec=60.0,
                  require_quorum=False, store=None, cluster_id="default",
                  clock=time.monotonic, on_change=None, schedule_version_fn=None,
-                 schedule_term_fn=None, logger=None):
+                 schedule_term_fn=None, logger=None, max_term_jump=MAX_TERM_JUMP):
         self.candidates = parse_candidates(candidates)
         self.self_endpoint = normalize_endpoint(self_endpoint)
         if self.self_endpoint not in self.candidates:
@@ -224,6 +230,7 @@ class Election(object):
         self.eps = float(clock_margin)
         self.F = float(failback_sec)
         self.require_quorum = bool(require_quorum)
+        self.max_term_jump = int(max_term_jump)
         self.cluster_id = cluster_id
         self.clock = clock
         self.on_change = on_change
@@ -313,12 +320,21 @@ class Election(object):
             self.logger.warning("election: stepping down at term %d (%s)", self.term, reason)
         return was == ROLE_LEADER
 
-    def _adopt(self, term, source):
-        """Adopt a higher term (persisted first). Returns True when adopted."""
+    def _adopt(self, term, source, bounded=False):
+        """Adopt a higher term (persisted first). Returns True when adopted.
+
+        A term above TERM_MAX is never adopted (no candidate can reach it, so
+        adopting it would only exhaust the term space). With *bounded*, a
+        term more than ``max_term_jump`` above ours is ignored too.
+        """
         if term <= self.term:
             return False
-        if term > TERM_U32_MAX:
+        if term > TERM_MAX:
             self.logger.warning("election: ignoring out-of-range term %d from %s", term, source)
+            return False
+        if bounded and term > self.term + self.max_term_jump:
+            self.logger.warning("election: ignoring term %d from %s (more than %d above "
+                                "term %d)", term, source, self.max_term_jump, self.term)
             return False
         if not self._persist(term, None):
             return False
@@ -429,7 +445,9 @@ class Election(object):
             holder = self.lease_holder if self._lease_valid(now) else None
             reason = None
             granted = False
-            if self._settling(now):
+            if endpoint not in self.candidates or endpoint == self.self_endpoint:
+                reason = "not_candidate"
+            elif self._settling(now):
                 reason = "settling"
             elif self.state_error:
                 reason = "state_dir_unwritable"
@@ -456,7 +474,9 @@ class Election(object):
             lease_ms = int(self.L * 1000)
             reason = None
             granted = False
-            if self._settling(now):
+            if endpoint not in self.candidates or endpoint == self.self_endpoint:
+                reason = "not_candidate"
+            elif self._settling(now):
                 reason = "settling"
             elif self.state_error:
                 reason = "state_dir_unwritable"
@@ -469,7 +489,7 @@ class Election(object):
                         proceed = False            # stickiness: do not adopt t
                     else:
                         was_leader = self.role == ROLE_LEADER
-                        if not self._adopt(term, endpoint):
+                        if not self._adopt(term, endpoint, bounded=True):
                             proceed = False
                         changed = changed or was_leader
                 if proceed and term == self.term:
@@ -490,14 +510,15 @@ class Election(object):
             self._notify()
         return reply
 
-    def observe_term(self, term, source="reply"):
+    def observe_term(self, term, source="reply", bounded=True):
         """A message carried *term* (e.g. an XACK reply): adopt it when higher and step down.
 
+        Unsolicited sources are *bounded* by ``max_term_jump`` (see _adopt).
         Returns True when the term was adopted.
         """
         with self.lock:
             was_leader = self.role == ROLE_LEADER
-            adopted = self._adopt(int(term), source)
+            adopted = self._adopt(int(term), source, bounded=bounded)
         if adopted and was_leader:
             self._notify()
         return adopted
@@ -514,7 +535,7 @@ class Election(object):
         best, src = 0, None
         for ep, r in replies.items():
             if isinstance(r, dict) and r.get("ok") and isinstance(r.get("term"), int):
-                if r["term"] > best:
+                if best < r["term"] <= TERM_MAX:
                     best, src = r["term"], ep
         if best > self.term:
             return self._adopt(best, "{} reply of {}".format(source_verb, src))

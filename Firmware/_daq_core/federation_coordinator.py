@@ -34,6 +34,7 @@ import logging
 import math
 import os
 import queue
+import selectors
 import signal
 import socket
 import struct
@@ -52,9 +53,11 @@ from federation_common import (
     read_request, request_json, self_host, self_member, _verb_of,
 )
 from federation_election import TERM_U32_MAX
-from federation_health import DnsUnavailable, FederationHealth, classify_error
+from federation_health import (DnsUnavailable, FederationHealth, classify_error,
+                               recv_until_close)
 from federation_scheduler import (
     FederationScheduler, INLINE_LIMIT, SCHB_LIMIT, STRATEGIES, compute_gen,
+    validate_schedule_doc,
 )
 
 try:
@@ -88,6 +91,15 @@ LEGACY_VERB_LIST = ("PING", "STATUS", "FREQ", "GAIN", "INSTANCE", "REBALANCE")
 BUSY_LEGACY = {"error": "busy", "retry_in_sec": 1}
 RECONCILE_BACKOFF_SEC = (5, 10, 20, 40, 80)
 COLLISION_EVENT_SEC = 600.0
+#: Most REGISTER-ed members held at once; past it a new node_key is refused busy.
+REGISTER_MAX_MEMBERS = 256
+#: New node_keys one source address may register per REGISTER_RATE_WINDOW_SEC.
+REGISTER_NEW_PER_SOURCE = 16
+REGISTER_RATE_WINDOW_SEC = 60.0
+#: Overflow connections the priority probe watches at once, and how long one
+#: may stay silent before it gets the busy reply.
+PROBE_MAX_PENDING = 256
+PROBE_IDLE_SEC = 1.0
 EVENTS_DEFAULT = 100
 EVENTS_MAX = 1000
 
@@ -785,7 +797,8 @@ class FederationCoordinator:
         self._runtime_removed = set()   # node keys removed by MEMBER REMOVE
         self._registered = OrderedDict()  # node_key -> Member
         self._collisions = OrderedDict()  # (nk, holder_addr, rejected_addr) -> since (wall)
-        self._collision_events = {}
+        self._collision_events = OrderedDict()   # ckey -> mono of the last emitted event
+        self._register_rate = OrderedDict()      # source addr -> [window start mono, new keys]
         self.cluster_mode = bool(str(s.cluster_members or "").strip())
         self._build_static_members()
 
@@ -1066,25 +1079,83 @@ class FederationCoordinator:
                 pass
 
     def _probe_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                client, addr = self._probe_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                client.settimeout(1.0)
-                data = client.recv(4096)
-            except OSError:
-                data = b""
-            if data and _verb_of(data) in PRIORITY_VERBS and \
-                    self._reserved_free.acquire(blocking=False):
-                try:
-                    self._reserved_pool.submit(self._serve_conn, _PrefixedSocket(client, data),
-                                               addr, self._reserved_free)
+        """Serve overflow connections whose first bytes are a priority verb.
+
+        All pending sockets are watched at once (selector), so idle overflow
+        connections cannot delay a LEADER/LEASE that is already readable;
+        one that stays silent for PROBE_IDLE_SEC gets the busy reply.
+        """
+        sel = selectors.DefaultSelector()
+        pending = OrderedDict()             # socket -> (addr, accepted mono)
+        try:
+            while not self._stop_event.is_set():
+                block = not pending
+                while True:
+                    try:
+                        client, addr = (self._probe_queue.get(timeout=0.5) if block
+                                        else self._probe_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                    block = False
+                    if len(pending) >= PROBE_MAX_PENDING:
+                        old, _ = pending.popitem(last=False)
+                        self._probe_drop(sel, old)
+                    try:
+                        sel.register(client, selectors.EVENT_READ)
+                    except (OSError, ValueError):
+                        self._send_busy(client)
+                        continue
+                    pending[client] = (addr, time.monotonic())
+                if not pending:
                     continue
-                except RuntimeError:
-                    self._reserved_free.release()
-            self._send_busy(client)
+                try:
+                    ready = sel.select(timeout=0.05)
+                except (OSError, ValueError):
+                    ready = []
+                for key, _ev in ready:
+                    client = key.fileobj
+                    entry = pending.pop(client, None)
+                    try:
+                        sel.unregister(client)
+                    except (KeyError, ValueError, OSError):
+                        pass
+                    if entry is not None:
+                        self._probe_serve(client, entry[0])
+                now = time.monotonic()
+                while pending:
+                    client, (addr, since) = next(iter(pending.items()))
+                    if now - since < PROBE_IDLE_SEC:
+                        break
+                    del pending[client]
+                    self._probe_drop(sel, client)
+        finally:
+            for client in list(pending):
+                self._probe_drop(sel, client)
+            sel.close()
+
+    def _probe_drop(self, sel, client):
+        try:
+            sel.unregister(client)
+        except (KeyError, ValueError, OSError):
+            pass
+        self._send_busy(client)
+
+    def _probe_serve(self, client, addr):
+        try:
+            client.settimeout(0.05)
+            data = client.recv(4096)
+        except OSError:
+            data = b""
+        if data and _verb_of(data) in PRIORITY_VERBS and \
+                self._reserved_free.acquire(blocking=False):
+            try:
+                client.settimeout(None)
+                self._reserved_pool.submit(self._serve_conn, _PrefixedSocket(client, data),
+                                           addr, self._reserved_free)
+                return
+            except (RuntimeError, OSError):
+                self._reserved_free.release()
+        self._send_busy(client)
 
     def _serve_conn(self, client, addr, sem):
         try:
@@ -1731,14 +1802,10 @@ class FederationCoordinator:
                 timeout = max(0.001, min(s.peer_connect_timeout_sec, s.status_timeout_sec,
                                          ctx.remaining()))
                 with self._connect(m.connect_host, addrs, port, timeout) as sock:
-                    sock.settimeout(max(0.001, min(s.status_timeout_sec, ctx.remaining())))
+                    read_s = max(0.001, min(s.status_timeout_sec, ctx.remaining()))
+                    sock.settimeout(read_s)
                     sock.sendall(payload)
-                    data = b""
-                    while True:
-                        chunk = sock.recv(65536)
-                        if not chunk:
-                            break
-                        data += chunk
+                    data = recv_until_close(sock, max(0.001, min(read_s, ctx.remaining())))
                 obj = json.loads(data.decode("utf-8", errors="replace"))
                 if not isinstance(obj, dict):
                     raise ValueError("reply is not a JSON object")
@@ -2516,6 +2583,7 @@ class FederationCoordinator:
         new_member = None
         moved = None
         collision = None
+        refused = None
         with self._membership_lock:
             static = next((m for m in self._static if m.node_key == nk
                            and nk not in self._runtime_removed), None)
@@ -2544,6 +2612,9 @@ class FederationCoordinator:
                         holder.inst["ports"] = dict(ports)
                         moved = holder
                     accepted_as = holder
+                elif not self._register_admit(nk, src, now):
+                    refused = {"ok": False, "error": "busy",
+                               "retry_in_sec": int(REGISTER_RATE_WINDOW_SEC)}
                 else:
                     inst = {"host": host, "connect_host": host, "instance_id": iid,
                             "node_key": nk, "node_id": node_id, "ports": ports,
@@ -2563,10 +2634,23 @@ class FederationCoordinator:
                 self._collisions.setdefault(ckey, time.time())
                 while len(self._collisions) > 256:
                     self._collisions.popitem(last=False)
+        if refused is not None:
+            self.logger.warning("REGISTER of %s from %s refused: registration limit "
+                                "(%d members, %d new keys per source per %.0f s)", nk, src,
+                                REGISTER_MAX_MEMBERS, REGISTER_NEW_PER_SOURCE,
+                                REGISTER_RATE_WINDOW_SEC)
+            return refused
         if collision is not None:
+            mono = time.monotonic()
             last = self._collision_events.get(ckey)
-            if last is None or time.monotonic() - last >= COLLISION_EVENT_SEC:
-                self._collision_events[ckey] = time.monotonic()
+            if last is None or mono - last >= COLLISION_EVENT_SEC:
+                self._collision_events.pop(ckey, None)
+                self._collision_events[ckey] = mono
+                while self._collision_events:
+                    k0, t0 = next(iter(self._collision_events.items()))
+                    if len(self._collision_events) <= 256 and mono - t0 < COLLISION_EVENT_SEC:
+                        break
+                    del self._collision_events[k0]
                 self._emit("node_key_collision", "error",
                            {"node_key": nk, "holder_addr": collision["addr"],
                             "rejected_addr": src})
@@ -2585,6 +2669,34 @@ class FederationCoordinator:
             reply["peers"] = {m.node_key: rows.get(m.node_key, {"state": "unknown"})
                               for m in self._members() if m.node_key != nk}
         return reply
+
+    def _register_admit(self, nk, src, now):
+        """Admit a new registered node_key (membership lock held).
+
+        Bounds the registered table (REGISTER_MAX_MEMBERS, expired entries
+        are evicted first) and the new keys per source address per window.
+        """
+        rate = self._register_rate
+        while rate:
+            k0, (t0, _n) = next(iter(rate.items()))
+            if now - t0 < REGISTER_RATE_WINDOW_SEC and len(rate) <= 4096:
+                break
+            del rate[k0]
+        win = rate.get(src)
+        if win is not None and win[1] >= REGISTER_NEW_PER_SOURCE:
+            return False
+        if nk not in self._registered and len(self._registered) >= REGISTER_MAX_MEMBERS:
+            for key, m in list(self._registered.items()):
+                if self._registration_expired(m, now):
+                    del self._registered[key]
+                    break
+            else:
+                return False
+        if win is None:
+            rate[src] = [now, 1]
+        else:
+            win[1] += 1
+        return True
 
     # ------------------------------------------------------------------
     # new verbs: ALL / NODE / FANOUT / RECAL
@@ -3346,40 +3458,83 @@ class FederationCoordinator:
                 "partitioned_at": self._partitioned_at}
 
     def _apply_sync_doc(self, doc):
-        """Install a replicated state document (followers, pull repair, load at start)."""
-        sched_doc = doc.get("schedule")
-        if sched_doc:
-            self._need_scheduler().set_master_schedule_doc(sched_doc)
-        elif self.scheduler is not None:
-            self.scheduler.clear_master_schedule()
-        self._version = int(doc.get("version", 0))
-        self._sync_term = int(doc.get("term", 0))
-        self._set_at = doc.get("set_at")
-        self._rebalance_seq = int(doc.get("rebalance_seq", 0))
-        self._issued_gens = deque((int(g) for g in doc.get("issued_gens", [])), maxlen=4096)
-        self._empty = list(doc.get("empty", []))
-        self._partitioned_at = doc.get("partitioned_at")
-        recs = OrderedDict()
-        for key, a in (doc.get("assignments") or {}).items():
-            rec = self._desired_record(a.get("gen"), a.get("desired", "schedule"),
-                                       a.get("partition", []), a.get("last_frame_count"))
-            rec["state"] = a.get("state", "unknown")
-            rec["attempts"] = a.get("attempts", 0)
-            rec["last_result"] = a.get("last_result")
-            recs[key] = rec
-        self._assignments = recs
-        runtime = doc.get("members_runtime") or {}
+        """Install a replicated state document (followers, pull repair, load at start).
+
+        Every field is parsed and validated into locals first; coordinator
+        state changes only once the whole document is known good, so a bad
+        document (ValueError) leaves the held (term, version) untouched.
+        """
+        if not isinstance(doc, dict):
+            raise ValueError("sync document must be a JSON object")
+        try:
+            version = int(doc.get("version", 0))
+            term = int(doc.get("term", 0))
+            rebalance_seq = int(doc.get("rebalance_seq", 0))
+            gens = doc.get("issued_gens", [])
+            if not isinstance(gens, list):
+                raise ValueError("issued_gens must be a list")
+            issued = deque((int(g) for g in gens), maxlen=4096)
+            empty = doc.get("empty", [])
+            if not isinstance(empty, list):
+                raise ValueError("empty must be a list")
+            sched_doc = doc.get("schedule")
+            if sched_doc:
+                canon = validate_schedule_doc(sched_doc)
+                strat = canon.get("strategy") or "round_robin"
+                if strat not in STRATEGIES:
+                    raise ValueError("unknown strategy '{}'".format(strat))
+            assignments = doc.get("assignments") or {}
+            if not isinstance(assignments, dict):
+                raise ValueError("assignments must be an object")
+            recs = OrderedDict()
+            for key, a in assignments.items():
+                if not isinstance(a, dict):
+                    raise ValueError("assignment '{}' must be an object".format(key))
+                partition = a.get("partition", [])
+                if not isinstance(partition, list) or \
+                        not all(isinstance(e, dict) for e in partition):
+                    raise ValueError("assignment '{}' partition must be a list of "
+                                     "objects".format(key))
+                rec = self._desired_record(a.get("gen"), a.get("desired", "schedule"),
+                                           partition, a.get("last_frame_count"))
+                rec["state"] = a.get("state", "unknown")
+                rec["attempts"] = a.get("attempts", 0)
+                rec["last_result"] = a.get("last_result")
+                recs[str(key)] = rec
+            runtime = doc.get("members_runtime") or {}
+            if not isinstance(runtime, dict):
+                raise ValueError("members_runtime must be an object")
+            added_entries = runtime.get("added", [])
+            removed = runtime.get("removed", [])
+            if not isinstance(added_entries, list) or not isinstance(removed, list):
+                raise ValueError("members_runtime added/removed must be lists")
+            removed = set(str(k) for k in removed)
+        except (TypeError, AttributeError, KeyError) as e:
+            raise ValueError("bad sync document: {}".format(e))
         added = []
-        for entry in runtime.get("added", []):
+        for entry in added_entries:
             try:
                 added.append(Member(parse_member(entry, default_stride=self.settings.port_stride,
                                                  allow_loopback=not self.cluster_mode),
                                     "runtime"))
-            except ValueError:
+            except (TypeError, ValueError, AttributeError):
                 self.logger.warning("ignoring bad replicated member '%s'", entry)
+        # -- commit (nothing below raises for a validated document) --
+        if sched_doc:
+            self._need_scheduler().set_master_schedule_doc(sched_doc)
+        elif self.scheduler is not None:
+            self.scheduler.clear_master_schedule()
+        self._version = version
+        self._sync_term = term
+        self._set_at = doc.get("set_at")
+        self._rebalance_seq = rebalance_seq
+        self._issued_gens = issued
+        self._empty = list(empty)
+        self._partitioned_at = doc.get("partitioned_at")
+        self._assignments = recs
         with self._membership_lock:
             self._runtime_added = added
-            self._runtime_removed = set(runtime.get("removed", []))
+            self._runtime_removed = removed
         self._membership_changed()
 
     def _replicate(self):
@@ -3388,6 +3543,8 @@ class FederationCoordinator:
             return {"stored": 1, "of": 1}, True, True
         s = self.settings
         doc = self._sync_doc()
+        # the sender's endpoint lets a follower refuse a SYNC from a non-candidate
+        body = dict(doc, leader=self.election.self_endpoint)
         followers = [ep for ep in self.election.candidates if ep != self.election.self_endpoint]
         n = len(self.election.candidates)
         stored = 1
@@ -3398,7 +3555,7 @@ class FederationCoordinator:
                     return None
                 host, _, port = ep.rpartition(":")
                 try:
-                    return request_json(host, int(port), "SCHEDULE SYNC", body=doc,
+                    return request_json(host, int(port), "SCHEDULE SYNC", body=body,
                                         auth_token=s.auth_token or None,
                                         connect_timeout=min(2.0, s.sync_push_timeout_sec),
                                         timeout=s.sync_push_timeout_sec)
@@ -3438,18 +3595,36 @@ class FederationCoordinator:
             term, version = int(doc["term"]), int(doc["version"])
         except (TypeError, ValueError):
             return {"ok": False, "error": "bad_request", "message": "bad term/version"}
+        from federation_election import normalize_endpoint
+        el = self.election
+        try:
+            sender = normalize_endpoint(str(doc.get("leader") or ""))
+        except (TypeError, ValueError):
+            sender = None
+        if sender is None or sender not in el.candidates or sender == el.self_endpoint:
+            return {"ok": False, "error": "not_candidate",
+                    "message": "SCHEDULE SYNC must name a coordinator candidate as 'leader'"}
         role, own_term = self._role_term()
         if role == "leader" and term <= own_term:
             return {"ok": True, "stored": False, "term": self._sync_term,
                     "version": self._version}
+        known = el.leader_info()
+        if term == own_term and known is not None and known["term"] == own_term and \
+                known["endpoint"] != sender:
+            # this follower knows a different leader for this term
+            return {"ok": False, "error": "not_leader", "leader": known}
         if term > own_term:
-            self.election.observe_term(term, source="SCHEDULE SYNC")
+            el.observe_term(term, source="SCHEDULE SYNC of {}".format(sender))
+            if self._role_term()[1] < term:
+                return {"ok": False, "error": "bad_request",
+                        "message": "term {} not accepted (current term {})".format(
+                            term, self._role_term()[1])}
         stored = False
         with self._mutation_lock:
             if (term, version) > (self._sync_term, self._version):
                 try:
                     self._apply_sync_doc(doc)
-                except (TypeError, ValueError, KeyError) as e:
+                except (TypeError, ValueError, KeyError, AttributeError) as e:
                     return {"ok": False, "error": "bad_request", "message": str(e)}
                 self._persist()
                 stored = True
@@ -3497,7 +3672,7 @@ class FederationCoordinator:
                         self._persist()
                         self.logger.info("pull repair from %s: version %d (term %d)",
                                          leader_ep, self._version, self._sync_term)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, TypeError) as e:
             self.logger.info("pull repair from %s failed: %s", leader_ep, e)
         finally:
             self._repair_running = False
@@ -3546,7 +3721,7 @@ class FederationCoordinator:
         doc.setdefault("version", 0)
         try:
             self._apply_sync_doc(doc)
-        except (TypeError, ValueError, KeyError) as e:
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
             self.logger.error("ignoring persisted coordinator state: %s", e)
             return
         self.logger.info("loaded persisted state: version %d, %s master schedule",

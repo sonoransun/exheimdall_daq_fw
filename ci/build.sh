@@ -34,7 +34,17 @@
 #                                the summary table but do not fail the lane.
 #                                If the diff cannot be computed every finding
 #                                is fatal (fail closed).
-#     neither                    report-only (exit 0 despite findings).
+#     CI_BASE_SHA=<sha>          (pushes; used when CI_BASE_REF is empty) the
+#                                same rule against
+#                                `git diff --name-only <sha>...HEAD`, i.e. the
+#                                commits the push added (github.event.before).
+#                                An all-zero sha (new branch) or an
+#                                unreachable sha is fail-closed (strict).
+#     none of these              report-only (exit 0 despite findings), e.g.
+#                                the nightly schedule / workflow_dispatch.
+#   Under GitHub Actions every non-fatal finding is also emitted as a
+#   ::warning:: annotation (and the deploy-lint table goes to the job
+#   summary), so report-only regressions on main stay visible.
 #
 #   Environment:
 #     DEPS_DIR       Cache directory for cloned/built dependencies
@@ -50,7 +60,8 @@
 #     CI_OPTIONAL_TARGETS  1 (default) = the generic lane also builds the
 #                    optional targets; 0 = core binaries only (pipeline job)
 #     PYTHON         interpreter for deploy-lint (default: python3)
-#     HEIMDALL_STRICT_MODULES, CI_BASE_REF   see "Changed-file rule"
+#     HEIMDALL_STRICT_MODULES, CI_BASE_REF, CI_BASE_SHA
+#                    see "Changed-file rule"
 #
 #   Required system packages (ubuntu): build-essential cmake git
 #     libusb-1.0-0-dev libzmq3-dev; the kfr lane additionally needs clang;
@@ -70,6 +81,7 @@ MAKE_JOBS="${MAKE_JOBS:-$(nproc 2>/dev/null || echo 2)}"
 PYTHON="${PYTHON:-python3}"
 STRICT="${HEIMDALL_STRICT_MODULES:-0}"
 CI_BASE_REF="${CI_BASE_REF:-}"
+CI_BASE_SHA="${CI_BASE_SHA:-}"
 CI_OPTIONAL_TARGETS="${CI_OPTIONAL_TARGETS:-1}"
 
 case "$STRICT" in
@@ -159,17 +171,31 @@ check_outputs() {
 
 CHANGED_FILES=""
 CHANGED_MODE="report"   # report | changed | strict
+CHANGED_BASE=""         # what the changed-file diff was taken against
 
 init_changed_files() {
+    local base
     if [ "$STRICT" = 1 ]; then
         CHANGED_MODE="strict"
         return 0
     fi
-    [ -n "$CI_BASE_REF" ] || return 0
-    if CHANGED_FILES="$(git -C "$REPO_ROOT" diff --name-only "origin/$CI_BASE_REF...HEAD")"; then
-        CHANGED_MODE="changed"
+    if [ -n "$CI_BASE_REF" ]; then
+        base="origin/$CI_BASE_REF"
+    elif [ -n "$CI_BASE_SHA" ]; then
+        if printf '%s' "$CI_BASE_SHA" | grep -Eqx '0+'; then
+            log "WARNING: push has no base commit (new branch) - treating every finding as fatal"
+            CHANGED_MODE="strict"
+            return 0
+        fi
+        base="$CI_BASE_SHA"
     else
-        log "WARNING: cannot diff against origin/$CI_BASE_REF - treating every finding as fatal"
+        return 0
+    fi
+    if CHANGED_FILES="$(git -C "$REPO_ROOT" diff --name-only "$base...HEAD")"; then
+        CHANGED_MODE="changed"
+        CHANGED_BASE="$base"
+    else
+        log "WARNING: cannot diff against $base - treating every finding as fatal"
         CHANGED_MODE="strict"
     fi
 }
@@ -177,9 +203,19 @@ init_changed_files() {
 describe_mode() {
     case "$CHANGED_MODE" in
         strict)  echo "strict: every finding is fatal" ;;
-        changed) echo "changed-file rule vs origin/$CI_BASE_REF" ;;
-        *)       echo "report-only: set CI_BASE_REF or HEIMDALL_STRICT_MODULES=1 to gate" ;;
+        changed) echo "changed-file rule vs $CHANGED_BASE" ;;
+        *)       echo "report-only: set CI_BASE_REF, CI_BASE_SHA or HEIMDALL_STRICT_MODULES=1 to gate" ;;
     esac
+}
+
+# gha_warning <title> <message>: GitHub Actions ::warning:: annotation for a
+# non-fatal finding (no-op outside Actions).
+gha_warning() {
+    [ "${GITHUB_ACTIONS:-}" = "true" ] || return 0
+    local msg
+    # workflow-command escaping: % CR LF
+    msg="$(printf '%s' "$2" | sed -e 's/%/%25/g' | tr '\n' ' ')"
+    echo "::warning title=$1::$msg ($(describe_mode))"
 }
 
 # is_fatal <repo-relative path>...: a finding attributed to these files fails
@@ -229,6 +265,7 @@ build_optional_targets() {
         exit 1
     fi
     log "optional target failure does not fail the lane ($(describe_mode))"
+    gha_warning "optional target build" "one or more optional Makefile targets failed to build (attempted:$targets)"
 }
 
 # --- deploy-lint ------------------------------------------------------------
@@ -246,6 +283,8 @@ finding() {
     if is_fatal "$@"; then
         status=FATAL
         LINT_FATAL=1
+    else
+        gha_warning "deploy-lint: $check" "$file"
     fi
     LINT_SUMMARY="${LINT_SUMMARY}$(printf '%-6s  %-28s  %s' "$status" "$check" "$file")
 "
@@ -562,6 +601,15 @@ deploy_lint() {
         printf '%s' "$LINT_SUMMARY"
     fi
     echo "===== $LINT_FINDINGS finding(s); lane $( [ "$LINT_FATAL" -eq 0 ] && echo passed || echo FAILED ) ====="
+    if [ -n "$LINT_SUMMARY" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        {
+            echo "### deploy-lint: $LINT_FINDINGS finding(s) ($(describe_mode))"
+            echo '```'
+            printf '%-6s  %-28s  %s\n' STATUS CHECK FILE
+            printf '%s' "$LINT_SUMMARY"
+            echo '```'
+        } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+    fi
     [ "$LINT_FATAL" -eq 0 ]
 }
 

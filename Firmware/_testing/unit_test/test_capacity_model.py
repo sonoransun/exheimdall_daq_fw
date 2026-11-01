@@ -282,6 +282,41 @@ class EvaluateTest(unittest.TestCase):
         r = self.report([self.write("s.ini", ini_text(0, iface="shmem"))], host)
         self.assertEqual(r["resources"]["egress"]["verdict"], "skip")
 
+    def test_egress_fails_above_tcp_goodput(self):
+        # 96 MB/s on an 800 Mbit/s link is 96 % of line rate: below 100 %, but
+        # above the ~94.1 % TCP goodput, so it cannot be carried.
+        r = self.report([self.write("a.ini", ini_text(0))], dict(X86, nics=[{"name": "eth0", "speed_mbps": 800}]))
+        e = r["resources"]["egress:eth0"]
+        self.assertEqual((e["need"], e["have"], e["verdict"]), (96.0, 100.0, "fail"))
+        self.assertIn("TCP goodput 94.1 % of link", e["note"])
+        r = self.report([self.write("b.ini", ini_text(0))], dict(X86, nics=[{"name": "eth0", "speed_mbps": 820}]))
+        self.assertEqual(r["resources"]["egress:eth0"]["verdict"], "warn")
+        self.assertAlmostEqual(cm.TCP_GOODPUT_FRACTION, 1448.0 / 1538.0)
+
+    def test_multi_client_frame_deadline(self):
+        def multi(extra):
+            return ini_text(0).replace("out_data_iface_type = eth\n",
+                                       "out_data_iface_type = eth\niq_server_max_clients = 2\n" + extra)
+        host = dict(X86, nics=[{"name": "eth0", "speed_mbps": 10000}])
+        # Auto deadline (1.0 x the ~437 ms frame period): only the stream rate matters.
+        r = self.report([self.write("a.ini", multi(""))], host)
+        e = r["resources"]["egress:eth0"]
+        self.assertEqual((e["need"], e["verdict"]), (192.0, "ok"))
+        self.assertNotIn("frame deadline", e["note"])
+        # 100 ms: 2 x 41.9 MB per 0.1 s = 839 MB/s, still within 10GbE goodput.
+        r = self.report([self.write("b.ini", multi("iq_server_frame_deadline_ms = 100\n"))], host)
+        self.assertEqual(r["resources"]["egress:eth0"]["verdict"], "ok")
+        # 50 ms: 1678 MB/s exceeds the link, every session would be closed.
+        r = self.report([self.write("c.ini", multi("iq_server_frame_deadline_ms = 50\n"))], host)
+        e = r["resources"]["egress:eth0"]
+        self.assertEqual((e["need"], e["verdict"]), (192.0, "fail"))
+        self.assertIn("frame deadline needs 1677.8 MB/s", e["note"])
+        inst = {"iq_server_max_clients": 2, "iq_server_frame_deadline_ms": 0,
+                "cpi_size": 2 ** 20, "decimation_ratio": 1, "sample_rate": 2.4e6}
+        self.assertEqual(cm.iq_frame_deadline_sec(inst), 0.436)
+        self.assertEqual(cm.iq_frame_deadline_sec(dict(inst, cpi_size=1024)), 0.1)
+        self.assertEqual(cm.iq_frame_deadline_sec(dict(inst, iq_server_max_clients=1)), 10.0)
+
     def test_slow_virtual_link_beside_fast_nic_does_not_fail(self):
         host = dict(X86, nics=[{"name": "eth0", "speed_mbps": 1000}, {"name": "tun0", "speed_mbps": 10},
                                {"name": "eth1", "speed_mbps": 1000}])

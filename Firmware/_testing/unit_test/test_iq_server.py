@@ -418,7 +418,7 @@ class TesterIQServer(unittest.TestCase):
         self.assertEqual(late.frames, self.frames[first:])
 
     def test_multi_auto_deadline_has_a_floor(self):
-        """Auto deadline = 0.8 x cpi_size*R/fs, floored at 100 ms: a tiny CPI
+        """Auto deadline = 1.0 x cpi_size*R/fs, floored at 100 ms: a tiny CPI
         does not drop every network client."""
         self._configure(data_interface__iq_server_max_clients=2, daq__sample_rate=1000000)
         self._start(_make_frames(1, self.N, self.M))
@@ -431,8 +431,8 @@ class TesterIQServer(unittest.TestCase):
         self._configure(data_interface__iq_server_max_clients=2, daq__sample_rate=10000,
                         pre_processing__decimation_ratio=2)
         self._start(_make_frames(1, self.N, self.M))
-        # 0.8 * 4096 * 2 / 10000 s = 655 ms
-        self._wait_log("frame deadline 655 ms")
+        # 1.0 x the frame period: 4096 * 2 / 10000 s = 819 ms
+        self._wait_log("frame deadline 819 ms")
         self.proc.send_signal(signal.SIGTERM)
         self.assertEqual(self.proc.wait(5), 0)
         self.producer.go.set()

@@ -609,23 +609,15 @@ class TestDAQDatabaseIntegration(unittest.TestCase):
         self.assertEqual(struct.unpack("I", value)[0], 3)
         self.assertIsNone(self.db.get_schedule_state(b"missing_key"))
 
-    def _skip_if_rotate_defect(self, errors_before):
-        """KNOWN CROSS-OWNERSHIP DEFECT (found by this suite on the first
-        real-berkeleydb run): daq_db.rotate() opens a plain cursor inside a
-        DB_INIT_CDB environment, so cursor.delete() fails with BDB0697
-        'Write attempted on read-only cursor' and rotation silently deletes
-        nothing (the error only increments read_errors).
-        Fix belongs in _daq_core/daq_db.py (not owned by the test
-        workstream): open the cursor with
-        db_obj.cursor(flags=bdb.DB_WRITECURSOR) in rotate().
-        Until that lands, skip loudly instead of failing the suite; once
-        fixed, these tests re-arm automatically and assert strictly."""
+    def _assert_rotate_clean(self, errors_before):
+        """rotate() must not record any BDB error. Regression guard for the
+        read-only-cursor defect (BDB0697 under DB_INIT_CDB): rotate() must
+        open its cursor with DB_WRITECURSOR, otherwise cursor.delete() fails
+        and rotation silently deletes nothing (only read_errors grows)."""
         errors_now = self.db.get_db_stats().get("read_errors", 0)
-        if errors_now > errors_before:
-            self.skipTest(
-                "SKIP reason: known daq_db defect - rotate() cursor is "
-                "read-only under DB_INIT_CDB (BDB0697); needs "
-                "DB_WRITECURSOR in daq_db.rotate() (daq_db owner)")
+        self.assertEqual(errors_now, errors_before,
+                         "rotate() incremented read_errors (BDB cursor "
+                         "delete failed - DB_WRITECURSOR regression?)")
 
     def test_rotation(self):
         """Rotation deletes old records"""
@@ -636,7 +628,7 @@ class TestDAQDatabaseIntegration(unittest.TestCase):
         errors_before = self.db.get_db_stats().get("read_errors", 0)
         # Rotate with 0 hours = delete everything
         self.db.rotate(max_age_hours=0)
-        self._skip_if_rotate_defect(errors_before)
+        self._assert_rotate_clean(errors_before)
         results = self.db.get_frame_metrics_by_time_range(0, int(time.time() * 1000) + 1000)
         self.assertEqual(len(results), 0)
 
@@ -655,7 +647,7 @@ class TestDAQDatabaseIntegration(unittest.TestCase):
 
         errors_before = self.db.get_db_stats().get("read_errors", 0)
         self.db.rotate(max_age_hours=15)  # survivors: 10h, 1h, 2h old
-        self._skip_if_rotate_defect(errors_before)
+        self._assert_rotate_clean(errors_before)
         results = self.db.get_frame_metrics_by_time_range(0, now_ms + 1000)
         self.assertEqual(len(results), 3)
         surviving_offsets = sorted((now_ms - r.timestamp_ms) // (3600 * 1000)

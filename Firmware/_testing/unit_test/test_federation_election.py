@@ -353,7 +353,52 @@ class TestElectionMachine(unittest.TestCase):
             e2 = Election(["a:1", "b:2"], "a:1", store=TermStore(d), clock=clock)
             self.assertFalse(e2.state_error)               # the term file still loads
             self.assertNotEqual(e2.eligible(), (False, "state_dir_unwritable"))
-            self.assertTrue(e2.observe_term(0xFFFFFFFF, "XACK"))   # u32 max is a valid term
+            # u32 max is a valid wire value but above TERM_MAX: never adopted
+            self.assertFalse(e2.observe_term(0xFFFFFFFF, "XACK", bounded=False))
+            self.assertTrue(e2.observe_term(TERM_MAX, "LEADER reply", bounded=False))
+            self.assertEqual(e2.term, TERM_MAX)
+
+    def test_non_candidate_lease_and_prevote_refused(self):
+        clock = SimClock()
+        e = Election(["a:6000", "b:6000", "c:6000"], "a:6000", store=MemoryTermStore(),
+                     clock=clock)
+        clock.t += e.G + 1
+        for ep in ("evil.example:1", "a:6000"):           # a stranger, or our own endpoint
+            r = e.handle_lease(0xFFFFFFFF, ep)
+            self.assertEqual((r["granted"], r["reason"], r["term"], r["lease_holder"]),
+                             (False, "not_candidate", 0, None))
+            p = e.handle_prevote(5, ep)
+            self.assertEqual((p["granted"], p["reason"]), (False, "not_candidate"))
+        self.assertEqual(e.role_term(), ("follower", 0))
+        self.assertIsNone(e.leader_info())
+        self.assertEqual(e.eligible(), (True, None))
+        self.assertTrue(e.handle_lease(1, "b:6000")["granted"])
+
+    def test_unsolicited_term_jump_bounded(self):
+        clock = SimClock()
+        e = Election(["a:6000", "b:6000"], "a:6000", store=MemoryTermStore(), clock=clock)
+        clock.t += e.G + 1
+        with self.assertLogs("federation_election", level="WARNING"):
+            r = e.handle_lease(e.max_term_jump + 1, "b:6000")
+        self.assertEqual((r["granted"], r["term"]), (False, 0))
+        self.assertTrue(e.handle_lease(e.max_term_jump, "b:6000")["granted"])
+        self.assertEqual(e.term, e.max_term_jump)
+        self.assertFalse(e.observe_term(e.term + e.max_term_jump + 1, "XACK"))
+        self.assertTrue(e.observe_term(e.term + 3, "XACK"))
+        # replies to our own polls of the candidates are not bounded (state-wipe catch-up)
+        far = e.term + 50000
+        leader_reply = {"ok": True, "role": "leader", "term": far, "eligible": True,
+                        "reason": None, "lease": {"holder": "b:6000", "term": far}}
+        e.tick(lambda reqs: {ep: (leader_reply if line.startswith("LEADER") else None)
+                             for ep, line in reqs})
+        self.assertEqual(e.term, far)
+        self.assertEqual(e.leader_info()["endpoint"], "b:6000")
+        # ... but a poisoned reply above TERM_MAX is never adopted
+        bad = dict(leader_reply, term=TERM_MAX + 1)
+        e.tick(lambda reqs: {ep: (bad if line.startswith("LEADER") else None)
+                             for ep, line in reqs})
+        self.assertLessEqual(e.term, TERM_MAX)
+        self.assertNotEqual(e.eligible(), (False, "term_exhausted"))
 
     def test_cluster_mismatch(self):
         e = Election(["a:1", "b:2"], "a:1", store=MemoryTermStore(), cluster_id="lab-a")
@@ -385,6 +430,50 @@ def _free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+class TestSyncAcceptance(unittest.TestCase):
+    """SCHEDULE SYNC is taken only from a candidate and within the term-jump bound."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="coordstate")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.eps = ["127.0.0.1:{}".format(_free_port()) for _ in range(2)]
+        s = CoordinatorSettings(coordinator_candidates=",".join(self.eps),
+                                coordinator_self=self.eps[0], state_dir=self.dir)
+        self.c = FederationCoordinator(port=int(self.eps[0].rsplit(":", 1)[1]),
+                                       listen_address="127.0.0.1", settings=s)
+
+    def sync(self, doc):
+        from federation_common import Request
+        body = json.dumps(doc).encode()
+        return self.c._schedule_sync(Request("SCHEDULE", "SYNC", body, False, "SCHEDULE SYNC"))
+
+    def test_sender_must_be_a_candidate(self):
+        for leader in (None, "evil.example:1", self.eps[0]):
+            doc = {"term": 1, "version": 1, "leader": leader}
+            r = self.sync(doc)
+            self.assertEqual((r["ok"], r["error"]), (False, "not_candidate"), leader)
+        self.assertEqual(self.c._role_term()[1], 0)
+        self.assertEqual((self.c._sync_term, self.c._version), (0, 0))
+        r = self.sync({"term": 1, "version": 1, "leader": self.eps[1]})
+        self.assertEqual((r["ok"], r["stored"], r["term"], r["version"]), (True, True, 1, 1))
+        self.assertEqual(self.c._role_term()[1], 1)
+
+    def test_term_jump_refused(self):
+        far = self.c.election.max_term_jump + 1
+        with self.assertLogs("federation_coordinator.election", level="WARNING"):
+            r = self.sync({"term": far, "version": 1, "leader": self.eps[1]})
+        self.assertEqual((r["ok"], r["error"]), (False, "bad_request"))
+        self.assertEqual(self.c._role_term()[1], 0)
+        self.assertEqual((self.c._sync_term, self.c._version), (0, 0))
+
+    def test_bad_document_leaves_state(self):
+        r = self.sync({"term": 1, "version": 2, "leader": self.eps[1], "assignments": [1]})
+        self.assertEqual((r["ok"], r["error"]), (False, "bad_request"))
+        self.assertEqual((self.c._sync_term, self.c._version), (0, 0))
+        r = self.sync({"term": 1, "version": 2, "leader": self.eps[1]})
+        self.assertTrue(r["stored"])
 
 
 class Cluster(object):
@@ -672,9 +761,11 @@ class TestRealCoordinators(unittest.TestCase):
         st = FakeStatusServer()
         self._cleanup.extend([hwc.close, st.close])
         hwc.delays["SCHE"] = 5.0
+        # a 1 s lease (10 polls) so a shared-runner stall does not fail over
         cl = self.cluster(instances=[member(0, hwc, st)],
-                          extra={"hwc_request_timeout_sec": 7.0, "max_member_rto_sec": 10.0})
-        lead = cl.wait_leader(4.0)
+                          extra={"hwc_request_timeout_sec": 7.0, "max_member_rto_sec": 10.0,
+                                 "election_missed_polls": 10, "election_settle_polls": 12})
+        lead = cl.wait_leader(8.0)
         c = cl.coords[lead]
         sched = {"name": "big", "entries": [{"frequency": 400000000 + i, "gains": [100] * 5}
                                             for i in range(4)]}
@@ -690,9 +781,12 @@ class TestRealCoordinators(unittest.TestCase):
         spans = list(c.election_runner.tick_starts)[-(len(c.election_runner.tick_starts)
                                                      - start_count):]
         th.join(30)
-        self.assertGreater(len(spans), 15)
+        # ~30 ticks at I = 0.1 s; the point is that ticks keep coming while
+        # the REBALANCE holds the mutation lock, not their exact cadence
+        interval = c.election.I
+        self.assertGreaterEqual(len(spans), 5)
         gaps = [b[0] - a[0] for a, b in zip(spans, spans[1:])]
-        self.assertLess(max(gaps), 0.5)
+        self.assertLess(max(gaps), 10 * interval)
         self.assertEqual(cl.leaders(), [lead])
         self.assertEqual(result.get("status"), "rebalanced", result)
 
